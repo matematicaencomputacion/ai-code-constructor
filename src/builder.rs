@@ -9,6 +9,11 @@ use crate::state::CodeState;
 /// por el Repairer para producir una versión corregida.
 pub fn build(state: &mut CodeState) {
     println!("BUILDER: generando código...");
+    println!("BUILDER: request -> {}", state.request);
+
+    if let Some(plan) = &state.plan {
+        println!("BUILDER: utilizando plan -> {}", plan);
+    }
 
     // =========================================================
     // PRIMERA ITERACIÓN
@@ -17,19 +22,20 @@ pub fn build(state: &mut CodeState) {
     if state.iteration == 1 {
         println!("BUILDER: generando primera versión...");
 
-        // Código deliberadamente incorrecto.
-        // Falta cerrar correctamente el println!.
-        let code = String::from(
-            r#"fn main() {
-    println!("API REST generada"
-}
+        // Generamos deliberadamente código incorrecto.
+        // La diferencia es que ahora el código incorpora
+        // información real del request.
+        let code = format!(
+            r#"fn main() {{
+    println!("Request: {}"
+}}
 "#,
+            state.request
         );
 
         state.code = Some(code);
 
         println!("BUILDER: código generado");
-
         return;
     }
 
@@ -46,25 +52,27 @@ pub fn build(state: &mut CodeState) {
 
         println!("BUILDER: generando versión corregida...");
 
-        // Código Rust válido.
-        //
-        // También contiene los elementos que el Validator
-        // utiliza para verificar la intención de API REST.
-        let corrected_code = String::from(
-            r#"fn main() {
-    println!("API REST generada");
+        let plan = state.plan.as_deref().unwrap_or("Sin plan disponible");
+
+        let corrected_code = format!(
+            r#"fn main() {{
+    println!("Request: {}");
+
+    // Plan utilizado:
+    // {}
 
     // HTTP Server
     // GET /api
     // endpoint: GET /api
-}
+}}
 "#,
+            state.request,
+            plan.replace('\n', "\n// ")
         );
 
         state.code = Some(corrected_code);
 
         println!("BUILDER: código corregido generado");
-
         return;
     }
 
@@ -74,15 +82,16 @@ pub fn build(state: &mut CodeState) {
 
     println!("BUILDER: generando versión estándar...");
 
-    let code = String::from(
-        r#"fn main() {
-    println!("API REST generada");
+    let code = format!(
+        r#"fn main() {{
+    println!("Request: {}");
 
     // HTTP Server
     // GET /api
     // endpoint: GET /api
-}
+}}
 "#,
+        state.request
     );
 
     state.code = Some(code);
