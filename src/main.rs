@@ -1,9 +1,9 @@
-mod state;
-mod planner;
 mod builder;
-mod validator;
 mod compiler;
+mod planner;
 mod repairer;
+mod state;
+mod validator;
 
 use state::CodeState;
 
@@ -13,6 +13,7 @@ fn main() {
         plan: None,
         code: None,
         errors: Vec::new(),
+        feedback: Vec::new(),
         iteration: 0,
     };
 
@@ -37,7 +38,6 @@ fn main() {
     // =========================================================
 
     loop {
-        // Aumentamos el número de iteración.
         state.iteration += 1;
 
         println!(
@@ -55,10 +55,13 @@ fn main() {
         }
 
         // -----------------------------------------------------
-        // LIMPIAMOS LOS ERRORES ANTERIORES
+        // IMPORTANTE:
+        //
+        // NO limpiamos state.errors aquí.
+        //
+        // El Builder necesita recibir el feedback generado
+        // por el Repairer de la iteración anterior.
         // -----------------------------------------------------
-
-        state.errors.clear();
 
         // -----------------------------------------------------
         // BUILDER
@@ -73,21 +76,15 @@ fn main() {
         let compile_result = match &state.code {
             Some(code) => compiler::compile(code),
 
-            None => Err(
-                "El Builder no generó ningún código."
-                    .to_string()
-            ),
+            None => Err("El Builder no generó ningún código.".to_string()),
         };
 
         match compile_result {
             // =================================================
             // CÓDIGO COMPILADO
             // =================================================
-
             Ok(_) => {
-                println!(
-                    "COMPILER: código compilado correctamente"
-                );
+                println!("COMPILER: código compilado correctamente");
 
                 // -------------------------------------------------
                 // VALIDATOR
@@ -100,9 +97,7 @@ fn main() {
                 // -------------------------------------------------
 
                 if state.errors.is_empty() {
-                    println!(
-                        "\nCONSTRUCTOR: código aprobado."
-                    );
+                    println!("\nCONSTRUCTOR: código aprobado.");
 
                     break;
                 }
@@ -122,19 +117,14 @@ fn main() {
 
                 repairer::repair(&mut state);
 
-                println!(
-                    "CONSTRUCTOR: intentando corregir..."
-                );
+                println!("CONSTRUCTOR: intentando corregir...");
             }
 
             // =================================================
             // ERROR DE COMPILACIÓN
             // =================================================
-
             Err(error) => {
-                println!(
-                    "COMPILER: error de compilación:"
-                );
+                println!("COMPILER: error de compilación:");
 
                 println!("{}", error);
 
@@ -142,14 +132,11 @@ fn main() {
                 // GUARDAMOS EL ERROR EN EL ESTADO
                 // -------------------------------------------------
 
-                state.errors.push(format!(
-                    "Error de compilación: {}",
-                    error.trim()
-                ));
+                state
+                    .errors
+                    .push(format!("Error de compilación: {}", error.trim()));
 
-                println!(
-                    "CONSTRUCTOR: se encontró un error de compilación."
-                );
+                println!("CONSTRUCTOR: se encontró un error de compilación.");
 
                 // -------------------------------------------------
                 // REPAIRER
@@ -157,9 +144,7 @@ fn main() {
 
                 repairer::repair(&mut state);
 
-                println!(
-                    "CONSTRUCTOR: intentando corregir..."
-                );
+                println!("CONSTRUCTOR: intentando corregir...");
             }
         }
     }

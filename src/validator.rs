@@ -8,9 +8,7 @@ pub fn validate(state: &mut CodeState) {
     let code = match &state.code {
         Some(code) => code,
         None => {
-            state
-                .errors
-                .push("No se generó ningún código.".to_string());
+            state.errors.push("No se generó ningún código.".to_string());
 
             println!(
                 "VALIDATOR: código inválido. {} error(es) encontrado(s)",
@@ -36,9 +34,8 @@ pub fn validate(state: &mut CodeState) {
     // ---------------------------------------------------------
 
     if state.request.contains("API REST") {
-        let has_server = code.contains("HTTP")
-            || code.contains("Server")
-            || code.contains("server");
+        let has_server =
+            code.contains("HTTP") || code.contains("Server") || code.contains("server");
 
         let has_endpoint = code.contains("GET")
             || code.contains("POST")
@@ -46,10 +43,9 @@ pub fn validate(state: &mut CodeState) {
             || code.contains("/api");
 
         if !has_server || !has_endpoint {
-            state.errors.push(
-                "El código no contiene la implementación esperada de API REST"
-                    .to_string(),
-            );
+            state
+                .errors
+                .push("El código no contiene la implementación esperada de API REST".to_string());
         }
     }
 

@@ -9,9 +9,7 @@ pub fn plan(state: &mut CodeState) {
 2. Definir endpoints
 3. Implementar handlers
 4. Agregar tests"
-    } else if request.contains("calculadora")
-        || request.contains("calculator")
-    {
+    } else if request.contains("calculadora") || request.contains("calculator") {
         "1. Definir las operaciones matemáticas
 2. Implementar las funciones de cálculo
 3. Implementar la interfaz de entrada
