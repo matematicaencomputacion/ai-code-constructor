@@ -9,7 +9,8 @@ use state::CodeState;
 
 fn main() {
     let mut state = CodeState {
-        request: "Crear una API REST".to_string(),
+        request: std::env::args().skip(1).collect::<Vec<String>>().join(" "),
+
         plan: None,
         code: None,
         errors: Vec::new(),

@@ -6,7 +6,7 @@ use crate::state::CodeState;
 /// defectuoso para probar el ciclo de compilación y reparación.
 ///
 /// Las siguientes iteraciones utilizan el feedback generado
-/// por el Repairer para producir una versión corregida.
+/// por el Repairer y el plan generado por el Planner.
 pub fn build(state: &mut CodeState) {
     println!("BUILDER: generando código...");
     println!("BUILDER: request -> {}", state.request);
@@ -23,8 +23,7 @@ pub fn build(state: &mut CodeState) {
         println!("BUILDER: generando primera versión...");
 
         // Generamos deliberadamente código incorrecto.
-        // La diferencia es que ahora el código incorpora
-        // información real del request.
+        // El request sigue siendo información real del estado.
         let code = format!(
             r#"fn main() {{
     println!("Request: {}"
@@ -54,20 +53,23 @@ pub fn build(state: &mut CodeState) {
 
         let plan = state.plan.as_deref().unwrap_or("Sin plan disponible");
 
+        let plan_comments = plan
+            .lines()
+            .map(|line| format!("// {}", line))
+            .collect::<Vec<String>>()
+            .join("\n");
+
         let corrected_code = format!(
             r#"fn main() {{
     println!("Request: {}");
 
     // Plan utilizado:
-    // {}
+    {}
 
-    // HTTP Server
-    // GET /api
-    // endpoint: GET /api
+    // Implementación basada en el plan.
 }}
 "#,
-            state.request,
-            plan.replace('\n', "\n// ")
+            state.request, plan_comments
         );
 
         state.code = Some(corrected_code);
@@ -82,16 +84,25 @@ pub fn build(state: &mut CodeState) {
 
     println!("BUILDER: generando versión estándar...");
 
+    let plan = state.plan.as_deref().unwrap_or("Sin plan disponible");
+
+    let plan_comments = plan
+        .lines()
+        .map(|line| format!("// {}", line))
+        .collect::<Vec<String>>()
+        .join("\n");
+
     let code = format!(
         r#"fn main() {{
     println!("Request: {}");
 
-    // HTTP Server
-    // GET /api
-    // endpoint: GET /api
+    // Plan utilizado:
+    {}
+
+    // Implementación basada en el plan.
 }}
 "#,
-        state.request
+        state.request, plan_comments
     );
 
     state.code = Some(code);
