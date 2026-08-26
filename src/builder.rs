@@ -32,6 +32,7 @@ pub fn build(state: &mut CodeState) {
 
         // Código deliberadamente defectuoso para probar
         // el ciclo Compiler -> Repairer -> Builder.
+        // Defecto: println! sin cerrar el llamado (falta `);`).
         let code = format!(
             r#"fn main() {{
     println!("Request: {}"
@@ -63,8 +64,21 @@ pub fn build(state: &mut CodeState) {
     // =========================================================
     // GENERACIÓN BASADA EN EL TIPO DE PLAN
     // =========================================================
+    // La base depende exclusivamente de `plan.kind`. El feedback solo
+    // transforma esa base; nunca concatena plantillas de otros planes.
 
-    let base_implementation = match plan.kind {
+    let kind = plan.kind.clone();
+    let base_implementation = base_implementation_for(kind);
+
+    let implementation = apply_feedback(base_implementation, &state.feedback, &state.request);
+
+    state.code = Some(implementation);
+
+    println!("BUILDER: código generado a partir del plan y el feedback");
+}
+
+fn base_implementation_for(kind: PlanKind) -> String {
+    match kind {
         PlanKind::Calculator => r#"fn main() {
     let resultado = sumar(2, 3);
     println!("Resultado: {}", resultado);
@@ -131,27 +145,35 @@ fn implementar_funcionalidad() {
 }
 "#
         .to_string(),
-    };
+    }
+}
 
-    let implementation = apply_feedback(base_implementation, &state.feedback);
+/// Defecto deliberado de la iteración 1: `println!("Request: …"` sin `);`.
+#[cfg(test)]
+fn defective_request_println(request: &str) -> String {
+    // Tras el cierre de la cadena viene un salto de línea, no `);`.
+    format!(r#"println!("Request: {request}""#) + "\n"
+}
 
-    state.code = Some(implementation);
+/// Misma sentencia con los delimitadores correctamente cerrados.
+fn corrected_request_println(request: &str) -> String {
+    format!(r#"println!("Request: {request}");"#)
+}
 
-    println!("BUILDER: código generado a partir del plan y el feedback");
+fn has_delimiter_feedback(feedback: &[String]) -> bool {
+    feedback
+        .iter()
+        .any(|item| item.contains("delimitadores") || item.contains("delimitador sin cerrar"))
 }
 
 /// Aplica el feedback del Repairer sobre la implementación base del plan.
 ///
-/// El efecto es determinista y depende del *contenido* de cada mensaje:
-/// distintos tipos de feedback producen transformaciones distintas.
-fn apply_feedback(base_implementation: String, feedback: &[String]) -> String {
+/// Para feedback de delimitadores, corrige el defecto concreto de la iteración 1:
+/// cierra el `println!("Request: …")` que quedó sin `);`.
+fn apply_feedback(base_implementation: String, feedback: &[String], request: &str) -> String {
     if feedback.is_empty() {
         return base_implementation;
     }
-
-    let has_delimiter_feedback = feedback
-        .iter()
-        .any(|item| item.contains("delimitadores") || item.contains("delimitador sin cerrar"));
 
     let has_structure_feedback = feedback
         .iter()
@@ -159,21 +181,14 @@ fn apply_feedback(base_implementation: String, feedback: &[String]) -> String {
 
     let mut implementation = base_implementation;
 
-    if has_delimiter_feedback {
-        implementation = inject_main_call(implementation, "asegurar_delimitadores_balanceados();");
-        implementation.push_str(
-            r#"
-fn asegurar_delimitadores_balanceados() {
-    let _llaves = ('{', '}');
-    let _parens = ('(', ')');
-    println!("Delimitadores balanceados tras feedback");
-}
-"#,
-        );
+    if has_delimiter_feedback(feedback) {
+        // Reparación real: reintroducir el println del request YA cerrado.
+        let fixed = corrected_request_println(request);
+        implementation = inject_main_statement(implementation, &fixed);
     }
 
     if has_structure_feedback {
-        implementation = inject_main_call(implementation, "validar_estructura_rust();");
+        implementation = inject_main_statement(implementation, "validar_estructura_rust();");
         implementation.push_str(
             r#"
 fn validar_estructura_rust() {
@@ -183,10 +198,9 @@ fn validar_estructura_rust() {
         );
     }
 
-    // Feedback genérico: efecto distinto al de delimitadores/estructura,
-    // para que el contenido (no solo la presencia) determine el código.
-    if !has_delimiter_feedback && !has_structure_feedback {
-        implementation = inject_main_call(implementation, "aplicar_feedback_generico();");
+    // Feedback genérico: efecto distinto al de delimitadores/estructura.
+    if !has_delimiter_feedback(feedback) && !has_structure_feedback {
+        implementation = inject_main_statement(implementation, "aplicar_feedback_generico();");
         implementation.push_str(
             r#"
 fn aplicar_feedback_generico() {
@@ -199,15 +213,24 @@ fn aplicar_feedback_generico() {
     implementation
 }
 
-fn inject_main_call(implementation: String, call: &str) -> String {
-    implementation.replacen("fn main() {\n", &format!("fn main() {{\n    {call}\n"), 1)
+fn inject_main_statement(implementation: String, statement: &str) -> String {
+    implementation.replacen(
+        "fn main() {\n",
+        &format!("fn main() {{\n    {statement}\n"),
+        1,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::compiler;
     use crate::planner::{BuildPlan, PlanKind};
+    use crate::repairer;
     use crate::state::CodeState;
+    use std::sync::Mutex;
+
+    static COMPILE_LOCK: Mutex<()> = Mutex::new(());
 
     fn state_with_plan(kind: PlanKind, request: &str, iteration: u32) -> CodeState {
         CodeState {
@@ -229,6 +252,10 @@ mod tests {
         opens == closes
     }
 
+    fn contains_defective_request_println(code: &str, request: &str) -> bool {
+        code.contains(&defective_request_println(request))
+    }
+
     #[test]
     fn builder_first_iteration_generates_deliberately_broken_code() {
         let request = "Crear una calculadora";
@@ -242,10 +269,9 @@ mod tests {
         let code = state.code.expect("El Builder debe generar código");
         assert!(code.contains(request));
         assert!(code.contains("fn main()"));
-        // Código incompleto a propósito (falta cierre de println)
-        assert!(!code.contains(r#"println!("Request: {}");"#));
-        // iteration == 1 ignora el feedback y no aplica correcciones
-        assert!(!code.contains("asegurar_delimitadores_balanceados"));
+        assert!(contains_defective_request_println(&code, request));
+        // iteration == 1 ignora el feedback y no aplica la corrección
+        assert!(!code.contains(&corrected_request_println(request)));
     }
 
     #[test]
@@ -308,14 +334,15 @@ mod tests {
         let code = state.code.expect("El Builder debe generar código");
         assert!(code.contains("sumar"));
         assert!(code.contains("a + b"));
-        assert!(!code.contains("asegurar_delimitadores_balanceados"));
+        assert!(!code.contains("Request:"));
         assert!(!code.contains("aplicar_feedback_generico"));
         assert!(!code.contains("validar_estructura_rust"));
     }
 
     #[test]
     fn builder_delimiter_feedback_produces_balanced_corrected_code() {
-        let mut state = state_with_plan(PlanKind::Api, "Crear una API REST", 2);
+        let request = "Crear una API REST";
+        let mut state = state_with_plan(PlanKind::Api, request, 2);
         state.feedback.push(
             "Revisar los delimitadores del código generado. \
              Verificar que todas las llaves { } y paréntesis ( ) \
@@ -327,22 +354,21 @@ mod tests {
 
         let code = state.code.expect("El Builder debe generar código");
         assert!(braces_are_balanced(&code));
-        assert!(code.contains("asegurar_delimitadores_balanceados"));
-        assert!(code.contains("Delimitadores balanceados tras feedback"));
+        assert!(code.contains(&corrected_request_println(request)));
+        assert!(!contains_defective_request_println(&code, request));
         assert!(code.contains("crear_servidor"));
-        assert!(!code.contains(r#"println!("Request:"#));
     }
 
     #[test]
     fn builder_delimiter_feedback_changes_code_versus_no_feedback() {
-        let mut without_feedback =
-            state_with_plan(PlanKind::Calculator, "Crear una calculadora", 2);
+        let request = "Crear una calculadora";
+        let mut without_feedback = state_with_plan(PlanKind::Calculator, request, 2);
         build(&mut without_feedback);
         let code_without = without_feedback
             .code
             .expect("Debe generar código sin feedback");
 
-        let mut with_feedback = state_with_plan(PlanKind::Calculator, "Crear una calculadora", 2);
+        let mut with_feedback = state_with_plan(PlanKind::Calculator, request, 2);
         with_feedback.feedback.push(
             "Existe un delimitador sin cerrar. \
              Revisar llaves, paréntesis y corchetes."
@@ -354,15 +380,16 @@ mod tests {
             .expect("Debe generar código con feedback");
 
         assert_ne!(code_with, code_without);
-        assert!(code_with.contains("asegurar_delimitadores_balanceados"));
-        assert!(!code_without.contains("asegurar_delimitadores_balanceados"));
+        assert!(code_with.contains(&corrected_request_println(request)));
+        assert!(!code_without.contains(&corrected_request_println(request)));
         assert!(code_with.contains("sumar"));
         assert!(braces_are_balanced(&code_with));
     }
 
     #[test]
     fn builder_consumes_feedback_content_not_only_presence() {
-        let mut delimiter_state = state_with_plan(PlanKind::Generic, "app", 2);
+        let request = "app";
+        let mut delimiter_state = state_with_plan(PlanKind::Generic, request, 2);
         delimiter_state
             .feedback
             .push("Revisar los delimitadores del código generado.".to_string());
@@ -371,7 +398,7 @@ mod tests {
             .code
             .expect("código con feedback delimitadores");
 
-        let mut generic_state = state_with_plan(PlanKind::Generic, "app", 2);
+        let mut generic_state = state_with_plan(PlanKind::Generic, request, 2);
         generic_state.feedback.push(
             "Analizar y corregir el siguiente error de compilación: cannot find value `x`"
                 .to_string(),
@@ -379,7 +406,7 @@ mod tests {
         build(&mut generic_state);
         let generic_code = generic_state.code.expect("código con feedback genérico");
 
-        let mut structure_state = state_with_plan(PlanKind::Generic, "app", 2);
+        let mut structure_state = state_with_plan(PlanKind::Generic, request, 2);
         structure_state
             .feedback
             .push("El código contiene texto fuera de una estructura Rust válida.".to_string());
@@ -392,14 +419,129 @@ mod tests {
         assert_ne!(delimiter_code, structure_code);
         assert_ne!(generic_code, structure_code);
 
-        assert!(delimiter_code.contains("asegurar_delimitadores_balanceados"));
+        assert!(delimiter_code.contains(&corrected_request_println(request)));
         assert!(!delimiter_code.contains("aplicar_feedback_generico"));
         assert!(!delimiter_code.contains("validar_estructura_rust"));
 
         assert!(generic_code.contains("aplicar_feedback_generico"));
-        assert!(!generic_code.contains("asegurar_delimitadores_balanceados"));
+        assert!(!generic_code.contains(&corrected_request_println(request)));
 
         assert!(structure_code.contains("validar_estructura_rust"));
-        assert!(!structure_code.contains("asegurar_delimitadores_balanceados"));
+        assert!(!structure_code.contains(&corrected_request_println(request)));
+    }
+
+    #[test]
+    fn delimiter_repair_chain_fixes_concrete_compile_defect() {
+        let _guard = COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let request = "Crear una API REST";
+
+        // A. iteration == 1 produce código que no compila
+        let mut state = state_with_plan(PlanKind::Api, request, 1);
+        build(&mut state);
+        let broken = state.code.clone().expect("Debe existir código defectuoso");
+        assert!(contains_defective_request_println(&broken, request));
+
+        let compile_error =
+            compiler::compile(&broken).expect_err("A: el código defectuoso debe fallar");
+
+        // B. el fallo es el error concreto de delimitadores
+        assert!(
+            compile_error.contains("mismatched closing delimiter")
+                || compile_error.contains("unclosed delimiter"),
+            "B: error inesperado: {compile_error}"
+        );
+
+        // C. Repairer convierte ese error en feedback concreto
+        state
+            .errors
+            .push(format!("Error de compilación: {}", compile_error.trim()));
+        repairer::repair(&mut state);
+        assert!(
+            state
+                .feedback
+                .iter()
+                .any(|f| f.contains("delimitadores") || f.contains("delimitador")),
+            "C: feedback inesperado: {:?}",
+            state.feedback
+        );
+
+        // D/E. Builder consume el feedback y elimina el defecto
+        state.iteration = 2;
+        build(&mut state);
+        let fixed = state
+            .code
+            .as_ref()
+            .expect("D: debe generar código corregido");
+        assert!(
+            fixed.contains(&corrected_request_println(request)),
+            "D: debe incluir el println corregido"
+        );
+        assert!(
+            !contains_defective_request_println(fixed, request),
+            "E: no debe conservar el defecto original"
+        );
+        assert!(fixed.contains("crear_servidor"));
+        assert!(fixed.contains("definir_endpoints"));
+        assert!(fixed.contains("implementar_handlers"));
+
+        // El código Api no debe mezclar fragmentos de otros planes
+        assert!(
+            !fixed.contains("validar_credenciales"),
+            "no debe contener Authentication"
+        );
+        assert!(
+            !fixed.contains("password.is_empty()"),
+            "no debe contener fragmento residual de Authentication"
+        );
+        assert!(
+            !fixed.contains("rio.is_empty()"),
+            "no debe contener cola residual de Authentication"
+        );
+        assert!(!fixed.contains("fn sumar"), "no debe contener Calculator");
+        assert!(
+            !fixed.contains("analizar_requisitos"),
+            "no debe contener Generic"
+        );
+        assert!(
+            braces_are_balanced(fixed),
+            "no debe haber llaves de cierre extra"
+        );
+
+        // F. el código corregido compila
+        compiler::compile(fixed).expect("F: el código corregido debe compilar");
+    }
+
+    #[test]
+    fn api_delimiter_repair_stays_within_api_plan_and_compiles() {
+        let _guard = COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let request = "Crear una API REST";
+        let mut state = state_with_plan(PlanKind::Api, request, 2);
+        state.feedback.push(
+            "Revisar los delimitadores del código generado. \
+             Verificar que todas las llaves { } y paréntesis ( ) \
+             estén correctamente balanceados."
+                .to_string(),
+        );
+
+        build(&mut state);
+
+        let code = state.code.expect("debe generar código Api corregido");
+        assert!(code.contains(&corrected_request_println(request)));
+        assert!(!contains_defective_request_println(&code, request));
+        assert!(code.contains("crear_servidor"));
+        assert!(code.contains("Servidor HTTP"));
+        assert!(!code.contains("validar_credenciales"));
+        assert!(!code.contains("password.is_empty()"));
+        assert!(!code.contains("rio.is_empty()"));
+        assert!(!code.contains("fn sumar"));
+        assert!(!code.contains("analizar_requisitos"));
+        assert!(braces_are_balanced(&code));
+        compiler::compile(&code).expect("Api + feedback de delimitadores debe compilar");
     }
 }
