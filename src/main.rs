@@ -248,9 +248,16 @@ mod integration_tests {
             .code
             .as_ref()
             .expect("El ciclo debe dejar código generado");
+        // Defecto iteración 1: println sin `);`. Tras feedback debe estar cerrado.
+        let corrected = format!(r#"println!("Request: {request}");"#);
+        let defective = format!(r#"println!("Request: {request}""#) + "\n";
         assert!(
-            !code.contains(&format!("Request: {request}")),
-            "El código final no debe ser la versión defectuosa de la primera iteración"
+            code.contains(&corrected),
+            "El código final debe corregir el println del request"
+        );
+        assert!(
+            !code.contains(&defective),
+            "No debe quedar el println defectuoso sin cerrar"
         );
         assert!(code.contains("crear_servidor"));
         assert!(code.contains("definir_endpoints") || code.contains("endpoint"));
