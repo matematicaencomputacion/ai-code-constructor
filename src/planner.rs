@@ -1,6 +1,6 @@
 use crate::state::CodeState;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PlanKind {
     Api,
     Calculator,
@@ -72,4 +72,69 @@ pub fn plan(state: &mut CodeState) {
     }
 
     state.plan = Some(plan);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::CodeState;
+
+    fn state_with_request(request: &str) -> CodeState {
+        CodeState {
+            request: request.to_string(),
+            plan: None,
+            code: None,
+            errors: Vec::new(),
+            feedback: Vec::new(),
+            iteration: 0,
+        }
+    }
+
+    #[test]
+    fn planner_detects_api_rest() {
+        let mut state = state_with_request("Crear una API REST");
+
+        plan(&mut state);
+
+        let build_plan = state.plan.expect("El Planner debe generar un plan");
+
+        assert_eq!(build_plan.kind, PlanKind::Api);
+        assert_eq!(build_plan.steps.len(), 4);
+    }
+
+    #[test]
+    fn planner_detects_calculator() {
+        let mut state = state_with_request("Crear una calculadora");
+
+        plan(&mut state);
+
+        let build_plan = state.plan.expect("El Planner debe generar un plan");
+
+        assert_eq!(build_plan.kind, PlanKind::Calculator);
+        assert_eq!(build_plan.steps.len(), 4);
+    }
+
+    #[test]
+    fn planner_detects_authentication() {
+        let mut state = state_with_request("Crear un sistema de autenticación");
+
+        plan(&mut state);
+
+        let build_plan = state.plan.expect("El Planner debe generar un plan");
+
+        assert_eq!(build_plan.kind, PlanKind::Authentication);
+        assert_eq!(build_plan.steps.len(), 4);
+    }
+
+    #[test]
+    fn planner_uses_generic_plan_for_unknown_request() {
+        let mut state = state_with_request("Crear una aplicación de inventario");
+
+        plan(&mut state);
+
+        let build_plan = state.plan.expect("El Planner debe generar un plan");
+
+        assert_eq!(build_plan.kind, PlanKind::Generic);
+        assert_eq!(build_plan.steps.len(), 4);
+    }
 }
