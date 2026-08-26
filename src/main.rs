@@ -31,7 +31,11 @@ fn main() {
 
     if let Some(plan) = &state.plan {
         println!("PLANNER: plan generado:");
-        println!("{}", plan);
+        println!("Tipo: {:?}", plan.kind);
+
+        for (index, step) in plan.steps.iter().enumerate() {
+            println!("{}. {}", index + 1, step);
+        }
     }
 
     // =========================================================

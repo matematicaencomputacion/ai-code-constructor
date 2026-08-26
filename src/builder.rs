@@ -1,3 +1,4 @@
+use crate::planner::PlanKind;
 use crate::state::CodeState;
 
 /// Genera código a partir del estado actual.
@@ -11,9 +12,16 @@ pub fn build(state: &mut CodeState) {
     println!("BUILDER: generando código...");
     println!("BUILDER: request -> {}", state.request);
 
-    if let Some(plan) = &state.plan {
-        println!("BUILDER: utilizando plan -> {}", plan);
-    }
+    let plan = match &state.plan {
+        Some(plan) => plan,
+        None => {
+            println!("BUILDER: no hay plan disponible.");
+            state.code = None;
+            return;
+        }
+    };
+
+    println!("BUILDER: utilizando plan -> {:?}", plan);
 
     // =========================================================
     // PRIMERA ITERACIÓN
@@ -22,8 +30,8 @@ pub fn build(state: &mut CodeState) {
     if state.iteration == 1 {
         println!("BUILDER: generando primera versión...");
 
-        // Generamos deliberadamente código incorrecto.
-        // El request sigue siendo información real del estado.
+        // Código deliberadamente defectuoso para probar
+        // el ciclo Compiler -> Repairer -> Builder.
         let code = format!(
             r#"fn main() {{
     println!("Request: {}"
@@ -50,62 +58,82 @@ pub fn build(state: &mut CodeState) {
         }
 
         println!("BUILDER: generando versión corregida...");
-
-        let plan = state.plan.as_deref().unwrap_or("Sin plan disponible");
-
-        let plan_comments = plan
-            .lines()
-            .map(|line| format!("// {}", line))
-            .collect::<Vec<String>>()
-            .join("\n");
-
-        let corrected_code = format!(
-            r#"fn main() {{
-    println!("Request: {}");
-
-    // Plan utilizado:
-    {}
-
-    // Implementación basada en el plan.
-}}
-"#,
-            state.request, plan_comments
-        );
-
-        state.code = Some(corrected_code);
-
-        println!("BUILDER: código corregido generado");
-        return;
     }
 
     // =========================================================
-    // FALLBACK
+    // GENERACIÓN BASADA EN EL TIPO DE PLAN
     // =========================================================
 
-    println!("BUILDER: generando versión estándar...");
+    let implementation = match plan.kind {
+        PlanKind::Calculator => r#"fn main() {
+    let resultado = sumar(2, 3);
+    println!("Resultado: {}", resultado);
+}
 
-    let plan = state.plan.as_deref().unwrap_or("Sin plan disponible");
+fn sumar(a: i32, b: i32) -> i32 {
+    a + b
+}
+"#
+        .to_string(),
 
-    let plan_comments = plan
-        .lines()
-        .map(|line| format!("// {}", line))
-        .collect::<Vec<String>>()
-        .join("\n");
+        PlanKind::Authentication => r#"fn main() {
+    let usuario_valido = validar_credenciales("usuario", "password");
 
-    let code = format!(
-        r#"fn main() {{
-    println!("Request: {}");
+    if usuario_valido {
+        println!("Login correcto");
+    } else {
+        println!("Login incorrecto");
+    }
+}
 
-    // Plan utilizado:
-    {}
+fn validar_credenciales(usuario: &str, password: &str) -> bool {
+    !usuario.is_empty() && !password.is_empty()
+}
+"#
+        .to_string(),
 
-    // Implementación basada en el plan.
-}}
-"#,
-        state.request, plan_comments
-    );
+        PlanKind::Api => r#"fn main() {
+    crear_servidor();
+    definir_endpoints();
+    implementar_handlers();
+}
 
-    state.code = Some(code);
+fn crear_servidor() {
+    println!("Servidor HTTP configurado");
+}
 
-    println!("BUILDER: código generado");
+fn definir_endpoints() {
+    println!("Endpoints definidos");
+}
+
+fn implementar_handlers() {
+    println!("Handlers implementados");
+}
+"#
+        .to_string(),
+
+        PlanKind::Generic => r#"fn main() {
+    analizar_requisitos();
+    disenar_solucion();
+    implementar_funcionalidad();
+}
+
+fn analizar_requisitos() {
+    println!("Requisitos analizados");
+}
+
+fn disenar_solucion() {
+    println!("Solución diseñada");
+}
+
+fn implementar_funcionalidad() {
+    println!("Funcionalidad principal implementada");
+}
+"#
+        .to_string(),
+    };
+
+    state.code = Some(implementation);
+
+    println!("BUILDER: código generado a partir del plan");
 }
