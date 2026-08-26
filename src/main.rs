@@ -7,6 +7,9 @@ mod validator;
 
 use state::CodeState;
 
+/// Máximo de intentos del ciclo autónomo Builder → Compiler → Validator → Repairer.
+const MAX_ITERATIONS: u32 = 3;
+
 fn main() {
     let request = std::env::args().skip(1).collect::<Vec<String>>().join(" ");
     let _state = run_constructor(&request);
@@ -14,6 +17,12 @@ fn main() {
 
 /// Ejecuta el ciclo autónomo completo del Constructor y devuelve el estado final.
 fn run_constructor(request: &str) -> CodeState {
+    run_constructor_with_limit(request, MAX_ITERATIONS)
+}
+
+/// Igual que [`run_constructor`], pero permite fijar el tope de iteraciones
+/// (útil para tests del límite sin alterar los módulos de construcción).
+fn run_constructor_with_limit(request: &str, max_iterations: u32) -> CodeState {
     let mut state = CodeState {
         request: request.to_string(),
 
@@ -55,15 +64,6 @@ fn run_constructor(request: &str) -> CodeState {
             "\n================ ITERACIÓN {} ================",
             state.iteration
         );
-
-        // -----------------------------------------------------
-        // LÍMITE DE SEGURIDAD
-        // -----------------------------------------------------
-
-        if state.iteration > 6 {
-            println!("\nCONSTRUCTOR: límite de iteraciones alcanzado.");
-            break;
-        }
 
         // -----------------------------------------------------
         // IMPORTANTE:
@@ -129,6 +129,10 @@ fn run_constructor(request: &str) -> CodeState {
                 repairer::repair(&mut state);
 
                 println!("CONSTRUCTOR: intentando corregir...");
+
+                if reached_iteration_limit(&mut state, max_iterations) {
+                    break;
+                }
             }
 
             // =================================================
@@ -156,6 +160,10 @@ fn run_constructor(request: &str) -> CodeState {
                 repairer::repair(&mut state);
 
                 println!("CONSTRUCTOR: intentando corregir...");
+
+                if reached_iteration_limit(&mut state, max_iterations) {
+                    break;
+                }
             }
         }
     }
@@ -171,6 +179,28 @@ fn run_constructor(request: &str) -> CodeState {
     println!("\n================================================");
 
     state
+}
+
+/// Si se agotaron los intentos sin aprobación, deja evidencia en `state.errors`.
+fn reached_iteration_limit(state: &mut CodeState, max_iterations: u32) -> bool {
+    if state.iteration < max_iterations {
+        return false;
+    }
+
+    println!("\nCONSTRUCTOR: límite de iteraciones alcanzado.");
+    state.errors.push(format!(
+        "Límite de iteraciones alcanzado (máximo: {}).",
+        max_iterations
+    ));
+    true
+}
+
+#[cfg(test)]
+fn hit_iteration_limit(state: &CodeState) -> bool {
+    state
+        .errors
+        .iter()
+        .any(|error| error.contains("Límite de iteraciones alcanzado"))
 }
 
 #[cfg(test)]
@@ -194,7 +224,10 @@ mod integration_tests {
 
         assert_eq!(state.request, request);
 
-        let plan = state.plan.expect("El ciclo debe conservar el plan");
+        let plan = state
+            .plan
+            .as_ref()
+            .expect("El ciclo debe conservar el plan");
         assert_eq!(plan.kind, PlanKind::Api);
 
         // El ciclo debió pasar por reparación: iteración 1 falla, iteración 2 aprueba.
@@ -211,7 +244,10 @@ mod integration_tests {
             "El feedback debe reflejar el error de delimitadores de la primera versión"
         );
 
-        let code = state.code.expect("El ciclo debe dejar código generado");
+        let code = state
+            .code
+            .as_ref()
+            .expect("El ciclo debe dejar código generado");
         assert!(
             !code.contains(&format!("Request: {request}")),
             "El código final no debe ser la versión defectuosa de la primera iteración"
@@ -225,6 +261,11 @@ mod integration_tests {
             "Al aprobar no deben quedar errores: {:?}",
             state.errors
         );
+        assert!(
+            !hit_iteration_limit(&state),
+            "Una construcción aprobada no debe reportar límite de iteraciones"
+        );
+        assert!(state.iteration < MAX_ITERATIONS);
     }
 
     #[test]
@@ -238,7 +279,10 @@ mod integration_tests {
 
         assert_eq!(state.request, request);
 
-        let plan = state.plan.expect("El ciclo debe conservar el plan");
+        let plan = state
+            .plan
+            .as_ref()
+            .expect("El ciclo debe conservar el plan");
         assert_eq!(plan.kind, PlanKind::Calculator);
 
         assert!(
@@ -247,7 +291,10 @@ mod integration_tests {
         );
         assert!(!state.feedback.is_empty());
 
-        let code = state.code.expect("El ciclo debe dejar código generado");
+        let code = state
+            .code
+            .as_ref()
+            .expect("El ciclo debe dejar código generado");
         assert!(code.contains("sumar"));
         assert!(code.contains("a + b"));
 
@@ -256,6 +303,7 @@ mod integration_tests {
             "No deben quedar errores finales: {:?}",
             state.errors
         );
+        assert!(!hit_iteration_limit(&state));
     }
 
     #[test]
@@ -269,7 +317,10 @@ mod integration_tests {
 
         assert_eq!(state.request, request);
 
-        let plan = state.plan.expect("El ciclo debe conservar el plan");
+        let plan = state
+            .plan
+            .as_ref()
+            .expect("El ciclo debe conservar el plan");
         assert_eq!(plan.kind, PlanKind::Authentication);
 
         assert!(
@@ -278,7 +329,10 @@ mod integration_tests {
         );
         assert!(!state.feedback.is_empty());
 
-        let code = state.code.expect("El ciclo debe dejar código generado");
+        let code = state
+            .code
+            .as_ref()
+            .expect("El ciclo debe dejar código generado");
         assert!(code.contains("validar_credenciales"));
         assert!(code.contains("Login correcto") || code.contains("Login incorrecto"));
 
@@ -286,6 +340,92 @@ mod integration_tests {
             state.errors.is_empty(),
             "No deben quedar errores finales: {:?}",
             state.errors
+        );
+        assert!(!hit_iteration_limit(&state));
+    }
+
+    #[test]
+    fn constructor_stops_at_iteration_limit_without_approval() {
+        let _guard = CONSTRUCTOR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        // Con tope 1 solo corre la versión defectuosa deliberada; no puede aprobar.
+        let max_iterations = 1;
+        let request = "Crear una calculadora";
+        let state = run_constructor_with_limit(request, max_iterations);
+
+        assert_eq!(state.iteration, max_iterations);
+        assert!(
+            state.iteration <= MAX_ITERATIONS,
+            "El ciclo no debe superar MAX_ITERATIONS"
+        );
+        assert!(
+            hit_iteration_limit(&state),
+            "Debe quedar evidencia explícita del límite en state.errors: {:?}",
+            state.errors
+        );
+        assert!(
+            state
+                .errors
+                .iter()
+                .any(|e| e.contains("Error de compilación")),
+            "Deben conservarse los errores de la última iteración fallida"
+        );
+        assert!(
+            !state.feedback.is_empty(),
+            "El Repairer debe haber generado feedback antes del corte"
+        );
+
+        let code = state
+            .code
+            .as_ref()
+            .expect("Debe conservarse el código generado");
+        assert!(code.contains(&format!("Request: {request}")));
+
+        let plan = state.plan.as_ref().expect("Debe conservarse el plan");
+        assert_eq!(plan.kind, PlanKind::Calculator);
+        assert_eq!(state.request, request);
+    }
+
+    #[test]
+    fn constructor_never_exceeds_configured_iteration_limit() {
+        let _guard = CONSTRUCTOR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let max_iterations = 2;
+        let state = run_constructor_with_limit("Crear una API REST", max_iterations);
+
+        // Con tope 2 el flujo actual aprueba exactamente en la segunda iteración.
+        assert!(state.iteration <= max_iterations);
+        assert!(state.errors.is_empty());
+        assert!(!hit_iteration_limit(&state));
+        assert_eq!(
+            state.plan.as_ref().map(|p| p.kind.clone()),
+            Some(PlanKind::Api)
+        );
+    }
+
+    #[test]
+    fn constructor_preserves_state_fields_when_hitting_iteration_limit() {
+        let _guard = CONSTRUCTOR_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let request = "Crear un sistema de autenticación";
+        let state = run_constructor_with_limit(request, 1);
+
+        assert_eq!(state.request, request);
+        assert!(state.plan.is_some());
+        assert!(state.code.is_some());
+        assert!(!state.errors.is_empty());
+        assert!(!state.feedback.is_empty());
+        assert_eq!(state.iteration, 1);
+        assert!(hit_iteration_limit(&state));
+        assert_eq!(
+            state.plan.as_ref().map(|p| p.kind.clone()),
+            Some(PlanKind::Authentication)
         );
     }
 }
