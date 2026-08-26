@@ -137,3 +137,89 @@ fn implementar_funcionalidad() {
 
     println!("BUILDER: código generado a partir del plan");
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::planner::{BuildPlan, PlanKind};
+    use crate::state::CodeState;
+
+    fn state_with_plan(kind: PlanKind, request: &str, iteration: u32) -> CodeState {
+        CodeState {
+            request: request.to_string(),
+            plan: Some(BuildPlan {
+                kind,
+                steps: vec!["paso".to_string()],
+            }),
+            code: None,
+            errors: Vec::new(),
+            feedback: Vec::new(),
+            iteration,
+        }
+    }
+
+    #[test]
+    fn builder_first_iteration_generates_deliberately_broken_code() {
+        let request = "Crear una calculadora";
+        let mut state = state_with_plan(PlanKind::Calculator, request, 1);
+
+        build(&mut state);
+
+        let code = state.code.expect("El Builder debe generar código");
+        assert!(code.contains(request));
+        assert!(code.contains("fn main()"));
+        // Código incompleto a propósito (falta cierre de println)
+        assert!(!code.contains(r#"println!("Request: {}");"#));
+    }
+
+    #[test]
+    fn builder_generates_api_code() {
+        let mut state = state_with_plan(PlanKind::Api, "Crear una API REST", 2);
+
+        build(&mut state);
+
+        let code = state.code.expect("El Builder debe generar código");
+        assert!(code.contains("crear_servidor"));
+        assert!(code.contains("definir_endpoints"));
+        assert!(code.contains("implementar_handlers"));
+        assert!(code.contains("Servidor HTTP"));
+        assert!(code.contains("Endpoints"));
+        assert!(code.contains("Handlers"));
+    }
+
+    #[test]
+    fn builder_generates_calculator_code() {
+        let mut state = state_with_plan(PlanKind::Calculator, "Crear una calculadora", 2);
+
+        build(&mut state);
+
+        let code = state.code.expect("El Builder debe generar código");
+        assert!(code.contains("sumar"));
+        assert!(code.contains("Resultado"));
+        assert!(code.contains("a + b"));
+    }
+
+    #[test]
+    fn builder_generates_authentication_code() {
+        let mut state = state_with_plan(PlanKind::Authentication, "Crear un sistema de login", 2);
+
+        build(&mut state);
+
+        let code = state.code.expect("El Builder debe generar código");
+        assert!(code.contains("validar_credenciales"));
+        assert!(code.contains("Login correcto"));
+        assert!(code.contains("Login incorrecto"));
+    }
+
+    #[test]
+    fn builder_generates_generic_code() {
+        let mut state = state_with_plan(PlanKind::Generic, "Crear una app de inventario", 2);
+
+        build(&mut state);
+
+        let code = state.code.expect("El Builder debe generar código");
+        assert!(code.contains("analizar_requisitos"));
+        assert!(code.contains("disenar_solucion"));
+        assert!(code.contains("implementar_funcionalidad"));
+    }
+}
