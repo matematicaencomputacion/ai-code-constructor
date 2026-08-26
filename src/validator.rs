@@ -66,3 +66,125 @@ pub fn validate(state: &mut CodeState) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::CodeState;
+
+    fn state_with_code(request: &str, code: Option<&str>) -> CodeState {
+        CodeState {
+            request: request.to_string(),
+            plan: None,
+            code: code.map(str::to_string),
+            errors: Vec::new(),
+            feedback: Vec::new(),
+            iteration: 0,
+        }
+    }
+
+    #[test]
+    fn validator_accepts_non_empty_code_for_generic_request() {
+        let mut state = state_with_code(
+            "Crear una calculadora",
+            Some("fn main() {\n    println!(\"ok\");\n}\n"),
+        );
+
+        validate(&mut state);
+
+        assert!(state.errors.is_empty());
+    }
+
+    #[test]
+    fn validator_rejects_when_code_is_none() {
+        let mut state = state_with_code("Crear una calculadora", None);
+
+        validate(&mut state);
+
+        assert_eq!(state.errors.len(), 1);
+        assert_eq!(state.errors[0], "No se generó ningún código.");
+    }
+
+    #[test]
+    fn validator_rejects_empty_code() {
+        let mut state = state_with_code("Crear una calculadora", Some("   \n\t  "));
+
+        validate(&mut state);
+
+        assert_eq!(state.errors.len(), 1);
+        assert_eq!(state.errors[0], "El código generado está vacío.");
+    }
+
+    #[test]
+    fn validator_clears_previous_errors_before_validating() {
+        let mut state = state_with_code(
+            "Crear una calculadora",
+            Some("fn main() {\n    println!(\"ok\");\n}\n"),
+        );
+        state.errors.push("error previo".to_string());
+
+        validate(&mut state);
+
+        assert!(state.errors.is_empty());
+    }
+
+    #[test]
+    fn validator_accepts_api_rest_code_with_server_and_endpoint() {
+        let mut state = state_with_code(
+            "Crear una API REST",
+            Some(
+                r#"fn main() {
+    println!("Servidor HTTP");
+    println!("endpoint /api");
+}
+"#,
+            ),
+        );
+
+        validate(&mut state);
+
+        assert!(state.errors.is_empty());
+    }
+
+    #[test]
+    fn validator_rejects_api_rest_code_without_expected_implementation() {
+        let mut state = state_with_code(
+            "Crear una API REST",
+            Some("fn main() {\n    println!(\"hola\");\n}\n"),
+        );
+
+        validate(&mut state);
+
+        assert_eq!(state.errors.len(), 1);
+        assert_eq!(
+            state.errors[0],
+            "El código no contiene la implementación esperada de API REST"
+        );
+    }
+
+    #[test]
+    fn validator_does_not_apply_api_rest_rules_when_request_lacks_exact_phrase() {
+        let mut state = state_with_code(
+            "Crear una api rest",
+            Some("fn main() {\n    println!(\"hola\");\n}\n"),
+        );
+
+        validate(&mut state);
+
+        assert!(state.errors.is_empty());
+    }
+
+    #[test]
+    fn validator_reports_empty_and_api_rest_errors_together() {
+        let mut state = state_with_code("Crear una API REST", Some(""));
+
+        validate(&mut state);
+
+        assert_eq!(state.errors.len(), 2);
+        assert_eq!(state.errors[0], "El código generado está vacío.");
+        assert_eq!(
+            state.errors[1],
+            "El código no contiene la implementación esperada de API REST"
+        );
+    }
+}
