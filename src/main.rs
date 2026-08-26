@@ -9,7 +9,8 @@ use state::CodeState;
 
 fn main() {
     let mut state = CodeState {
-        request: "Crear una API REST".to_string(),
+        request: std::env::args().skip(1).collect::<Vec<String>>().join(" "),
+
         plan: None,
         code: None,
         errors: Vec::new(),
@@ -30,7 +31,11 @@ fn main() {
 
     if let Some(plan) = &state.plan {
         println!("PLANNER: plan generado:");
-        println!("{}", plan);
+        println!("Tipo: {:?}", plan.kind);
+
+        for (index, step) in plan.steps.iter().enumerate() {
+            println!("{}. {}", index + 1, step);
+        }
     }
 
     // =========================================================
