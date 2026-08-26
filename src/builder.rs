@@ -64,8 +64,21 @@ pub fn build(state: &mut CodeState) {
     // =========================================================
     // GENERACIÓN BASADA EN EL TIPO DE PLAN
     // =========================================================
+    // La base depende exclusivamente de `plan.kind`. El feedback solo
+    // transforma esa base; nunca concatena plantillas de otros planes.
 
-    let base_implementation = match plan.kind {
+    let kind = plan.kind.clone();
+    let base_implementation = base_implementation_for(kind);
+
+    let implementation = apply_feedback(base_implementation, &state.feedback, &state.request);
+
+    state.code = Some(implementation);
+
+    println!("BUILDER: código generado a partir del plan y el feedback");
+}
+
+fn base_implementation_for(kind: PlanKind) -> String {
+    match kind {
         PlanKind::Calculator => r#"fn main() {
     let resultado = sumar(2, 3);
     println!("Resultado: {}", resultado);
@@ -132,13 +145,7 @@ fn implementar_funcionalidad() {
 }
 "#
         .to_string(),
-    };
-
-    let implementation = apply_feedback(base_implementation, &state.feedback, &state.request);
-
-    state.code = Some(implementation);
-
-    println!("BUILDER: código generado a partir del plan y el feedback");
+    }
 }
 
 /// Defecto deliberado de la iteración 1: `println!("Request: …"` sin `);`.
@@ -477,8 +484,64 @@ mod tests {
             "E: no debe conservar el defecto original"
         );
         assert!(fixed.contains("crear_servidor"));
+        assert!(fixed.contains("definir_endpoints"));
+        assert!(fixed.contains("implementar_handlers"));
+
+        // El código Api no debe mezclar fragmentos de otros planes
+        assert!(
+            !fixed.contains("validar_credenciales"),
+            "no debe contener Authentication"
+        );
+        assert!(
+            !fixed.contains("password.is_empty()"),
+            "no debe contener fragmento residual de Authentication"
+        );
+        assert!(
+            !fixed.contains("rio.is_empty()"),
+            "no debe contener cola residual de Authentication"
+        );
+        assert!(!fixed.contains("fn sumar"), "no debe contener Calculator");
+        assert!(
+            !fixed.contains("analizar_requisitos"),
+            "no debe contener Generic"
+        );
+        assert!(
+            braces_are_balanced(fixed),
+            "no debe haber llaves de cierre extra"
+        );
 
         // F. el código corregido compila
         compiler::compile(fixed).expect("F: el código corregido debe compilar");
+    }
+
+    #[test]
+    fn api_delimiter_repair_stays_within_api_plan_and_compiles() {
+        let _guard = COMPILE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+
+        let request = "Crear una API REST";
+        let mut state = state_with_plan(PlanKind::Api, request, 2);
+        state.feedback.push(
+            "Revisar los delimitadores del código generado. \
+             Verificar que todas las llaves { } y paréntesis ( ) \
+             estén correctamente balanceados."
+                .to_string(),
+        );
+
+        build(&mut state);
+
+        let code = state.code.expect("debe generar código Api corregido");
+        assert!(code.contains(&corrected_request_println(request)));
+        assert!(!contains_defective_request_println(&code, request));
+        assert!(code.contains("crear_servidor"));
+        assert!(code.contains("Servidor HTTP"));
+        assert!(!code.contains("validar_credenciales"));
+        assert!(!code.contains("password.is_empty()"));
+        assert!(!code.contains("rio.is_empty()"));
+        assert!(!code.contains("fn sumar"));
+        assert!(!code.contains("analizar_requisitos"));
+        assert!(braces_are_balanced(&code));
+        compiler::compile(&code).expect("Api + feedback de delimitadores debe compilar");
     }
 }
