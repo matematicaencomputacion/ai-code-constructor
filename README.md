@@ -443,10 +443,16 @@ The suite (130+ deterministic tests; 2 ignored live-provider tests) covers:
 - ConstructorBridge snapshot immutability,
 - E2E mock flows: validate → repair → correct → validate → compile → finish,
 - HTTP client behavior with local mock server,
-- retry policy for transient model errors.
+- retry policy for transient model errors,
+- retry observability (`last` ≠ `total` ≠ AgentLoop `iteration_count`; `None` ≠ zero).
 
 CI (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy -D warnings`,
 `cargo check`, `cargo test` — no network, no live LLM.
+
+**Retry observability (causal):** `last_retry_count` = retries del último `complete()`.
+`ModelRetryObservability::total()` = suma de retries de todos los `complete()` finalizados.
+`per_call()` = retries por complete en orden. Iteraciones del AgentLoop no se derivan de retries
+ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente causal), no `Some(0)`.
 
 ---
 
@@ -463,6 +469,9 @@ CI (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy -D warnings`
 - `CorrectionPolicy` + deterministic implementation
 - `ModelClient`, `MockModelClient`, `AiAgent`, JSON decision parsing
 - `OpenAICompatibleModelClient` + `RetryingModelClient`
+- `ModelRetryObservability` (handle causal): `last` / `total` / `per_call` — ortogonal a `AgentLoop` iterations
+- LiveSession proyecta `total_retries` (y `StepRecord.retry_count` solo si hay alineación 1:1 propose↔complete↔step)
+- `ConstructionObservability.model_retry_count`: `Some(total)` con handle inyectado; `None` sin fuente causal (no inventa 0)
 - `ConstructorBridge` + artifact snapshot from `CodeState`
 - Live session scaffolding + versioned system prompt
 - `RustArtifact` with revision tracking (unit tested, not integrated)
@@ -470,12 +479,18 @@ CI (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy -D warnings`
 - Deterministic `plan_specification`: `Specification` → `BuildPlan` via `SpecificationBuildPlan` (traceable WHAT → HOW)
 - Evidence-based `EvaluationEngine`: AcceptanceCriterion + Evidence → PASS / FAIL / InsufficientEvidence (deterministic, no LLM)
 - Explicit `CriterionKind` on `AcceptanceCriterion` (semantics live in the contract, not in the ID)
+- Evidence-based evaluation for Validate / Compile / RunTests / Clippy / CheckFormat (`tool` + scoped `exit_status`)
+- AiAgent / ModelDecision surface for `run_tests` / `run_clippy` / `check_format` (same decision chain)
 - Evaluation → Observation bridge (`observation_from_*`) so Agents decide from typed verification results
 - AgentLoop evaluation cycle: Tool → Evidence → EvaluationEngine → Observation → Agent (optional via `evaluation_specification`)
 - `RustArtifact` as first-class working product in `AgentContext` / live sessions / ConstructorBridge
 - ActionPolicy / ActionConstraints: permission ≠ action validity (Artifact / Repair / Correction / Finish)
 - LiveSession uses `ActionPolicy::default_session_policy()` by default (injectable)
 - Autonomous construction session: Specification → Plan → Artifact → AgentLoop → ConstructionResult
+- Deterministic Initial Artifact from `builder::initial_source_for_kind(PlanKind)` (caller override optional)
+- Autonomous construction observability (`ConstructionObservability` derived from LoopResult / Evaluation)
+- Artifact-scoped quality tools: Test/Clippy/Fmt materialize `RustArtifact` into an ephemeral Cargo crate (RAII), never the host workspace
+- Live quality demo wiring (`LiveSessionConfig::quality_verification_artifact`)
 - CI quality gate
 
 ### Experimental
@@ -483,14 +498,14 @@ CI (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy -D warnings`
 - Full harness stack (not default CLI path)
 - `AiAgent` with live model (`manual_live_agent_session`, ignored in CI)
 - Live validate-and-compile session
+- Live quality-verification session (`manual_live_quality_agent_session`, ignored in CI)
 - `AutonomousConstructionSession` (Specification-driven, not the CLI Constructor)
 - Bridged agents (`BridgedValidateRepairAgent`, etc.) for demonstration
 - Prompt-driven decisions (provider-agnostic prompt v1)
 
 ### Next (reasonable architectural units)
 
-- Richer observability (latency, retry counts in session traces)
-- Multi-criterion Specifications beyond Validate+Compile in autonomous construction
+- Multi-file Artifact / richer workspace materialization
 
 ### Long-term vision (not implemented)
 

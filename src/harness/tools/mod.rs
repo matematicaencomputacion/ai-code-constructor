@@ -22,9 +22,64 @@ pub const VALIDATE: &str = "validate";
 pub const REPAIR_DIAGNOSTIC: &str = "repair_diagnostic";
 pub const APPLY_CORRECTION: &str = "apply_correction";
 
+use crate::harness::artifact_materialization::ArtifactMaterialization;
+use crate::harness::context::AgentContext;
 use crate::harness::evaluation::Evidence;
 use crate::harness::tool::ToolResult;
-use std::process::Output;
+use std::path::Path;
+use std::process::{Command, Output};
+
+/// Ejecuta un `cargo` sobre la materialización del `working_artifact` (nunca el workspace del repo).
+pub(crate) fn run_cargo_on_artifact(
+    tool_name: &str,
+    ctx: &AgentContext,
+    configure: impl FnOnce(&mut Command, &Path),
+) -> ToolResult {
+    let Some(artifact) = ctx.working_artifact.as_ref() else {
+        return ToolResult {
+            success: false,
+            output: format!("working_artifact ausente para tool `{tool_name}`"),
+            evidence: vec![
+                Evidence::new("tool", tool_name),
+                Evidence::new("missing_artifact", "working_artifact required"),
+            ],
+        };
+    };
+
+    let materialization = match ArtifactMaterialization::from_artifact(artifact) {
+        Ok(value) => value,
+        Err(error) => {
+            return ToolResult {
+                success: false,
+                output: error.clone(),
+                evidence: vec![
+                    Evidence::new("tool", tool_name),
+                    Evidence::new("materialization_error", error),
+                ],
+            };
+        }
+    };
+
+    let root = materialization.root();
+    let mut command = Command::new("cargo");
+    command.current_dir(root);
+    configure(&mut command, root);
+
+    let mut result = match command.output() {
+        Ok(output) => tool_result_from_output(tool_name, output),
+        Err(error) => ToolResult {
+            success: false,
+            output: format!("No se pudo ejecutar cargo ({tool_name}): {error}"),
+            evidence: vec![
+                Evidence::new("tool", tool_name),
+                Evidence::new("spawn_error", error.to_string()),
+            ],
+        },
+    };
+    ctx.append_artifact_evidence(&mut result.evidence);
+    // `materialization` se dropea aquí → cleanup del dir temporal.
+    result
+}
 
 pub(crate) fn tool_result_from_output(tool_name: &str, output: Output) -> ToolResult {
     let stdout = String::from_utf8_lossy(&output.stdout).into_owned();

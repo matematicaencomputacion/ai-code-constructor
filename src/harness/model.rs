@@ -74,6 +74,11 @@ pub enum ModelDecision {
     Compile {
         code: String,
     },
+    RunTests {
+        filter: String,
+    },
+    RunClippy,
+    CheckFormat,
     Finish {
         summary: String,
     },
@@ -400,6 +405,14 @@ pub fn serialize_decision(decision: &ModelDecision) -> String {
         ModelDecision::Compile { code } => {
             format!("{{\"action\":\"compile\",\"code\":{}}}", json_string(code))
         }
+        ModelDecision::RunTests { filter } => {
+            format!(
+                "{{\"action\":\"run_tests\",\"filter\":{}}}",
+                json_string(filter)
+            )
+        }
+        ModelDecision::RunClippy => "{\"action\":\"run_clippy\"}".to_string(),
+        ModelDecision::CheckFormat => "{\"action\":\"check_format\"}".to_string(),
         ModelDecision::Finish { summary } => {
             format!(
                 "{{\"action\":\"finish\",\"summary\":{}}}",
@@ -493,6 +506,12 @@ pub fn parse_model_response(raw_text: &str) -> Result<ModelDecision, ModelRespon
             })?;
             Ok(ModelDecision::Compile { code })
         }
+        "run_tests" => {
+            let filter = extract_string_field(trimmed, "filter").unwrap_or_default();
+            Ok(ModelDecision::RunTests { filter })
+        }
+        "run_clippy" => Ok(ModelDecision::RunClippy),
+        "check_format" => Ok(ModelDecision::CheckFormat),
         "finish" => {
             let summary = extract_string_field(trimmed, "summary").ok_or_else(|| {
                 ModelResponseError::InvalidModelResponse("finish sin summary".to_string())
@@ -1016,6 +1035,70 @@ mod tests {
         )
         .expect("correction");
         assert!(matches!(correction, ModelDecision::ApplyCorrection { .. }));
+    }
+
+    #[test]
+    fn parse_quality_decisions() {
+        let tests = parse_model_response(r#"{"action":"run_tests","filter":"my_filter"}"#)
+            .expect("run_tests");
+        match tests {
+            ModelDecision::RunTests { filter } => assert_eq!(filter, "my_filter"),
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(matches!(
+            parse_model_response(r#"{"action":"run_clippy"}"#).expect("clippy"),
+            ModelDecision::RunClippy
+        ));
+        assert!(matches!(
+            parse_model_response(r#"{"action":"check_format"}"#).expect("fmt"),
+            ModelDecision::CheckFormat
+        ));
+        let empty_filter =
+            parse_model_response(r#"{"action":"run_tests"}"#).expect("run_tests default filter");
+        assert!(matches!(
+            empty_filter,
+            ModelDecision::RunTests { filter } if filter.is_empty()
+        ));
+    }
+
+    #[test]
+    fn quality_decisions_round_trip_serialize_parse() {
+        for decision in [
+            ModelDecision::RunTests {
+                filter: "suite::case".to_string(),
+            },
+            ModelDecision::RunClippy,
+            ModelDecision::CheckFormat,
+        ] {
+            let raw = serialize_decision(&decision);
+            let parsed = parse_model_response(&raw).expect("round-trip");
+            assert_eq!(parsed, decision, "raw={raw}");
+        }
+    }
+
+    #[test]
+    fn parse_unknown_action_keeps_unsupported_error() {
+        let err = parse_model_response(r#"{"action":"launch_missiles"}"#).unwrap_err();
+        assert!(matches!(
+            err,
+            ModelResponseError::UnsupportedAction(name) if name == "launch_missiles"
+        ));
+    }
+
+    #[test]
+    fn system_prompt_in_model_request_lists_quality_actions() {
+        let session = AiSessionConfig {
+            user_request: "Crear una API REST".to_string(),
+            plan_kind: "Api".to_string(),
+        };
+        let request = model_request_from_context(
+            &AgentContext::new("ai").with_working_code("fn main() {}"),
+            &session,
+        )
+        .expect("request");
+        assert!(request.system_prompt.contains("run_tests"));
+        assert!(request.system_prompt.contains("run_clippy"));
+        assert!(request.system_prompt.contains("check_format"));
     }
 
     #[test]

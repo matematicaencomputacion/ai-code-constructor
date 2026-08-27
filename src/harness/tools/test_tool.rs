@@ -1,12 +1,11 @@
 use crate::harness::context::AgentContext;
 use crate::harness::tool::{Tool, ToolResult};
-use crate::harness::tools::{RUN_TESTS, tool_result_from_output};
-use std::process::Command;
+use crate::harness::tools::{RUN_TESTS, run_cargo_on_artifact};
 
-/// Ejecuta `cargo test` de forma controlada.
+/// Ejecuta `cargo test` sobre la materialización del [`crate::harness::RustArtifact`] de sesión.
 ///
-/// El `input` se interpreta como filtro opcional de tests (pasado a `cargo test`).
-/// Usar un filtro acotado evita re-ejecutar toda la suite de forma recursiva.
+/// El `input` es un filtro opcional de tests (pasado a `cargo test`).
+/// No usa el workspace del repositorio anfitrión.
 pub struct TestTool;
 
 impl Tool for TestTool {
@@ -15,28 +14,13 @@ impl Tool for TestTool {
     }
 
     fn execute(&self, input: &str, ctx: &AgentContext) -> ToolResult {
-        let workspace = ctx.workspace();
-        let mut command = Command::new("cargo");
-        command.arg("test").current_dir(&workspace);
-
-        let filter = input.trim();
-        if !filter.is_empty() {
-            command.arg(filter);
-        }
-
-        // Evita capturar salida interactiva y reduce ruido en evidencia.
-        command.arg("--").arg("--nocapture");
-
-        match command.output() {
-            Ok(output) => tool_result_from_output(RUN_TESTS, output),
-            Err(error) => ToolResult {
-                success: false,
-                output: format!("No se pudo ejecutar cargo test: {error}"),
-                evidence: vec![
-                    crate::harness::evaluation::Evidence::new("tool", RUN_TESTS),
-                    crate::harness::evaluation::Evidence::new("spawn_error", error.to_string()),
-                ],
-            },
-        }
+        let filter = input.trim().to_string();
+        run_cargo_on_artifact(RUN_TESTS, ctx, move |command, _root| {
+            command.arg("test");
+            if !filter.is_empty() {
+                command.arg(&filter);
+            }
+            command.arg("--").arg("--nocapture");
+        })
     }
 }

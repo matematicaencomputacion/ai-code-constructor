@@ -10,6 +10,7 @@ mod agent_loop;
 mod agent_prompt;
 mod ai_agent;
 pub mod artifact;
+mod artifact_materialization;
 mod autonomous_construction;
 mod bridge;
 mod constraint;
@@ -35,7 +36,11 @@ pub mod tools;
 #[cfg(test)]
 mod action_policy_tests;
 #[cfg(test)]
+mod ai_agent_quality_actions_tests;
+#[cfg(test)]
 mod artifact_context_tests;
+#[cfg(test)]
+mod artifact_scoped_quality_tests;
 #[cfg(test)]
 mod autonomous_construction_tests;
 
@@ -64,9 +69,12 @@ pub use artifact::{
     ARTIFACT_CONTRACT_VERSION, ArtifactContractVersion, ArtifactId, ArtifactLanguage, RustArtifact,
 };
 #[allow(unused_imports)]
+pub use artifact_materialization::ArtifactMaterialization;
+#[allow(unused_imports)]
 pub use autonomous_construction::{
-    AutonomousConstructionConfig, AutonomousConstructionSession, ConstructionResult,
-    ConstructionStatus,
+    AutonomousConstructionConfig, AutonomousConstructionSession, ConstructionObservability,
+    ConstructionResult, ConstructionStatus, CriterionObservabilityEntry, ToolExecutionSummary,
+    initial_artifact_from_plan,
 };
 #[allow(unused_imports)]
 pub use bridge::{
@@ -102,8 +110,10 @@ pub use evaluation_observation::{
 pub use live_session::{
     LIVE_AGENT_MAX_ITERATIONS, LiveSessionConfig, LiveSessionError, LiveSessionResult,
     LiveSessionStepRecord, LiveSessionTrace, build_validate_compile_harness,
-    build_validate_compile_harness_with_policy, run_live_agent_session,
-    run_live_agent_session_with_client, run_live_agent_session_with_client_and_policy,
+    build_validate_compile_harness_with_policy, live_quality_artifact_source,
+    live_quality_specification, run_live_agent_session, run_live_agent_session_with_client,
+    run_live_agent_session_with_client_and_policy,
+    run_live_agent_session_with_client_policy_and_retry_observability,
 };
 #[allow(unused_imports)]
 pub use model::{
@@ -118,7 +128,7 @@ pub use openai_compatible_client::{
     ModelCallMetadata, ModelClientConfig, OpenAICompatibleModelClient,
 };
 #[allow(unused_imports)]
-pub use retrying_model_client::{RetryConfig, RetryingModelClient};
+pub use retrying_model_client::{ModelRetryObservability, RetryConfig, RetryingModelClient};
 #[allow(unused_imports)]
 pub use runtime::{Harness, HarnessResult, StepOutcome};
 #[allow(unused_imports)]
@@ -345,12 +355,27 @@ mod tests {
 
     #[test]
     fn test_tool_produces_structured_result() {
-        // C — filtro acotado para no reentrar toda la suite
+        // C — Artifact con test que pasa (no el workspace del repo)
         let tool = TestTool;
-        let result = tool.execute(
-            "planner::tests::planner_detects_api_rest",
-            &AgentContext::new("tests"),
+        let source = r#"
+fn main() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn artifact_unit_passes() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+"#;
+        let ctx = AgentContext::new("tests").with_working_artifact(
+            crate::harness::RustArtifact::with_id(
+                crate::harness::ArtifactId::new("art-test-struct"),
+                "main.rs",
+                source,
+            ),
         );
+        let result = tool.execute("", &ctx);
         assert!(result.evidence.iter().any(|e| e.label == "exit_status"));
         assert!(result.evidence.iter().any(|e| e.label == "stdout"));
         assert!(result.evidence.iter().any(|e| e.label == "stderr"));
@@ -360,14 +385,27 @@ mod tests {
                 .iter()
                 .any(|e| e.label == "tool" && e.detail == RUN_TESTS)
         );
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "artifact_id" && e.detail == "art-test-struct")
+        );
         assert!(result.success, "TestTool falló: {}", result.output);
     }
 
     #[test]
     fn clippy_tool_produces_structured_result() {
-        // D
+        // D — Artifact limpio materializado
         let tool = ClippyTool;
-        let result = tool.execute("", &AgentContext::new("clippy"));
+        let ctx = AgentContext::new("clippy").with_working_artifact(
+            crate::harness::RustArtifact::with_id(
+                crate::harness::ArtifactId::new("art-clippy-struct"),
+                "main.rs",
+                "fn main() {}\n",
+            ),
+        );
+        let result = tool.execute("", &ctx);
         assert!(result.evidence.iter().any(|e| e.label == "exit_status"));
         assert!(
             result
@@ -375,20 +413,38 @@ mod tests {
                 .iter()
                 .any(|e| e.label == "tool" && e.detail == RUN_CLIPPY)
         );
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "artifact_id" && e.detail == "art-clippy-struct")
+        );
         assert!(result.success, "ClippyTool falló: {}", result.output);
     }
 
     #[test]
     fn fmt_tool_produces_structured_result() {
-        // E
+        // E — Artifact formateado
         let tool = FmtTool;
-        let result = tool.execute("", &AgentContext::new("fmt"));
+        let ctx =
+            AgentContext::new("fmt").with_working_artifact(crate::harness::RustArtifact::with_id(
+                crate::harness::ArtifactId::new("art-fmt-struct"),
+                "main.rs",
+                "fn main() {}\n",
+            ));
+        let result = tool.execute("", &ctx);
         assert!(result.evidence.iter().any(|e| e.label == "exit_status"));
         assert!(
             result
                 .evidence
                 .iter()
                 .any(|e| e.label == "tool" && e.detail == CHECK_FORMAT)
+        );
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "artifact_id" && e.detail == "art-fmt-struct")
         );
         assert!(result.success, "FmtTool falló: {}", result.output);
     }
