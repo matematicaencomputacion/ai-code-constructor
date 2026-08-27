@@ -1,5 +1,7 @@
 mod builder;
 mod compiler;
+#[allow(dead_code)] // capa nueva; aún no cableada al ciclo Constructor
+mod harness;
 mod planner;
 mod repairer;
 mod state;
@@ -408,10 +410,7 @@ mod integration_tests {
         assert!(state.iteration <= max_iterations);
         assert!(state.errors.is_empty());
         assert!(!hit_iteration_limit(&state));
-        assert_eq!(
-            state.plan.as_ref().map(|p| p.kind.clone()),
-            Some(PlanKind::Api)
-        );
+        assert_eq!(state.plan.as_ref().map(|p| p.kind), Some(PlanKind::Api));
     }
 
     #[test]
@@ -431,7 +430,7 @@ mod integration_tests {
         assert_eq!(state.iteration, 1);
         assert!(hit_iteration_limit(&state));
         assert_eq!(
-            state.plan.as_ref().map(|p| p.kind.clone()),
+            state.plan.as_ref().map(|p| p.kind),
             Some(PlanKind::Authentication)
         );
     }

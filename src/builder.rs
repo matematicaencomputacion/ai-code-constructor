@@ -67,7 +67,7 @@ pub fn build(state: &mut CodeState) {
     // La base depende exclusivamente de `plan.kind`. El feedback solo
     // transforma esa base; nunca concatena plantillas de otros planes.
 
-    let kind = plan.kind.clone();
+    let kind = plan.kind;
     let base_implementation = base_implementation_for(kind);
 
     let implementation = apply_feedback(base_implementation, &state.feedback, &state.request);
