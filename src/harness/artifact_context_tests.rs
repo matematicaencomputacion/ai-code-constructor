@@ -235,6 +235,7 @@ fn implementar_handlers() { println!("Handlers implementados"); }
                         AgentAction::ApplyCorrection {
                             corrections: vec![Correction {
                                 target: CorrectionTarget::SessionCode,
+                                path: None,
                                 operation: CorrectionOperation::ReplaceText {
                                     search: "println!(\"x\"".to_string(),
                                     replacement: "println!(\"x\"); }".to_string(),

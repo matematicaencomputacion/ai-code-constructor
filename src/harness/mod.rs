@@ -44,6 +44,8 @@ mod artifact_context_tests;
 mod artifact_scoped_quality_tests;
 #[cfg(test)]
 mod autonomous_construction_tests;
+#[cfg(test)]
+mod multi_file_correction_tests;
 
 // API pública del harness; aún no consumida por el ciclo Constructor.
 #[allow(unused_imports)]
@@ -92,6 +94,7 @@ pub use context::AgentContext;
 #[allow(unused_imports)]
 pub use correction::{
     Correction, CorrectionOperation, CorrectionTarget, SESSION_CODE_TARGET, apply_corrections,
+    apply_corrections_to_artifact,
 };
 #[allow(unused_imports)]
 pub use correction_policy::{

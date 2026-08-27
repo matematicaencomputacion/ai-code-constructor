@@ -139,6 +139,7 @@ mod tests {
             &AgentAction::ApplyCorrection {
                 corrections: vec![Correction {
                     target: CorrectionTarget::SessionCode,
+                    path: None,
                     operation: CorrectionOperation::ReplaceText {
                         search: "zzz".to_string(),
                         replacement: "y".to_string(),

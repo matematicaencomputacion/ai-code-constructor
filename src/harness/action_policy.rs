@@ -99,12 +99,26 @@ impl Constraint for ApplyCorrectionConstraint {
             };
         }
 
+        let Some(artifact) = ctx.working_artifact.as_ref() else {
+            return ConstraintDecision::Reject {
+                reason: "working_artifact ausente".to_string(),
+            };
+        };
+
         for correction in corrections {
             if correction.target != CorrectionTarget::SessionCode {
                 return ConstraintDecision::Reject {
                     reason: "target de corrección no autorizado".to_string(),
                 };
             }
+
+            let path = correction.resolved_path(artifact);
+            let Some(code) = artifact.file(path) else {
+                return ConstraintDecision::Reject {
+                    reason: format!("archivo de corrección inexistente: {}", path.as_str()),
+                };
+            };
+
             match &correction.operation {
                 CorrectionOperation::ReplaceText { search, .. } if search.is_empty() => {
                     return ConstraintDecision::Reject {
@@ -122,27 +136,29 @@ impl Constraint for ApplyCorrectionConstraint {
                     };
                 }
                 CorrectionOperation::RemoveText { end, .. } => {
-                    let len = ctx.working_code().map(|code| code.len()).unwrap_or(0);
-                    if *end > len {
+                    if *end > code.len() {
                         return ConstraintDecision::Reject {
-                            reason: "RemoveText fuera de rango del Artifact".to_string(),
+                            reason: format!("RemoveText fuera de rango en {}", path.as_str()),
                         };
                     }
                 }
                 CorrectionOperation::InsertText { position, .. } => {
-                    let len = ctx.working_code().map(|code| code.len()).unwrap_or(0);
-                    if *position > len {
+                    if *position > code.len() {
                         return ConstraintDecision::Reject {
-                            reason: "InsertText position fuera de rango".to_string(),
+                            reason: format!(
+                                "InsertText position fuera de rango en {}",
+                                path.as_str()
+                            ),
                         };
                     }
                 }
                 CorrectionOperation::ReplaceText { search, .. } => {
-                    if let Some(code) = ctx.working_code()
-                        && !code.contains(search.as_str())
-                    {
+                    if !code.contains(search.as_str()) {
                         return ConstraintDecision::Reject {
-                            reason: "ReplaceText search no encontrado en Artifact".to_string(),
+                            reason: format!(
+                                "ReplaceText search no encontrado en {}",
+                                path.as_str()
+                            ),
                         };
                     }
                 }

@@ -585,6 +585,7 @@ pub fn structured_to_correction(item: &StructuredCorrection) -> Correction {
             replacement,
         } => Correction {
             target: CorrectionTarget::SessionCode,
+            path: None,
             operation: CorrectionOperation::ReplaceText {
                 search: search.clone(),
                 replacement: replacement.clone(),
@@ -592,6 +593,7 @@ pub fn structured_to_correction(item: &StructuredCorrection) -> Correction {
         },
         StructuredCorrection::InsertText { position, text } => Correction {
             target: CorrectionTarget::SessionCode,
+            path: None,
             operation: CorrectionOperation::InsertText {
                 position: *position,
                 text: text.clone(),
@@ -599,6 +601,7 @@ pub fn structured_to_correction(item: &StructuredCorrection) -> Correction {
         },
         StructuredCorrection::RemoveText { start, end } => Correction {
             target: CorrectionTarget::SessionCode,
+            path: None,
             operation: CorrectionOperation::RemoveText {
                 start: *start,
                 end: *end,

@@ -164,9 +164,18 @@ impl Harness {
                 let outcome =
                     self.dispatch_named_tool(action, tools::APPLY_CORRECTION, &input, ctx);
                 if outcome.tool_executed
-                    && let Some(code) = outcome.observation.corrected_code()
+                    && outcome
+                        .tool_result
+                        .as_ref()
+                        .is_some_and(|result| result.success)
                 {
-                    ctx.update_working_source(code);
+                    // Mutación canónica multi-file: no usar corrected_code (solo primary).
+                    if let Some(artifact) = ctx.working_artifact.as_mut() {
+                        let _ = crate::harness::correction::apply_corrections_to_artifact(
+                            artifact,
+                            &corrections,
+                        );
+                    }
                 }
                 outcome
             }

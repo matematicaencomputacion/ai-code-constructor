@@ -1,6 +1,8 @@
+use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::context::AgentContext;
 use crate::harness::correction::{
-    Correction, CorrectionOperation, CorrectionTarget, SESSION_CODE_TARGET, apply_corrections,
+    Correction, CorrectionOperation, CorrectionTarget, SESSION_CODE_TARGET,
+    apply_corrections_to_artifact,
 };
 use crate::harness::evaluation::Evidence;
 use crate::harness::tool::{Tool, ToolResult};
@@ -13,24 +15,29 @@ const FIELD_SEP: &str = "\n<<<ACC_FIELD>>>\n";
 pub fn encode_correction_input(corrections: &[Correction]) -> String {
     let mut parts = vec![SESSION_CODE_TARGET.to_string()];
     for correction in corrections {
-        parts.push(encode_operation(&correction.operation));
+        parts.push(encode_correction(correction));
     }
     parts.join(CORR_SEP)
 }
 
-fn encode_operation(operation: &CorrectionOperation) -> String {
-    match operation {
+fn encode_correction(correction: &Correction) -> String {
+    let path = correction
+        .path
+        .as_ref()
+        .map(ArtifactPath::as_str)
+        .unwrap_or("");
+    match &correction.operation {
         CorrectionOperation::ReplaceText {
             search,
             replacement,
         } => {
-            format!("replace{FIELD_SEP}{search}{FIELD_SEP}{replacement}")
+            format!("replace{FIELD_SEP}{path}{FIELD_SEP}{search}{FIELD_SEP}{replacement}")
         }
         CorrectionOperation::InsertText { position, text } => {
-            format!("insert{FIELD_SEP}{position}{FIELD_SEP}{text}")
+            format!("insert{FIELD_SEP}{path}{FIELD_SEP}{position}{FIELD_SEP}{text}")
         }
         CorrectionOperation::RemoveText { start, end } => {
-            format!("remove{FIELD_SEP}{start}{FIELD_SEP}{end}")
+            format!("remove{FIELD_SEP}{path}{FIELD_SEP}{start}{FIELD_SEP}{end}")
         }
     }
 }
@@ -44,10 +51,7 @@ fn decode_correction_input(input: &str) -> Result<Vec<Correction>, String> {
     let target = CorrectionTarget::parse(segments[0])?;
     let mut corrections = Vec::new();
     for segment in segments.iter().skip(1) {
-        corrections.push(Correction {
-            target,
-            operation: decode_operation(segment)?,
-        });
+        corrections.push(decode_correction(target, segment)?);
     }
 
     if corrections.is_empty() {
@@ -57,20 +61,73 @@ fn decode_correction_input(input: &str) -> Result<Vec<Correction>, String> {
     Ok(corrections)
 }
 
-fn decode_operation(raw: &str) -> Result<CorrectionOperation, String> {
+fn decode_path(raw: &str) -> Result<Option<ArtifactPath>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        Ok(None)
+    } else {
+        ArtifactPath::parse(trimmed).map(Some)
+    }
+}
+
+fn decode_correction(target: CorrectionTarget, raw: &str) -> Result<Correction, String> {
     let fields: Vec<&str> = raw.split(FIELD_SEP).collect();
+    // Formato v2: kind | path | …args
+    // Compat v1 (sin path): kind | …args  (3 campos replace/insert/remove)
     match fields.first().copied() {
-        Some("replace") if fields.len() == 3 => Ok(CorrectionOperation::ReplaceText {
-            search: fields[1].to_string(),
-            replacement: fields[2].to_string(),
+        Some("replace") if fields.len() == 4 => Ok(Correction {
+            target,
+            path: decode_path(fields[1])?,
+            operation: CorrectionOperation::ReplaceText {
+                search: fields[2].to_string(),
+                replacement: fields[3].to_string(),
+            },
         }),
+        Some("replace") if fields.len() == 3 => Ok(Correction {
+            target,
+            path: None,
+            operation: CorrectionOperation::ReplaceText {
+                search: fields[1].to_string(),
+                replacement: fields[2].to_string(),
+            },
+        }),
+        Some("insert") if fields.len() == 4 => {
+            let position = fields[2]
+                .parse::<usize>()
+                .map_err(|_| format!("InsertText: position inválida `{}`", fields[2]))?;
+            Ok(Correction {
+                target,
+                path: decode_path(fields[1])?,
+                operation: CorrectionOperation::InsertText {
+                    position,
+                    text: fields[3].to_string(),
+                },
+            })
+        }
         Some("insert") if fields.len() == 3 => {
             let position = fields[1]
                 .parse::<usize>()
                 .map_err(|_| format!("InsertText: position inválida `{}`", fields[1]))?;
-            Ok(CorrectionOperation::InsertText {
-                position,
-                text: fields[2].to_string(),
+            Ok(Correction {
+                target,
+                path: None,
+                operation: CorrectionOperation::InsertText {
+                    position,
+                    text: fields[2].to_string(),
+                },
+            })
+        }
+        Some("remove") if fields.len() == 4 => {
+            let start = fields[2]
+                .parse::<usize>()
+                .map_err(|_| format!("RemoveText: start inválido `{}`", fields[2]))?;
+            let end = fields[3]
+                .parse::<usize>()
+                .map_err(|_| format!("RemoveText: end inválido `{}`", fields[3]))?;
+            Ok(Correction {
+                target,
+                path: decode_path(fields[1])?,
+                operation: CorrectionOperation::RemoveText { start, end },
             })
         }
         Some("remove") if fields.len() == 3 => {
@@ -80,16 +137,21 @@ fn decode_operation(raw: &str) -> Result<CorrectionOperation, String> {
             let end = fields[2]
                 .parse::<usize>()
                 .map_err(|_| format!("RemoveText: end inválido `{}`", fields[2]))?;
-            Ok(CorrectionOperation::RemoveText { start, end })
+            Ok(Correction {
+                target,
+                path: None,
+                operation: CorrectionOperation::RemoveText { start, end },
+            })
         }
         Some(kind) => Err(format!("operación desconocida o mal formada: {kind}")),
         None => Err("operación vacía".to_string()),
     }
 }
 
-/// Aplica correcciones estructuradas al código de sesión autorizado.
+/// Aplica correcciones estructuradas al Artifact de sesión autorizado.
 ///
 /// No ejecuta Validator, Compiler ni Repairer. No invoca comandos externos.
+/// La mutación canónica la aplica el Harness vía [`apply_corrections_to_artifact`].
 pub struct CorrectionTool;
 
 impl Tool for CorrectionTool {
@@ -128,38 +190,40 @@ impl Tool for CorrectionTool {
             };
         }
 
-        let base_code = match ctx.working_code() {
-            Some(code) if !code.is_empty() => code,
-            _ => {
-                return ToolResult {
-                    success: false,
-                    output: "no hay código de sesión autorizado para corregir".to_string(),
-                    evidence: vec![
-                        Evidence::new("tool", APPLY_CORRECTION),
-                        Evidence::new("correction_status", "error"),
-                        Evidence::new("security", "missing_session_code"),
-                    ],
-                };
-            }
+        let Some(base_artifact) = ctx.working_artifact.as_ref() else {
+            return ToolResult {
+                success: false,
+                output: "no hay Artifact de sesión autorizado para corregir".to_string(),
+                evidence: vec![
+                    Evidence::new("tool", APPLY_CORRECTION),
+                    Evidence::new("correction_status", "error"),
+                    Evidence::new("security", "missing_session_code"),
+                ],
+            };
         };
 
-        let corrected = match apply_corrections(base_code, &corrections) {
-            Ok(code) => code,
-            Err(error) => {
-                return ToolResult {
-                    success: false,
-                    output: error.clone(),
-                    evidence: vec![
-                        Evidence::new("tool", APPLY_CORRECTION),
-                        Evidence::new("correction_status", "error"),
-                        Evidence::new("correction_target", SESSION_CODE_TARGET),
-                        Evidence::new("apply_error", error),
-                    ],
-                };
-            }
-        };
+        let mut working = base_artifact.clone();
+        let revision_before = working.revision();
+        if let Err(error) = apply_corrections_to_artifact(&mut working, &corrections) {
+            return ToolResult {
+                success: false,
+                output: error.clone(),
+                evidence: vec![
+                    Evidence::new("tool", APPLY_CORRECTION),
+                    Evidence::new("correction_status", "error"),
+                    Evidence::new("correction_target", SESSION_CODE_TARGET),
+                    Evidence::new("apply_error", error),
+                ],
+            };
+        }
 
-        let changed = corrected != base_code;
+        let changed = working.revision() != revision_before || working != *base_artifact;
+        let corrected_primary = working.source().to_string();
+        let paths: Vec<String> = corrections
+            .iter()
+            .map(|c| c.resolved_path(&working).as_str().to_string())
+            .collect();
+
         let mut evidence = vec![
             Evidence::new("tool", APPLY_CORRECTION),
             Evidence::new(
@@ -169,9 +233,10 @@ impl Tool for CorrectionTool {
             Evidence::new("correction_target", SESSION_CODE_TARGET),
             Evidence::new("correction_count", corrections.len().to_string()),
             Evidence::new("code_changed", changed.to_string()),
-            Evidence::new("corrected_code", &corrected),
-            Evidence::new("base_code_bytes", base_code.len().to_string()),
-            Evidence::new("corrected_code_bytes", corrected.len().to_string()),
+            Evidence::new("corrected_code", &corrected_primary),
+            Evidence::new("base_code_bytes", base_artifact.source().len().to_string()),
+            Evidence::new("corrected_code_bytes", corrected_primary.len().to_string()),
+            Evidence::new("correction_paths", paths.join(",")),
         ];
         ctx.append_artifact_evidence(&mut evidence);
 
@@ -179,6 +244,10 @@ impl Tool for CorrectionTool {
             evidence.push(Evidence::new(
                 format!("correction_{index}_kind"),
                 correction.operation.kind_label(),
+            ));
+            evidence.push(Evidence::new(
+                format!("correction_{index}_path"),
+                correction.resolved_path(base_artifact).as_str(),
             ));
             evidence.push(Evidence::new(
                 format!("correction_{index}_description"),
@@ -190,10 +259,9 @@ impl Tool for CorrectionTool {
             success: changed,
             output: if changed {
                 format!(
-                    "corrección aplicada: {} operación(es), {} → {} bytes",
+                    "corrección aplicada: {} operación(es) sobre [{}]",
                     corrections.len(),
-                    base_code.len(),
-                    corrected.len()
+                    paths.join(", ")
                 )
             } else {
                 "corrección no modificó el código".to_string()
@@ -254,8 +322,11 @@ mod tests {
             .expect("corrected_code");
         assert_eq!(corrected, "Servidor HTTP");
 
-        // Tool returns corrected_code; Harness applies via update_working_source.
-        ctx.update_working_source(corrected);
+        apply_corrections_to_artifact(
+            ctx.working_artifact.as_mut().unwrap(),
+            &[Correction::replace_session_text("NET", "HTTP")],
+        )
+        .unwrap();
         assert_eq!(ctx.working_code(), Some("Servidor HTTP"));
         assert_eq!(ctx.working_artifact.as_ref().unwrap().id(), &id_before);
     }
@@ -268,17 +339,12 @@ mod tests {
         let mut ctx = AgentContext::new("corr")
             .with_working_code("Servidor NET")
             .with_evaluation_specification(spec.clone());
-        let input = encode_correction_input(&[Correction::replace_session_text("NET", "HTTP")]);
+        let corrections = [Correction::replace_session_text("NET", "HTTP")];
+        let input = encode_correction_input(&corrections);
         let result = tool.execute(&input, &ctx);
         assert!(result.success);
-        ctx.update_working_source(
-            result
-                .evidence
-                .iter()
-                .find(|e| e.label == "corrected_code")
-                .map(|e| e.detail.as_str())
-                .unwrap(),
-        );
+        apply_corrections_to_artifact(ctx.working_artifact.as_mut().unwrap(), &corrections)
+            .unwrap();
         assert_eq!(
             ctx.evaluation_specification.as_ref().map(|s| s.id.as_str()),
             Some(spec.id.as_str())

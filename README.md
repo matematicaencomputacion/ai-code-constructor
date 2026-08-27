@@ -378,7 +378,8 @@ inside the harness** without corrupting the original `CodeState`.
 - `replace_source` updates only the primary and preserves sibling files,
 - `ArtifactMaterialization` writes every file under an ephemeral Cargo crate (RAII), never the host workspace,
 - `CompileTool` / Test / Clippy / Fmt run on that materialized crate (`cargo check` / `test` / `clippy` / `fmt`);
-  ValidationTool and CorrectionTool still use the **primary** buffer (compat).
+  ValidationTool still uses the **primary** buffer (compat).
+- `Correction` may target an existing `ArtifactPath`; legacy corrections without path still use **primary**.
 
 ---
 
@@ -511,8 +512,8 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 
 ### Next (reasonable architectural units)
 
-- Multi-file corrections (`path` on Correction)
 - Builder multi-file initial artifacts (when a PlanKind justifies it)
+- ModelDecision path for multi-file corrections (optional)
 
 ### Long-term vision (not implemented)
 
