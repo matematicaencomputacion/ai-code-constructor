@@ -542,7 +542,7 @@ fn build_observability(
     }
 }
 
-fn plan_kind_label(kind: PlanKind) -> String {
+pub(crate) fn plan_kind_label(kind: PlanKind) -> String {
     match kind {
         PlanKind::Api => "Api".to_string(),
         PlanKind::Calculator => "Calculator".to_string(),

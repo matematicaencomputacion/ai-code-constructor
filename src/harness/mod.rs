@@ -45,6 +45,8 @@ mod artifact_scoped_quality_tests;
 #[cfg(test)]
 mod autonomous_construction_tests;
 #[cfg(test)]
+mod live_session_builder_initial_artifact_tests;
+#[cfg(test)]
 mod model_decision_multi_file_correction_tests;
 #[cfg(test)]
 mod multi_file_correction_tests;
@@ -117,11 +119,11 @@ pub use evaluation_observation::{
 };
 #[allow(unused_imports)]
 pub use live_session::{
-    LIVE_AGENT_MAX_ITERATIONS, LiveSessionConfig, LiveSessionError, LiveSessionResult,
-    LiveSessionStepRecord, LiveSessionTrace, build_validate_compile_harness,
-    build_validate_compile_harness_with_policy, live_quality_artifact_source,
-    live_quality_specification, run_live_agent_session, run_live_agent_session_with_client,
-    run_live_agent_session_with_client_and_policy,
+    LIVE_AGENT_MAX_ITERATIONS, LiveSessionConfig, LiveSessionError,
+    LiveSessionFromSpecificationOptions, LiveSessionResult, LiveSessionStepRecord,
+    LiveSessionTrace, build_validate_compile_harness, build_validate_compile_harness_with_policy,
+    live_quality_artifact_source, live_quality_specification, run_live_agent_session,
+    run_live_agent_session_with_client, run_live_agent_session_with_client_and_policy,
     run_live_agent_session_with_client_policy_and_retry_observability,
 };
 #[allow(unused_imports)]

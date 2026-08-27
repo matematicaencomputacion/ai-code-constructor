@@ -399,6 +399,10 @@ OpenAICompatibleModelClient
 First use case implemented: validate and compile an existing Rust artifact with
 a **real model choosing actions** (not a hardcoded sequence in `AiAgent`).
 
+`LiveSessionConfig::from_specification` resolves Specification → `plan_specification` →
+Builder Initial Artifact (single- or multi-file) without manual `working_code`.
+Legacy constructors (`validate_and_compile_artifact`, `with_artifact`, etc.) remain available.
+
 Manual test (excluded from CI):
 
 ```bash
@@ -500,6 +504,7 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - Multi-file `RustArtifact` (`ArtifactPath` + primary compat) + multi-file materialization
 - `CompileTool` via materialized crate (`cargo check`), same isolation as quality tools
 - Live quality demo wiring (`LiveSessionConfig::quality_verification_artifact`)
+- LiveSession can start from `LiveSessionConfig::from_specification` (Specification → Plan → Builder → Initial Artifact, including multi-file Authentication)
 - CI quality gate
 
 ### Experimental

@@ -7,6 +7,7 @@ use crate::harness::agent_loop::{AgentLoop, LoopResult};
 use crate::harness::agent_prompt::{SYSTEM_PROMPT_VERSION, system_prompt_v1};
 use crate::harness::ai_agent::AiAgent;
 use crate::harness::artifact::RustArtifact;
+use crate::harness::autonomous_construction::{initial_artifact_from_plan, plan_kind_label};
 use crate::harness::constraint::Constraint;
 use crate::harness::context::AgentContext;
 use crate::harness::evaluation::EvaluationVerdict;
@@ -18,6 +19,7 @@ use crate::harness::openai_compatible_client::{ModelClientConfig, OpenAICompatib
 use crate::harness::retrying_model_client::{ModelRetryObservability, RetryingModelClient};
 use crate::harness::runtime::Harness;
 use crate::harness::specification::Specification;
+use crate::harness::specification_planner::{SpecificationPlannerError, plan_specification};
 use crate::harness::tools::{CompileTool, CorrectionTool, RepairDiagnosticTool, ValidationTool};
 
 /// Límite estricto de iteraciones para sesiones live.
@@ -91,6 +93,83 @@ impl LiveSessionConfig {
             evaluation_specification: Some(live_quality_specification()),
             max_iterations: LIVE_AGENT_MAX_ITERATIONS,
             debug_log_prompt: false,
+        }
+    }
+
+    /// Construye la sesión desde Specification → Plan → Builder → Initial Artifact.
+    ///
+    /// No requiere `working_code` manual: materializa el [`RustArtifact`] vía
+    /// [`initial_artifact_from_plan`] (single- o multi-file según [`PlanKind`]).
+    /// La Specification se usa también como `evaluation_specification`.
+    pub fn from_specification(specification: Specification) -> Result<Self, LiveSessionError> {
+        Self::from_specification_with_options(
+            specification,
+            LiveSessionFromSpecificationOptions::default(),
+        )
+    }
+
+    /// Como [`Self::from_specification`], con control sobre evaluación y nombre del artifact.
+    pub fn from_specification_with_options(
+        specification: Specification,
+        options: LiveSessionFromSpecificationOptions,
+    ) -> Result<Self, LiveSessionError> {
+        specification
+            .validate()
+            .map_err(|error| LiveSessionError::Configuration(error.to_string()))?;
+
+        let planned = plan_specification(&specification).map_err(map_planner_error)?;
+
+        let artifact = initial_artifact_from_plan(
+            specification.id.clone(),
+            &planned.plan,
+            options.artifact_name,
+        );
+
+        Ok(Self {
+            goal: options
+                .goal
+                .unwrap_or_else(|| format!("live:{}", specification.id.as_str())),
+            user_request: specification.goal.clone(),
+            plan_kind: plan_kind_label(planned.plan.kind),
+            working_code: artifact.source().to_string(),
+            working_artifact: Some(artifact),
+            evaluation_specification: if options.attach_evaluation_specification {
+                Some(specification)
+            } else {
+                None
+            },
+            max_iterations: options.max_iterations.unwrap_or(LIVE_AGENT_MAX_ITERATIONS),
+            debug_log_prompt: options.debug_log_prompt,
+        })
+    }
+}
+
+/// Opciones al materializar una LiveSession desde Specification + Builder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveSessionFromSpecificationOptions {
+    pub goal: Option<String>,
+    pub artifact_name: String,
+    pub attach_evaluation_specification: bool,
+    pub max_iterations: Option<u32>,
+    pub debug_log_prompt: bool,
+}
+
+impl Default for LiveSessionFromSpecificationOptions {
+    fn default() -> Self {
+        Self {
+            goal: None,
+            artifact_name: "main.rs".to_string(),
+            attach_evaluation_specification: true,
+            max_iterations: None,
+            debug_log_prompt: false,
+        }
+    }
+}
+
+fn map_planner_error(error: SpecificationPlannerError) -> LiveSessionError {
+    match error {
+        SpecificationPlannerError::InvalidSpecification(message) => {
+            LiveSessionError::Configuration(format!("planificación rechazada: {message}"))
         }
     }
 }
