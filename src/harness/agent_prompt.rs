@@ -19,6 +19,7 @@ Allowed actions (JSON field "action"):
 - validate: run Validator on working_code
 - repair_diagnostic: analyze validator errors and produce diagnostic feedback
 - apply_correction: apply structured text edits only (replace_text, insert_text, remove_text). Optional "path" selects an existing Artifact file (e.g. "src/helper.rs"); omit path to edit the primary file.
+- apply_file_operations: modify Artifact structure (create_file, delete_file, rename_file). Paths are logical Artifact paths, not the host filesystem. Cannot delete the primary file; rename_file updates primary when renaming it.
 - compile: compile the current working_code
 - run_tests: run tests on the session Artifact (optional filter)
 - run_clippy: run clippy on the session Artifact
@@ -30,6 +31,9 @@ Required JSON schema (single object, no markdown):
 {"action":"repair_diagnostic","errors":["..."]}
 {"action":"apply_correction","corrections":[{"operation":"replace_text","search":"...","replacement":"..."}]}
 {"action":"apply_correction","corrections":[{"operation":"replace_text","path":"src/helper.rs","search":"...","replacement":"..."}]}
+{"action":"apply_file_operations","operations":[{"operation":"create_file","path":"src/helper.rs","source":"..."}]}
+{"action":"apply_file_operations","operations":[{"operation":"delete_file","path":"src/old.rs"}]}
+{"action":"apply_file_operations","operations":[{"operation":"rename_file","from":"src/auth.rs","to":"src/security.rs"}]}
 {"action":"compile","code":"..."}
 {"action":"run_tests","filter":"..."}
 {"action":"run_clippy"}
@@ -76,6 +80,8 @@ mod tests {
         assert!(SYSTEM_PROMPT_V1.contains("apply_correction"));
         assert!(SYSTEM_PROMPT_V1.contains("path"));
         assert!(SYSTEM_PROMPT_V1.contains("primary"));
+        assert!(SYSTEM_PROMPT_V1.contains("apply_file_operations"));
+        assert!(SYSTEM_PROMPT_V1.contains("create_file"));
         assert!(SYSTEM_PROMPT_V1.contains("compile"));
         assert!(SYSTEM_PROMPT_V1.contains("run_tests"));
         assert!(SYSTEM_PROMPT_V1.contains("run_clippy"));

@@ -228,6 +228,32 @@ impl RustArtifact {
             Err(format!("archivo inexistente: {}", path.as_str()))
         }
     }
+
+    pub(crate) fn insert_file_internal(&mut self, path: ArtifactPath, source: String) {
+        self.files.insert(path, source);
+    }
+
+    pub(crate) fn remove_file_internal(&mut self, path: &ArtifactPath) {
+        self.files.remove(path);
+    }
+
+    pub(crate) fn take_file_internal(&mut self, path: &ArtifactPath) -> Option<String> {
+        self.files.remove(path)
+    }
+
+    pub(crate) fn set_primary_internal(&mut self, path: ArtifactPath) {
+        self.primary = path;
+    }
+
+    pub(crate) fn files_snapshot(&self) -> BTreeMap<ArtifactPath, String> {
+        self.files.clone()
+    }
+
+    pub(crate) fn commit_files_state(&mut self, mut next: RustArtifact) {
+        self.files = std::mem::take(&mut next.files);
+        self.primary = next.primary;
+        self.revision += 1;
+    }
 }
 
 #[cfg(test)]

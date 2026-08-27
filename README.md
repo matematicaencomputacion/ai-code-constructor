@@ -505,6 +505,7 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - `CompileTool` via materialized crate (`cargo check`), same isolation as quality tools
 - Live quality demo wiring (`LiveSessionConfig::quality_verification_artifact`)
 - LiveSession can start from `LiveSessionConfig::from_specification` (Specification → Plan → Builder → Initial Artifact, including multi-file Authentication)
+- Artifacts can evolve structurally via `apply_file_operations` (`create_file`, `delete_file`, `rename_file`) on the canonical `RustArtifact`
 - CI quality gate
 
 ### Experimental

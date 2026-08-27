@@ -1,6 +1,7 @@
 mod clippy_tool;
 mod compile_tool;
 mod correction_tool;
+mod file_operations_tool;
 mod fmt_tool;
 mod repair_diagnostic_tool;
 mod test_tool;
@@ -9,6 +10,7 @@ mod validation_tool;
 pub use clippy_tool::ClippyTool;
 pub use compile_tool::CompileTool;
 pub use correction_tool::{CorrectionTool, encode_correction_input};
+pub use file_operations_tool::{FileOperationsTool, encode_file_operations_input};
 pub use fmt_tool::FmtTool;
 pub use repair_diagnostic_tool::{RepairDiagnosticTool, encode_repair_diagnostic_input};
 pub use test_tool::TestTool;
@@ -21,6 +23,7 @@ pub const CHECK_FORMAT: &str = "check_format";
 pub const VALIDATE: &str = "validate";
 pub const REPAIR_DIAGNOSTIC: &str = "repair_diagnostic";
 pub const APPLY_CORRECTION: &str = "apply_correction";
+pub const APPLY_FILE_OPERATIONS: &str = "apply_file_operations";
 
 use crate::harness::artifact_materialization::ArtifactMaterialization;
 use crate::harness::context::AgentContext;

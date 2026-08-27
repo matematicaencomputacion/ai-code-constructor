@@ -3,6 +3,7 @@
 //! ModelClient no conoce Harness, Tools ni componentes del Constructor.
 
 use crate::harness::artifact::RustArtifact;
+use crate::harness::artifact_file_operation::ArtifactFileOperation;
 use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::context::AgentContext;
 use crate::harness::correction::{Correction, CorrectionOperation, CorrectionTarget};
@@ -73,6 +74,9 @@ pub enum ModelDecision {
     ApplyCorrection {
         corrections: Vec<StructuredCorrection>,
     },
+    ApplyFileOperations {
+        operations: Vec<StructuredFileOperation>,
+    },
     Compile {
         code: String,
     },
@@ -107,6 +111,15 @@ pub enum StructuredCorrection {
         start: usize,
         end: usize,
     },
+}
+
+/// Operación estructural en la respuesta del modelo (antes de [`ArtifactFileOperation`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::enum_variant_names)]
+pub enum StructuredFileOperation {
+    CreateFile { path: String, source: String },
+    DeleteFile { path: String },
+    RenameFile { from: String, to: String },
 }
 
 fn structured_correction_path(item: &StructuredCorrection) -> &Option<String> {
@@ -210,6 +223,7 @@ pub enum ModelResponseError {
     InvalidModelResponse(String),
     UnsupportedAction(String),
     InvalidCorrection(String),
+    InvalidFileOperation(String),
 }
 
 impl std::fmt::Display for ModelResponseError {
@@ -221,6 +235,9 @@ impl std::fmt::Display for ModelResponseError {
             Self::InvalidModelResponse(message) => write!(f, "respuesta inválida: {message}"),
             Self::UnsupportedAction(message) => write!(f, "acción no soportada: {message}"),
             Self::InvalidCorrection(message) => write!(f, "corrección inválida: {message}"),
+            Self::InvalidFileOperation(message) => {
+                write!(f, "operación de archivo inválida: {message}")
+            }
         }
     }
 }
@@ -426,6 +443,14 @@ pub fn serialize_decision(decision: &ModelDecision) -> String {
                 .join(",");
             format!("{{\"action\":\"apply_correction\",\"corrections\":[{items}]}}")
         }
+        ModelDecision::ApplyFileOperations { operations } => {
+            let items = operations
+                .iter()
+                .map(serialize_structured_file_operation)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("{{\"action\":\"apply_file_operations\",\"operations\":[{items}]}}")
+        }
         ModelDecision::Compile { code } => {
             format!("{{\"action\":\"compile\",\"code\":{}}}", json_string(code))
         }
@@ -529,6 +554,15 @@ pub fn parse_model_response(raw_text: &str) -> Result<ModelDecision, ModelRespon
                 ));
             }
             Ok(ModelDecision::ApplyCorrection { corrections })
+        }
+        "apply_file_operations" => {
+            let operations = parse_file_operations_array(trimmed)?;
+            if operations.is_empty() {
+                return Err(ModelResponseError::InvalidFileOperation(
+                    "apply_file_operations requiere al menos una operación".to_string(),
+                ));
+            }
+            Ok(ModelDecision::ApplyFileOperations { operations })
         }
         "compile" => {
             let code = extract_string_field(trimmed, "code").ok_or_else(|| {
@@ -655,6 +689,104 @@ pub fn structured_to_correction(
                 end: *end,
             },
         }),
+    }
+}
+
+fn serialize_structured_file_operation(operation: &StructuredFileOperation) -> String {
+    match operation {
+        StructuredFileOperation::CreateFile { path, source } => format!(
+            "{{\"operation\":\"create_file\",\"path\":{},\"source\":{}}}",
+            json_string(path),
+            json_string(source)
+        ),
+        StructuredFileOperation::DeleteFile { path } => format!(
+            "{{\"operation\":\"delete_file\",\"path\":{}}}",
+            json_string(path)
+        ),
+        StructuredFileOperation::RenameFile { from, to } => format!(
+            "{{\"operation\":\"rename_file\",\"from\":{},\"to\":{}}}",
+            json_string(from),
+            json_string(to)
+        ),
+    }
+}
+
+fn parse_file_operations_array(
+    raw: &str,
+) -> Result<Vec<StructuredFileOperation>, ModelResponseError> {
+    let array_body = extract_array_body(raw, "operations").ok_or_else(|| {
+        ModelResponseError::InvalidFileOperation("operations ausente".to_string())
+    })?;
+    let objects = split_top_level_objects(&array_body);
+    objects
+        .iter()
+        .map(|item| parse_file_operation_object(item.as_str()))
+        .collect()
+}
+
+fn parse_file_operation_object(raw: &str) -> Result<StructuredFileOperation, ModelResponseError> {
+    let operation = extract_string_field(raw, "operation")
+        .ok_or_else(|| ModelResponseError::InvalidFileOperation("operation ausente".to_string()))?;
+    match operation.as_str() {
+        "create_file" => {
+            let path = extract_string_field(raw, "path").ok_or_else(|| {
+                ModelResponseError::InvalidFileOperation("create_file sin path".to_string())
+            })?;
+            let source = extract_string_field(raw, "source").ok_or_else(|| {
+                ModelResponseError::InvalidFileOperation("create_file sin source".to_string())
+            })?;
+            Ok(StructuredFileOperation::CreateFile { path, source })
+        }
+        "delete_file" => {
+            let path = extract_string_field(raw, "path").ok_or_else(|| {
+                ModelResponseError::InvalidFileOperation("delete_file sin path".to_string())
+            })?;
+            Ok(StructuredFileOperation::DeleteFile { path })
+        }
+        "rename_file" => {
+            let from = extract_string_field(raw, "from").ok_or_else(|| {
+                ModelResponseError::InvalidFileOperation("rename_file sin from".to_string())
+            })?;
+            let to = extract_string_field(raw, "to").ok_or_else(|| {
+                ModelResponseError::InvalidFileOperation("rename_file sin to".to_string())
+            })?;
+            Ok(StructuredFileOperation::RenameFile { from, to })
+        }
+        other => Err(ModelResponseError::InvalidFileOperation(format!(
+            "operation desconocida: {other}"
+        ))),
+    }
+}
+
+/// Convierte operaciones del modelo en [`ArtifactFileOperation`].
+pub fn structured_to_file_operation(
+    item: &StructuredFileOperation,
+) -> Result<ArtifactFileOperation, ModelResponseError> {
+    match item {
+        StructuredFileOperation::CreateFile { path, source } => {
+            let path = ArtifactPath::parse(path).map_err(|message| {
+                ModelResponseError::InvalidFileOperation(format!("path inválido: {message}"))
+            })?;
+            Ok(ArtifactFileOperation::CreateFile {
+                path,
+                source: source.clone(),
+            })
+        }
+        StructuredFileOperation::DeleteFile { path } => {
+            let path = ArtifactPath::parse(path).map_err(|message| {
+                ModelResponseError::InvalidFileOperation(format!("path inválido: {message}"))
+            })?;
+            Ok(ArtifactFileOperation::DeleteFile { path })
+        }
+        StructuredFileOperation::RenameFile { from, to } => {
+            let from = ArtifactPath::parse(from).map_err(|message| {
+                ModelResponseError::InvalidFileOperation(format!("from inválido: {message}"))
+            })?;
+            let to = ArtifactPath::parse(to).map_err(|message| {
+                ModelResponseError::InvalidFileOperation(format!("to inválido: {message}"))
+            })?;
+            Ok(ArtifactFileOperation::RenameFile { from, to })
+        }
     }
 }
 

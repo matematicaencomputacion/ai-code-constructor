@@ -179,6 +179,25 @@ impl Harness {
                 }
                 outcome
             }
+            AgentAction::ApplyFileOperations { operations } => {
+                let input = tools::encode_file_operations_input(&operations);
+                let outcome =
+                    self.dispatch_named_tool(action, tools::APPLY_FILE_OPERATIONS, &input, ctx);
+                if outcome.tool_executed
+                    && outcome
+                        .tool_result
+                        .as_ref()
+                        .is_some_and(|result| result.success)
+                    && let Some(artifact) = ctx.working_artifact.as_mut()
+                {
+                    let _ =
+                        crate::harness::artifact_file_operation::apply_file_operations_to_artifact(
+                            artifact,
+                            &operations,
+                        );
+                }
+                outcome
+            }
             AgentAction::InvokeTool { tool_name, input } => {
                 self.dispatch_named_tool(action, &tool_name, &input, ctx)
             }
