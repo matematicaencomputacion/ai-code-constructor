@@ -2,6 +2,8 @@
 //!
 //! ModelClient no conoce Harness, Tools ni componentes del Constructor.
 
+use crate::harness::artifact::RustArtifact;
+use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::context::AgentContext;
 use crate::harness::correction::{Correction, CorrectionOperation, CorrectionTarget};
 use crate::harness::evaluation::EvaluationVerdict;
@@ -85,12 +87,34 @@ pub enum ModelDecision {
 }
 
 /// Corrección estructurada en la respuesta del modelo (antes de mapear a [`Correction`]).
+///
+/// `path`: frontera de serialización del modelo (`Option<String>`). Ausente o vacío → primary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::enum_variant_names)]
 pub enum StructuredCorrection {
-    ReplaceText { search: String, replacement: String },
-    InsertText { position: usize, text: String },
-    RemoveText { start: usize, end: usize },
+    ReplaceText {
+        path: Option<String>,
+        search: String,
+        replacement: String,
+    },
+    InsertText {
+        path: Option<String>,
+        position: usize,
+        text: String,
+    },
+    RemoveText {
+        path: Option<String>,
+        start: usize,
+        end: usize,
+    },
+}
+
+fn structured_correction_path(item: &StructuredCorrection) -> &Option<String> {
+    match item {
+        StructuredCorrection::ReplaceText { path, .. }
+        | StructuredCorrection::InsertText { path, .. }
+        | StructuredCorrection::RemoveText { path, .. } => path,
+    }
 }
 
 /// Traza estructurada de interacción AiAgent ↔ ModelClient.
@@ -423,21 +447,27 @@ pub fn serialize_decision(decision: &ModelDecision) -> String {
 }
 
 fn serialize_structured_correction(correction: &StructuredCorrection) -> String {
+    let path_json = structured_correction_path(correction)
+        .as_ref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| format!(",\"path\":{}", json_string(value)))
+        .unwrap_or_default();
     match correction {
         StructuredCorrection::ReplaceText {
             search,
             replacement,
+            ..
         } => format!(
-            "{{\"operation\":\"replace_text\",\"search\":{},\"replacement\":{}}}",
+            "{{\"operation\":\"replace_text\"{path_json},\"search\":{},\"replacement\":{}}}",
             json_string(search),
             json_string(replacement)
         ),
-        StructuredCorrection::InsertText { position, text } => format!(
-            "{{\"operation\":\"insert_text\",\"position\":{position},\"text\":{}}}",
+        StructuredCorrection::InsertText { position, text, .. } => format!(
+            "{{\"operation\":\"insert_text\"{path_json},\"position\":{position},\"text\":{}}}",
             json_string(text)
         ),
-        StructuredCorrection::RemoveText { start, end } => {
-            format!("{{\"operation\":\"remove_text\",\"start\":{start},\"end\":{end}}}")
+        StructuredCorrection::RemoveText { start, end, .. } => {
+            format!("{{\"operation\":\"remove_text\"{path_json},\"start\":{start},\"end\":{end}}}")
         }
     }
 }
@@ -535,6 +565,7 @@ fn parse_corrections_array(raw: &str) -> Result<Vec<StructuredCorrection>, Model
 fn parse_correction_object(raw: &str) -> Result<StructuredCorrection, ModelResponseError> {
     let operation = extract_string_field(raw, "operation")
         .ok_or_else(|| ModelResponseError::InvalidCorrection("operation ausente".to_string()))?;
+    let path = extract_optional_string_field(raw, "path");
     match operation.as_str() {
         "replace_text" => {
             let search = extract_string_field(raw, "search").ok_or_else(|| {
@@ -549,6 +580,7 @@ fn parse_correction_object(raw: &str) -> Result<StructuredCorrection, ModelRespo
                 ));
             }
             Ok(StructuredCorrection::ReplaceText {
+                path,
                 search,
                 replacement,
             })
@@ -560,7 +592,11 @@ fn parse_correction_object(raw: &str) -> Result<StructuredCorrection, ModelRespo
             let text = extract_string_field(raw, "text").ok_or_else(|| {
                 ModelResponseError::InvalidCorrection("insert_text sin text".to_string())
             })?;
-            Ok(StructuredCorrection::InsertText { position, text })
+            Ok(StructuredCorrection::InsertText {
+                path,
+                position,
+                text,
+            })
         }
         "remove_text" => {
             let start = extract_number_field(raw, "start").ok_or_else(|| {
@@ -569,7 +605,7 @@ fn parse_correction_object(raw: &str) -> Result<StructuredCorrection, ModelRespo
             let end = extract_number_field(raw, "end").ok_or_else(|| {
                 ModelResponseError::InvalidCorrection("remove_text sin end".to_string())
             })?;
-            Ok(StructuredCorrection::RemoveText { start, end })
+            Ok(StructuredCorrection::RemoveText { path, start, end })
         }
         other => Err(ModelResponseError::InvalidCorrection(format!(
             "operation desconocida: {other}"
@@ -578,60 +614,96 @@ fn parse_correction_object(raw: &str) -> Result<StructuredCorrection, ModelRespo
 }
 
 /// Convierte una decisión validada en [`Correction`] del Harness.
-pub fn structured_to_correction(item: &StructuredCorrection) -> Correction {
+///
+/// `path` inválido produce error; ausente → `Correction.path = None` (primary).
+pub fn structured_to_correction(
+    item: &StructuredCorrection,
+) -> Result<Correction, ModelResponseError> {
+    let artifact_path = match structured_correction_path(item) {
+        None => None,
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => Some(ArtifactPath::parse(raw).map_err(|message| {
+            ModelResponseError::InvalidCorrection(format!("path inválido: {message}"))
+        })?),
+    };
     match item {
         StructuredCorrection::ReplaceText {
             search,
             replacement,
-        } => Correction {
+            ..
+        } => Ok(Correction {
             target: CorrectionTarget::SessionCode,
-            path: None,
+            path: artifact_path,
             operation: CorrectionOperation::ReplaceText {
                 search: search.clone(),
                 replacement: replacement.clone(),
             },
-        },
-        StructuredCorrection::InsertText { position, text } => Correction {
+        }),
+        StructuredCorrection::InsertText { position, text, .. } => Ok(Correction {
             target: CorrectionTarget::SessionCode,
-            path: None,
+            path: artifact_path,
             operation: CorrectionOperation::InsertText {
                 position: *position,
                 text: text.clone(),
             },
-        },
-        StructuredCorrection::RemoveText { start, end } => Correction {
+        }),
+        StructuredCorrection::RemoveText { start, end, .. } => Ok(Correction {
             target: CorrectionTarget::SessionCode,
-            path: None,
+            path: artifact_path,
             operation: CorrectionOperation::RemoveText {
                 start: *start,
                 end: *end,
             },
-        },
+        }),
     }
 }
 
-/// Valida que ApplyCorrection no intente reemplazar el programa completo.
+fn correction_target_source(
+    correction: &StructuredCorrection,
+    artifact: Option<&RustArtifact>,
+) -> Result<Option<String>, ModelResponseError> {
+    match structured_correction_path(correction) {
+        None => Ok(artifact.map(|item| item.source().to_string())),
+        Some(raw) if raw.trim().is_empty() => Ok(artifact.map(|item| item.source().to_string())),
+        Some(raw) => {
+            let path = ArtifactPath::parse(raw).map_err(|message| {
+                ModelResponseError::InvalidCorrection(format!("path inválido: {message}"))
+            })?;
+            let Some(content) = artifact.and_then(|item| item.file(&path).map(str::to_string))
+            else {
+                return Err(ModelResponseError::InvalidCorrection(format!(
+                    "archivo de corrección inexistente: {raw}"
+                )));
+            };
+            Ok(Some(content))
+        }
+    }
+}
+
+/// Valida que ApplyCorrection no intente reemplazar el programa completo del archivo objetivo.
 pub fn validate_apply_correction(
     corrections: &[StructuredCorrection],
-    working_code: Option<&str>,
+    artifact: Option<&RustArtifact>,
 ) -> Result<(), ModelResponseError> {
-    if let Some(code) = working_code {
-        for correction in corrections {
-            if let StructuredCorrection::ReplaceText {
-                search,
-                replacement,
-            } = correction
+    for correction in corrections {
+        if let StructuredCorrection::ReplaceText {
+            search,
+            replacement,
+            ..
+        } = correction
+        {
+            if search.is_empty() {
+                return Err(ModelResponseError::InvalidCorrection(
+                    "search vacío".to_string(),
+                ));
+            }
+            if let Some(code) = correction_target_source(correction, artifact)?
+                && replacement.len() >= code.len()
+                && search.len() < code.len() / 2
             {
-                if search.is_empty() {
-                    return Err(ModelResponseError::InvalidCorrection(
-                        "search vacío".to_string(),
-                    ));
-                }
-                if replacement.len() >= code.len() && search.len() < code.len() / 2 {
-                    return Err(ModelResponseError::InvalidCorrection(
-                        "reemplazo de programa completo no permitido".to_string(),
-                    ));
-                }
+                return Err(ModelResponseError::InvalidCorrection(
+                    "reemplazo de programa completo no permitido".to_string(),
+                ));
             }
         }
     }
@@ -975,6 +1047,7 @@ fn infer_mock_corrections(request: &ModelRequest) -> Vec<StructuredCorrection> {
         .iter()
         .filter(|(required, substitute)| !code.contains(required) && code.contains(substitute))
         .map(|(required, substitute)| StructuredCorrection::ReplaceText {
+            path: None,
             search: (*substitute).to_string(),
             replacement: (*required).to_string(),
         })
@@ -1113,11 +1186,13 @@ mod tests {
     #[test]
     fn apply_correction_rejects_full_program_replace() {
         let code = "short";
+        let artifact = RustArtifact::new("main.rs", code);
         let corrections = vec![StructuredCorrection::ReplaceText {
+            path: None,
             search: "x".to_string(),
             replacement: "a very long replacement".to_string(),
         }];
-        let err = validate_apply_correction(&corrections, Some(code)).unwrap_err();
+        let err = validate_apply_correction(&corrections, Some(&artifact)).unwrap_err();
         assert!(matches!(err, ModelResponseError::InvalidCorrection(_)));
     }
 

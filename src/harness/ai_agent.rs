@@ -67,11 +67,11 @@ impl AiAgent {
                 Ok(AgentAction::RepairDiagnostic { errors })
             }
             ModelDecision::ApplyCorrection { corrections } => {
-                validate_apply_correction(&corrections, ctx.working_code())?;
+                validate_apply_correction(&corrections, ctx.working_artifact.as_ref())?;
                 let mapped = corrections
                     .iter()
                     .map(structured_to_correction)
-                    .collect::<Vec<Correction>>();
+                    .collect::<Result<Vec<Correction>, ModelResponseError>>()?;
                 Ok(AgentAction::ApplyCorrection {
                     corrections: mapped,
                 })
@@ -241,6 +241,7 @@ fn implementar_handlers() {
     fn ai_agent_apply_correction_is_structured_not_full_code() {
         let decision = ModelDecision::ApplyCorrection {
             corrections: vec![StructuredCorrection::ReplaceText {
+                path: None,
                 search: "NET".to_string(),
                 replacement: "HTTP".to_string(),
             }],

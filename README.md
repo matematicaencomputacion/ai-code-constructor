@@ -380,6 +380,7 @@ inside the harness** without corrupting the original `CodeState`.
 - `CompileTool` / Test / Clippy / Fmt run on that materialized crate (`cargo check` / `test` / `clippy` / `fmt`);
   ValidationTool still uses the **primary** buffer (compat).
 - `Correction` may target an existing `ArtifactPath`; legacy corrections without path still use **primary**.
+- Model JSON corrections may include optional `"path"` per operation; omitted path edits the primary file.
 
 ---
 
@@ -513,7 +514,6 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 ### Next (reasonable architectural units)
 
 - Builder multi-file initial artifacts (when a PlanKind justifies it)
-- ModelDecision path for multi-file corrections (optional)
 
 ### Long-term vision (not implemented)
 

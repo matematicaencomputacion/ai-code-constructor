@@ -45,6 +45,8 @@ mod artifact_scoped_quality_tests;
 #[cfg(test)]
 mod autonomous_construction_tests;
 #[cfg(test)]
+mod model_decision_multi_file_correction_tests;
+#[cfg(test)]
 mod multi_file_correction_tests;
 
 // API pública del harness; aún no consumida por el ciclo Constructor.

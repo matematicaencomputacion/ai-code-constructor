@@ -18,7 +18,7 @@ Goal:
 Allowed actions (JSON field "action"):
 - validate: run Validator on working_code
 - repair_diagnostic: analyze validator errors and produce diagnostic feedback
-- apply_correction: apply structured text edits only (replace_text, insert_text, remove_text)
+- apply_correction: apply structured text edits only (replace_text, insert_text, remove_text). Optional "path" selects an existing Artifact file (e.g. "src/helper.rs"); omit path to edit the primary file.
 - compile: compile the current working_code
 - run_tests: run tests on the session Artifact (optional filter)
 - run_clippy: run clippy on the session Artifact
@@ -29,6 +29,7 @@ Required JSON schema (single object, no markdown):
 {"action":"validate","request":"...","plan_kind":"Api","code":null}
 {"action":"repair_diagnostic","errors":["..."]}
 {"action":"apply_correction","corrections":[{"operation":"replace_text","search":"...","replacement":"..."}]}
+{"action":"apply_correction","corrections":[{"operation":"replace_text","path":"src/helper.rs","search":"...","replacement":"..."}]}
 {"action":"compile","code":"..."}
 {"action":"run_tests","filter":"..."}
 {"action":"run_clippy"}
@@ -73,6 +74,8 @@ mod tests {
         assert!(SYSTEM_PROMPT_V1.contains("validate"));
         assert!(SYSTEM_PROMPT_V1.contains("repair_diagnostic"));
         assert!(SYSTEM_PROMPT_V1.contains("apply_correction"));
+        assert!(SYSTEM_PROMPT_V1.contains("path"));
+        assert!(SYSTEM_PROMPT_V1.contains("primary"));
         assert!(SYSTEM_PROMPT_V1.contains("compile"));
         assert!(SYSTEM_PROMPT_V1.contains("run_tests"));
         assert!(SYSTEM_PROMPT_V1.contains("run_clippy"));
