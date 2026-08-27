@@ -535,7 +535,9 @@ mod tests {
     #[test]
     fn compile_tool_chain_produces_pass_evaluation_without_llm() {
         let tool = CompileTool;
-        let result = tool.execute("fn main() {}", &AgentContext::new("eval-chain"));
+        let ctx = crate::harness::context::AgentContext::new("eval-chain")
+            .with_working_code("fn main() {}");
+        let result = tool.execute("", &ctx);
         let engine = EvaluationEngine::new();
         let evaluation = engine.evaluate_criterion(
             &AcceptanceCriterion::new(

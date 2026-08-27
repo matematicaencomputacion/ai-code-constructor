@@ -614,4 +614,165 @@ mod tests {
         assert_eq!(result.status, ConstructionStatus::Completed);
         assert_eq!(result.final_artifact.as_ref().unwrap().file_count(), 1);
     }
+
+    #[test]
+    fn compile_tool_requires_working_artifact() {
+        // A
+        let result = CompileTool.execute("fn main() {}", &AgentContext::new("no-art"));
+        assert!(!result.success);
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "missing_artifact")
+        );
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "compile_status" && e.detail == "error")
+        );
+    }
+
+    #[test]
+    fn compile_tool_single_and_multi_file_pass() {
+        // B + C + D
+        let single = CompileTool.execute(
+            "",
+            &AgentContext::new("sf").with_working_code("fn main() {}\n"),
+        );
+        assert!(single.success, "{}", single.output);
+
+        let multi = multi_file_passing_artifact("art-compile-multi");
+        let result = CompileTool.execute("", &AgentContext::new("mf").with_working_artifact(multi));
+        assert!(
+            result.success,
+            "CompileTool debe ver helper.rs materializado: {}",
+            result.output
+        );
+        assert_eq!(evidence_artifact_id(&result), Some("art-compile-multi"));
+    }
+
+    #[test]
+    fn compile_tool_multi_file_invalid_fails_host_intact() {
+        // E + I
+        use crate::harness::artifact_path::ArtifactPath;
+        let cargo_toml = fs::read_to_string("Cargo.toml").unwrap();
+        let main_rs = fs::read_to_string("src/main.rs").unwrap();
+        let art = RustArtifact::try_from_files(
+            ArtifactId::new("art-compile-broken"),
+            "main.rs",
+            ArtifactPath::parse("src/main.rs").unwrap(),
+            [
+                (
+                    ArtifactPath::parse("src/main.rs").unwrap(),
+                    "mod missing_sibling;\nfn main() {}\n".to_string(),
+                ),
+                (
+                    ArtifactPath::parse("src/helper.rs").unwrap(),
+                    "pub fn x() {}\n".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        let result =
+            CompileTool.execute("", &AgentContext::new("broken").with_working_artifact(art));
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "compile_status" && e.detail == "error")
+        );
+        assert_eq!(fs::read_to_string("Cargo.toml").unwrap(), cargo_toml);
+        assert_eq!(fs::read_to_string("src/main.rs").unwrap(), main_rs);
+    }
+
+    #[test]
+    fn compile_tool_independent_artifacts_and_revision() {
+        // F + G + H
+        let a = artifact("art-c-a", "fn main() { /*a*/ }\n");
+        let mut b = artifact("art-c-b", "fn main() { /*b*/ }\n");
+        let ra = CompileTool.execute("", &AgentContext::new("a").with_working_artifact(a));
+        let rb = CompileTool.execute("", &AgentContext::new("b").with_working_artifact(b.clone()));
+        assert!(ra.success && rb.success);
+        assert_eq!(evidence_artifact_id(&ra), Some("art-c-a"));
+        assert_eq!(evidence_artifact_id(&rb), Some("art-c-b"));
+
+        b.replace_source("fn main() { let x: = 1; }\n");
+        assert_eq!(b.revision(), 1);
+        let r_bad = CompileTool.execute("", &AgentContext::new("b2").with_working_artifact(b));
+        assert!(
+            !r_bad.success,
+            "debe compilar la revisión actual: {}",
+            r_bad.output
+        );
+        assert_eq!(evidence_artifact_id(&r_bad), Some("art-c-b"));
+    }
+
+    #[test]
+    fn compile_tool_temp_cleaned_and_evaluation_pass_fail() {
+        // J + K + L
+        let art = artifact("art-c-eval", "fn main() {}\n");
+        let path = {
+            let mat = ArtifactMaterialization::from_artifact(&art).unwrap();
+            mat.root().to_path_buf()
+        };
+        assert!(!path.exists());
+
+        let pass = CompileTool.execute("", &AgentContext::new("pass").with_working_artifact(art));
+        let engine = EvaluationEngine::new();
+        let criterion = AcceptanceCriterion::new("ac-compile", "compila", CriterionKind::Compile);
+        assert_eq!(
+            engine
+                .evaluate_criterion(&criterion, &pass.evidence)
+                .verdict,
+            EvaluationVerdict::Pass
+        );
+
+        let fail = CompileTool.execute(
+            "",
+            &AgentContext::new("fail").with_working_code("fn main() {"),
+        );
+        assert_eq!(
+            engine
+                .evaluate_criterion(&criterion, &fail.evidence)
+                .verdict,
+            EvaluationVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn compile_tool_harness_multi_file_integration() {
+        // N
+        use crate::harness::artifact_path::ArtifactPath;
+        let art = multi_file_passing_artifact("art-compile-harness");
+        let mut harness = Harness::new(4);
+        harness.register_tool(Box::new(CompileTool));
+        harness.register_constraint(Box::new(ActionPolicy::default_session_policy()));
+        let mut ctx = AgentContext::new("harness-mf").with_working_artifact(art);
+        let outcome = harness.execute_step(
+            AgentAction::Compile {
+                code: String::new(),
+            },
+            &mut ctx,
+        );
+        assert!(outcome.permitted);
+        assert!(outcome.tool_executed);
+        let tool = outcome.tool_result.as_ref().expect("tool result");
+        assert!(tool.success, "{}", tool.output);
+        assert!(
+            tool.evidence
+                .iter()
+                .any(|e| e.label == "artifact_id" && e.detail == "art-compile-harness")
+        );
+        // primary untouched siblings
+        assert!(
+            ctx.working_artifact
+                .as_ref()
+                .unwrap()
+                .file(&ArtifactPath::parse("src/helper.rs").unwrap())
+                .is_some()
+        );
+    }
 }

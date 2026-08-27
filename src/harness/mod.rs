@@ -325,13 +325,12 @@ mod tests {
 
     #[test]
     fn compile_tool_compiles_valid_code() {
-        // A
+        // A — requiere working_artifact (crate materializado)
         let tool = CompileTool;
-        let result = tool.execute(
-            "fn main() { println!(\"ok\"); }\n",
-            &AgentContext::new("compile-ok"),
-        );
-        assert!(result.success);
+        let ctx =
+            AgentContext::new("compile-ok").with_working_code("fn main() { println!(\"ok\"); }\n");
+        let result = tool.execute("", &ctx);
+        assert!(result.success, "{}", result.output);
         assert!(
             result
                 .evidence
@@ -344,10 +343,9 @@ mod tests {
     fn compile_tool_fails_invalid_code_with_evidence() {
         // B
         let tool = CompileTool;
-        let result = tool.execute(
-            "fn main() { println!(\"broken\"\n",
-            &AgentContext::new("compile-fail"),
-        );
+        let ctx = AgentContext::new("compile-fail")
+            .with_working_code("fn main() { println!(\"broken\"\n");
+        let result = tool.execute("", &ctx);
         assert!(!result.success);
         assert!(result.evidence.iter().any(|e| e.label == "compiler_stderr"));
         assert!(

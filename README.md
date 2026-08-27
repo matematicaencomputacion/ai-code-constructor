@@ -377,8 +377,8 @@ inside the harness** without corrupting the original `CodeState`.
 - `AgentContext.working_artifact` is canonical; `working_code()` returns the **primary** source,
 - `replace_source` updates only the primary and preserves sibling files,
 - `ArtifactMaterialization` writes every file under an ephemeral Cargo crate (RAII), never the host workspace,
-- CompileTool / ValidationTool / CorrectionTool still operate on the primary buffer (compat);
-  Test / Clippy / Fmt run on the full materialized crate.
+- `CompileTool` / Test / Clippy / Fmt run on that materialized crate (`cargo check` / `test` / `clippy` / `fmt`);
+  ValidationTool and CorrectionTool still use the **primary** buffer (compat).
 
 ---
 
@@ -495,6 +495,7 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - Autonomous construction observability (`ConstructionObservability` derived from LoopResult / Evaluation)
 - Artifact-scoped quality tools: Test/Clippy/Fmt materialize `RustArtifact` into an ephemeral Cargo crate (RAII), never the host workspace
 - Multi-file `RustArtifact` (`ArtifactPath` + primary compat) + multi-file materialization
+- `CompileTool` via materialized crate (`cargo check`), same isolation as quality tools
 - Live quality demo wiring (`LiveSessionConfig::quality_verification_artifact`)
 - CI quality gate
 
@@ -510,7 +511,6 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 
 ### Next (reasonable architectural units)
 
-- Compile via materialized crate (unify rustc/cargo worlds)
 - Multi-file corrections (`path` on Correction)
 - Builder multi-file initial artifacts (when a PlanKind justifies it)
 
