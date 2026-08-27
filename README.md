@@ -493,7 +493,8 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - ActionPolicy / ActionConstraints: permission ≠ action validity (Artifact / Repair / Correction / Finish)
 - LiveSession uses `ActionPolicy::default_session_policy()` by default (injectable)
 - Autonomous construction session: Specification → Plan → Artifact → AgentLoop → ConstructionResult
-- Deterministic Initial Artifact from `builder::initial_source_for_kind(PlanKind)` (caller override optional)
+- Deterministic Initial Artifact from `builder::initial_artifact_definition_for_kind(PlanKind)` (caller override optional)
+- `PlanKind::Authentication` produces `src/main.rs` + `src/auth.rs`; other kinds remain single-file
 - Autonomous construction observability (`ConstructionObservability` derived from LoopResult / Evaluation)
 - Artifact-scoped quality tools: Test/Clippy/Fmt materialize `RustArtifact` into an ephemeral Cargo crate (RAII), never the host workspace
 - Multi-file `RustArtifact` (`ArtifactPath` + primary compat) + multi-file materialization
@@ -513,7 +514,7 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 
 ### Next (reasonable architectural units)
 
-- Builder multi-file initial artifacts (when a PlanKind justifies it)
+- Extend multi-file initial artifacts to additional PlanKinds when justified
 
 ### Long-term vision (not implemented)
 
