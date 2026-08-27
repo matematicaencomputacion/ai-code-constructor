@@ -1,10 +1,10 @@
 use crate::harness::context::AgentContext;
-use crate::harness::evaluation::Evidence;
 use crate::harness::tool::{Tool, ToolResult};
-use crate::harness::tools::{RUN_CLIPPY, tool_result_from_output};
-use std::process::Command;
+use crate::harness::tools::{RUN_CLIPPY, run_cargo_on_artifact};
 
-/// Ejecuta `cargo clippy -- -D warnings`.
+/// Ejecuta `cargo clippy -- -D warnings` sobre el [`crate::harness::RustArtifact`] materializado.
+///
+/// No usa el workspace del repositorio anfitrión.
 pub struct ClippyTool;
 
 impl Tool for ClippyTool {
@@ -13,24 +13,8 @@ impl Tool for ClippyTool {
     }
 
     fn execute(&self, _input: &str, ctx: &AgentContext) -> ToolResult {
-        let workspace = ctx.workspace();
-        match Command::new("cargo")
-            .arg("clippy")
-            .arg("--")
-            .arg("-D")
-            .arg("warnings")
-            .current_dir(&workspace)
-            .output()
-        {
-            Ok(output) => tool_result_from_output(RUN_CLIPPY, output),
-            Err(error) => ToolResult {
-                success: false,
-                output: format!("No se pudo ejecutar cargo clippy: {error}"),
-                evidence: vec![
-                    Evidence::new("tool", RUN_CLIPPY),
-                    Evidence::new("spawn_error", error.to_string()),
-                ],
-            },
-        }
+        run_cargo_on_artifact(RUN_CLIPPY, ctx, |command, _root| {
+            command.arg("clippy").arg("--").arg("-D").arg("warnings");
+        })
     }
 }

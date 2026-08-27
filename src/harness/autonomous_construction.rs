@@ -2,7 +2,18 @@
 //!
 //! No reemplaza [`crate::main::run_constructor`]. Reutiliza AgentLoop, ActionPolicy,
 //! EvaluationEngine y el Harness de sesión (Validate / Repair / Correct / Compile).
+//!
+//! Initial Artifact: por defecto desde [`crate::builder::initial_source_for_kind`]
+//! (PlanKind → source determinista). El caller puede inyectar un source explícito
+//! para tests (p. ej. defectos controlados).
+//!
+//! Observabilidad: [`ConstructionObservability`] es un resumen **derivado** de
+//! LoopResult / Evidence / EvaluationEngine — no es una segunda fuente de verdad.
 
+use std::collections::BTreeMap;
+use std::time::Instant;
+
+use crate::builder;
 use crate::harness::action_policy::ActionPolicy;
 use crate::harness::agent::Agent;
 use crate::harness::agent_loop::{AgentLoop, LoopResult, LoopStatus};
@@ -10,16 +21,19 @@ use crate::harness::ai_agent::AiAgent;
 use crate::harness::artifact::{ArtifactId, RustArtifact};
 use crate::harness::constraint::Constraint;
 use crate::harness::context::AgentContext;
+use crate::harness::criterion::CriterionKind;
+use crate::harness::evaluation::EvaluationVerdict;
 use crate::harness::evaluation_engine::{
     EvaluationEngine, SpecificationEvaluation, SpecificationEvaluationStatus,
 };
 use crate::harness::live_session::build_validate_compile_harness_with_policy;
 use crate::harness::model::{AiSessionConfig, ModelClient};
+use crate::harness::observation::AgentObservation;
 use crate::harness::specification::{Specification, SpecificationId, SpecificationValidationError};
 use crate::harness::specification_planner::{
     SpecificationBuildPlan, SpecificationPlannerError, plan_specification,
 };
-use crate::planner::PlanKind;
+use crate::planner::{BuildPlan, PlanKind};
 
 /// Estado terminal de una construcción autónoma.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,29 +44,94 @@ pub enum ConstructionStatus {
     InvalidSpecification,
 }
 
+/// Resumen agregado de ejecuciones de una Tool (derivado de LoopHistory.steps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolExecutionSummary {
+    pub tool_name: String,
+    pub executions: u32,
+    pub successes: u32,
+    pub failures: u32,
+}
+
+/// Evaluación de un criterio en el timeline (derivada de CriterionEvaluated / EvaluationEngine).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CriterionObservabilityEntry {
+    pub criterion_id: String,
+    pub kind: CriterionKind,
+    pub verdict: EvaluationVerdict,
+}
+
+/// Resumen observable de una construcción. Derivado; no muta el flujo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConstructionObservability {
+    /// Duración total de la sesión (ms). Presente siempre; no afirmar valores exactos en tests.
+    pub duration_ms: u64,
+    /// Iteraciones reales de AgentLoop (`0` si no hubo loop).
+    pub iteration_count: u32,
+    /// Secuencia ordenada de Tools que se ejecutaron.
+    pub tools_executed_sequence: Vec<String>,
+    /// Conteos por Tool.
+    pub tool_summaries: Vec<ToolExecutionSummary>,
+    /// Timeline de CriterionEvaluated observados durante el loop.
+    pub criterion_timeline: Vec<CriterionObservabilityEntry>,
+    /// Verdict final por criterio (SpecificationEvaluation agregada).
+    pub final_criteria: Vec<CriterionObservabilityEntry>,
+    pub final_status: ConstructionStatus,
+    pub termination_reason: String,
+    /// Retries de transporte/modelo observados en la sesión, si hay fuente causal.
+    ///
+    /// - `Some(n)`: se inyectó [`crate::harness::ModelRetryObservability`] (n puede ser 0).
+    /// - `None`: no hay fuente causal (p. ej. `run_with_model_client` sin handle).
+    ///
+    /// Ortogonal a [`Self::iteration_count`]. Re-ejecutar una Tool tras FAIL **no** es un retry.
+    pub model_retry_count: Option<u32>,
+}
+
+impl ConstructionObservability {
+    pub fn tool_execution_count(&self, tool_name: &str) -> u32 {
+        self.tool_summaries
+            .iter()
+            .find(|item| item.tool_name == tool_name)
+            .map(|item| item.executions)
+            .unwrap_or(0)
+    }
+
+    pub fn criterion_verdicts(&self, criterion_id: &str) -> Vec<EvaluationVerdict> {
+        self.criterion_timeline
+            .iter()
+            .filter(|item| item.criterion_id == criterion_id)
+            .map(|item| item.verdict)
+            .collect()
+    }
+}
+
 /// Configuración de una sesión de construcción desde Specification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AutonomousConstructionConfig {
     pub specification: Specification,
-    /// Source inicial del Artifact (típicamente inválido; el Agent debe corregirlo).
-    pub initial_source: String,
+    /// Override opcional del source inicial (tests / inyección).
+    /// Si es `None`, el source se obtiene de [`builder::initial_source_for_kind`].
+    pub initial_source: Option<String>,
     pub max_iterations: u32,
     /// Nombre del archivo del Artifact.
     pub artifact_name: String,
 }
 
 impl AutonomousConstructionConfig {
-    pub fn new(
-        specification: Specification,
-        initial_source: impl Into<String>,
-        max_iterations: u32,
-    ) -> Self {
+    /// Configuración estándar: el Initial Artifact lo produce el Builder desde el Plan.
+    pub fn new(specification: Specification, max_iterations: u32) -> Self {
         Self {
             specification,
-            initial_source: initial_source.into(),
+            initial_source: None,
             max_iterations,
             artifact_name: "main.rs".to_string(),
         }
+    }
+
+    /// Inyecta un source explícito (p. ej. código defectuoso en tests).
+    pub fn with_initial_source(mut self, source: impl Into<String>) -> Self {
+        self.initial_source = Some(source.into());
+        self
     }
 
     pub fn with_artifact_name(mut self, name: impl Into<String>) -> Self {
@@ -74,6 +153,8 @@ pub struct ConstructionResult {
     pub termination_reason: String,
     pub validation_error: Option<SpecificationValidationError>,
     pub action_policy: String,
+    /// Resumen derivado de LoopResult / Evaluation (no altera la semántica).
+    pub observability: ConstructionObservability,
 }
 
 impl ConstructionResult {
@@ -96,6 +177,21 @@ impl ConstructionResult {
     }
 }
 
+/// Materializa un [`RustArtifact`] inicial a partir del plan (Builder determinista).
+pub fn initial_artifact_from_plan(
+    specification_id: SpecificationId,
+    plan: &BuildPlan,
+    artifact_name: impl Into<String>,
+) -> RustArtifact {
+    let source = builder::initial_source_for_kind(plan.kind);
+    RustArtifact::with_id(
+        ArtifactId::new(format!("artifact:{}", specification_id.as_str())),
+        artifact_name,
+        source,
+    )
+    .with_specification_id(specification_id)
+}
+
 /// Orquestador: Specification → Plan → Artifact → AgentLoop → Evaluation → Result.
 ///
 /// No implementa otro loop; delega en [`AgentLoop`].
@@ -113,48 +209,104 @@ impl AutonomousConstructionSession {
         agent: &mut dyn Agent,
         policy: ActionPolicy,
     ) -> ConstructionResult {
-        let specification_id = config.specification.id.clone();
         let policy_name = policy.name().to_string();
+        let harness = build_validate_compile_harness_with_policy(policy);
+        Self::run_with_harness(config, agent, policy_name, harness)
+    }
+
+    /// Misma semántica que [`Self::run_with_policy`], con Harness inyectado (tests / stubs).
+    ///
+    /// No introduce un segundo runtime: usa el mismo [`AgentLoop`] + [`crate::harness::Harness`].
+    pub fn run_with_harness(
+        config: AutonomousConstructionConfig,
+        agent: &mut dyn Agent,
+        policy_name: impl Into<String>,
+        harness: crate::harness::runtime::Harness,
+    ) -> ConstructionResult {
+        Self::run_with_harness_and_retry_observability(config, agent, policy_name, harness, None)
+    }
+
+    /// Como [`Self::run_with_harness`], con inyección causal opcional de retries de modelo.
+    pub fn run_with_harness_and_retry_observability(
+        config: AutonomousConstructionConfig,
+        agent: &mut dyn Agent,
+        policy_name: impl Into<String>,
+        harness: crate::harness::runtime::Harness,
+        retry_observability: Option<crate::harness::ModelRetryObservability>,
+    ) -> ConstructionResult {
+        let started = Instant::now();
+        let specification_id = config.specification.id.clone();
+        let policy_name = policy_name.into();
+        // Con handle: Some(total) incluso si es 0 ("fuente causal, sin retries").
+        // Sin handle: None ("sin fuente causal").
+        let retry_count_from_handle = || retry_observability.as_ref().map(|obs| obs.total());
 
         if let Err(error) = config.specification.validate() {
+            let termination_reason = format!("specification inválida: {error}");
+            let status = ConstructionStatus::InvalidSpecification;
             return ConstructionResult {
-                status: ConstructionStatus::InvalidSpecification,
+                status,
                 specification_id,
                 artifact_id: None,
                 final_artifact: None,
                 build_plan: None,
                 loop_result: None,
                 specification_evaluation: None,
-                termination_reason: format!("specification inválida: {error}"),
+                termination_reason: termination_reason.clone(),
                 validation_error: Some(error),
                 action_policy: policy_name,
+                observability: build_observability(
+                    status,
+                    started.elapsed().as_millis() as u64,
+                    None,
+                    None,
+                    &termination_reason,
+                    retry_count_from_handle(),
+                ),
             };
         }
 
         let planned = match plan_specification(&config.specification) {
             Ok(plan) => plan,
             Err(SpecificationPlannerError::InvalidSpecification(error)) => {
+                let termination_reason = format!("planificación rechazada: {error}");
+                let status = ConstructionStatus::InvalidSpecification;
                 return ConstructionResult {
-                    status: ConstructionStatus::InvalidSpecification,
+                    status,
                     specification_id,
                     artifact_id: None,
                     final_artifact: None,
                     build_plan: None,
                     loop_result: None,
                     specification_evaluation: None,
-                    termination_reason: format!("planificación rechazada: {error}"),
+                    termination_reason: termination_reason.clone(),
                     validation_error: Some(error),
                     action_policy: policy_name,
+                    observability: build_observability(
+                        status,
+                        started.elapsed().as_millis() as u64,
+                        None,
+                        None,
+                        &termination_reason,
+                        retry_count_from_handle(),
+                    ),
                 };
             }
         };
 
-        let initial_artifact = RustArtifact::with_id(
-            ArtifactId::new(format!("artifact:{}", specification_id.as_str())),
-            config.artifact_name.clone(),
-            config.initial_source.clone(),
-        )
-        .with_specification_id(specification_id.clone());
+        let initial_artifact = match &config.initial_source {
+            Some(source) => RustArtifact::with_id(
+                ArtifactId::new(format!("artifact:{}", specification_id.as_str())),
+                config.artifact_name.clone(),
+                source.clone(),
+            )
+            .with_specification_id(specification_id.clone()),
+            None => initial_artifact_from_plan(
+                specification_id.clone(),
+                &planned.plan,
+                config.artifact_name.clone(),
+            ),
+        };
         let artifact_id = initial_artifact.id().clone();
 
         let goal = format!(
@@ -166,7 +318,6 @@ impl AutonomousConstructionSession {
             .with_working_artifact(initial_artifact)
             .with_evaluation_specification(config.specification.clone());
 
-        let harness = build_validate_compile_harness_with_policy(policy);
         let max_iterations = config.max_iterations.max(1);
         let loop_result = AgentLoop::new(max_iterations).run(&harness, agent, ctx);
 
@@ -190,6 +341,15 @@ impl AutonomousConstructionSession {
             ConstructionStatus::InvalidSpecification => unreachable!("ya filtrado"),
         };
 
+        let observability = build_observability(
+            status,
+            started.elapsed().as_millis() as u64,
+            Some(&loop_result),
+            Some(&specification_evaluation),
+            &termination_reason,
+            retry_count_from_handle(),
+        );
+
         ConstructionResult {
             status,
             specification_id,
@@ -201,10 +361,11 @@ impl AutonomousConstructionSession {
             termination_reason,
             validation_error: None,
             action_policy: policy_name,
+            observability,
         }
     }
 
-    /// Atajo: AiAgent + ModelClient + policy por defecto.
+    /// Atajo: AiAgent + ModelClient + policy por defecto (sin retry observability → `None`).
     pub fn run_with_model_client(
         config: AutonomousConstructionConfig,
         client: Box<dyn ModelClient>,
@@ -221,6 +382,30 @@ impl AutonomousConstructionSession {
         client: Box<dyn ModelClient>,
         policy: ActionPolicy,
     ) -> ConstructionResult {
+        Self::run_with_model_client_policy_and_retry_observability(config, client, policy, None)
+    }
+
+    /// Como [`Self::run_with_model_client`], con handle causal de retries.
+    pub fn run_with_model_client_and_retry_observability(
+        config: AutonomousConstructionConfig,
+        client: Box<dyn ModelClient>,
+        retry_observability: crate::harness::ModelRetryObservability,
+    ) -> ConstructionResult {
+        Self::run_with_model_client_policy_and_retry_observability(
+            config,
+            client,
+            ActionPolicy::default_session_policy(),
+            Some(retry_observability),
+        )
+    }
+
+    /// AiAgent + policy + inyección causal opcional de retries de modelo.
+    pub fn run_with_model_client_policy_and_retry_observability(
+        config: AutonomousConstructionConfig,
+        client: Box<dyn ModelClient>,
+        policy: ActionPolicy,
+        retry_observability: Option<crate::harness::ModelRetryObservability>,
+    ) -> ConstructionResult {
         let plan_kind = match plan_specification(&config.specification) {
             Ok(planned) => plan_kind_label(planned.plan.kind),
             Err(_) => "Generic".to_string(),
@@ -230,7 +415,110 @@ impl AutonomousConstructionSession {
             plan_kind,
         };
         let mut agent = AiAgent::new(client, session);
-        Self::run_with_policy(config, &mut agent, policy)
+        let policy_name = policy.name().to_string();
+        let harness = build_validate_compile_harness_with_policy(policy);
+        Self::run_with_harness_and_retry_observability(
+            config,
+            &mut agent,
+            policy_name,
+            harness,
+            retry_observability,
+        )
+    }
+}
+
+fn build_observability(
+    final_status: ConstructionStatus,
+    duration_ms: u64,
+    loop_result: Option<&LoopResult>,
+    evaluation: Option<&SpecificationEvaluation>,
+    termination_reason: &str,
+    model_retry_count: Option<u32>,
+) -> ConstructionObservability {
+    let iteration_count = loop_result.map(|result| result.iterations).unwrap_or(0);
+
+    let tools_executed_sequence = loop_result
+        .map(LoopResult::tools_executed)
+        .unwrap_or_default();
+
+    let mut counts: BTreeMap<String, (u32, u32, u32)> = BTreeMap::new();
+    if let Some(result) = loop_result {
+        for step in &result.history.steps {
+            if !step.tool_executed {
+                continue;
+            }
+            let Some(name) = &step.tool_name else {
+                continue;
+            };
+            let entry = counts.entry(name.clone()).or_insert((0, 0, 0));
+            entry.0 += 1;
+            let success = step
+                .tool_result
+                .as_ref()
+                .map(|tool| tool.success)
+                .unwrap_or(false);
+            if success {
+                entry.1 += 1;
+            } else {
+                entry.2 += 1;
+            }
+        }
+    }
+    let tool_summaries = counts
+        .into_iter()
+        .map(
+            |(tool_name, (executions, successes, failures))| ToolExecutionSummary {
+                tool_name,
+                executions,
+                successes,
+                failures,
+            },
+        )
+        .collect();
+
+    let mut criterion_timeline = Vec::new();
+    if let Some(result) = loop_result {
+        for observation in &result.history.observations {
+            if let AgentObservation::CriterionEvaluated {
+                criterion_id,
+                kind,
+                verdict,
+                ..
+            } = observation
+            {
+                criterion_timeline.push(CriterionObservabilityEntry {
+                    criterion_id: criterion_id.as_str().to_string(),
+                    kind: *kind,
+                    verdict: *verdict,
+                });
+            }
+        }
+    }
+
+    let final_criteria = evaluation
+        .map(|aggregated| {
+            aggregated
+                .criteria
+                .iter()
+                .map(|item| CriterionObservabilityEntry {
+                    criterion_id: item.criterion_id.as_str().to_string(),
+                    kind: item.kind,
+                    verdict: item.verdict,
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    ConstructionObservability {
+        duration_ms,
+        iteration_count,
+        tools_executed_sequence,
+        tool_summaries,
+        criterion_timeline,
+        final_criteria,
+        final_status,
+        termination_reason: termination_reason.to_string(),
+        model_retry_count,
     }
 }
 

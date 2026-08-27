@@ -1,0 +1,430 @@
+//! Tests de aislamiento: Quality Tools evalúan el RustArtifact, no el workspace del repo.
+
+#[cfg(test)]
+mod tests {
+    use crate::harness::action::AgentAction;
+    use crate::harness::action_policy::ActionPolicy;
+    use crate::harness::agent::Agent;
+    use crate::harness::artifact::{ArtifactId, RustArtifact};
+    use crate::harness::artifact_materialization::ArtifactMaterialization;
+    use crate::harness::autonomous_construction::{
+        AutonomousConstructionConfig, AutonomousConstructionSession, ConstructionStatus,
+    };
+    use crate::harness::constraint::Constraint;
+    use crate::harness::context::AgentContext;
+    use crate::harness::criterion::CriterionKind;
+    use crate::harness::evaluation::EvaluationVerdict;
+    use crate::harness::evaluation_engine::EvaluationEngine;
+    use crate::harness::observation::AgentObservation;
+    use crate::harness::runtime::Harness;
+    use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+    use crate::harness::tool::Tool;
+    use crate::harness::tools::{
+        CHECK_FORMAT, ClippyTool, CompileTool, CorrectionTool, FmtTool, RUN_CLIPPY, RUN_TESTS,
+        RepairDiagnosticTool, TestTool, ValidationTool,
+    };
+    use std::fs;
+
+    fn artifact(id: &str, source: &str) -> RustArtifact {
+        RustArtifact::with_id(ArtifactId::new(id), "main.rs", source)
+    }
+
+    fn ctx_with(id: &str, source: &str) -> AgentContext {
+        AgentContext::new("quality-scope").with_working_artifact(artifact(id, source))
+    }
+
+    fn passing_tests_source() -> &'static str {
+        r#"
+fn main() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn isolation_pass() {
+        assert_eq!(1 + 1, 2);
+    }
+}
+"#
+    }
+
+    fn failing_tests_source() -> &'static str {
+        r#"
+fn main() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn isolation_must_fail() {
+        assert_eq!(1 + 1, 3, "artifact isolation failure marker");
+    }
+}
+"#
+    }
+
+    fn clippy_clean_source() -> &'static str {
+        "fn main() {}\n"
+    }
+
+    fn clippy_dirty_source() -> &'static str {
+        // unused_variables → warning; clippy -D warnings → FAIL
+        "fn main() {\n    let unused_for_isolation = 1;\n}\n"
+    }
+
+    fn fmt_clean_source() -> &'static str {
+        "fn main() {}\n"
+    }
+
+    fn fmt_dirty_source() -> &'static str {
+        "fn main(){let x=1;println!(\"{}\",x);}\n"
+    }
+
+    fn evidence_artifact_id(result: &crate::harness::tool::ToolResult) -> Option<&str> {
+        result
+            .evidence
+            .iter()
+            .find(|item| item.label == "artifact_id")
+            .map(|item| item.detail.as_str())
+    }
+
+    #[test]
+    fn missing_artifact_does_not_use_workspace() {
+        // A — sin Artifact: fail controlado, sin cargo sobre el repo
+        for (tool_name, result) in [
+            (
+                "run_tests",
+                TestTool.execute("", &AgentContext::new("no-art")),
+            ),
+            (
+                "run_clippy",
+                ClippyTool.execute("", &AgentContext::new("no-art")),
+            ),
+            (
+                "check_format",
+                FmtTool.execute("", &AgentContext::new("no-art")),
+            ),
+        ] {
+            assert!(
+                !result.success,
+                "{tool_name} no debe ejecutarse sin Artifact"
+            );
+            assert!(
+                result
+                    .evidence
+                    .iter()
+                    .any(|e| e.label == "missing_artifact"),
+                "{tool_name}: {:?}",
+                result.evidence
+            );
+            assert!(
+                !result.evidence.iter().any(|e| e.label == "exit_status"),
+                "{tool_name} no debe haber corrido cargo"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tool_uses_materialized_artifact_not_workspace() {
+        // B + F + G — Artifact con assert fallido → FAIL aunque el repo esté sano
+        let result = TestTool.execute("", &ctx_with("art-test-fail", failing_tests_source()));
+        assert!(
+            !result.success,
+            "debe fallar el Artifact: {}",
+            result.output
+        );
+        assert!(result.output.contains("isolation_must_fail") || !result.success);
+        assert_eq!(evidence_artifact_id(&result), Some("art-test-fail"));
+
+        let pass = TestTool.execute("", &ctx_with("art-test-pass", passing_tests_source()));
+        assert!(pass.success, "Artifact válido debe pasar: {}", pass.output);
+        assert_eq!(evidence_artifact_id(&pass), Some("art-test-pass"));
+    }
+
+    #[test]
+    fn clippy_tool_uses_materialized_artifact_not_workspace() {
+        // C + G
+        let dirty = ClippyTool.execute("", &ctx_with("art-clippy-bad", clippy_dirty_source()));
+        assert!(
+            !dirty.success,
+            "clippy debe fallar sobre Artifact sucio: {}",
+            dirty.output
+        );
+        assert_eq!(evidence_artifact_id(&dirty), Some("art-clippy-bad"));
+
+        let clean = ClippyTool.execute("", &ctx_with("art-clippy-ok", clippy_clean_source()));
+        assert!(
+            clean.success,
+            "clippy debe pasar sobre Artifact limpio: {}",
+            clean.output
+        );
+        assert_eq!(evidence_artifact_id(&clean), Some("art-clippy-ok"));
+    }
+
+    #[test]
+    fn fmt_tool_uses_materialized_artifact_not_workspace() {
+        // D + G
+        let dirty = FmtTool.execute("", &ctx_with("art-fmt-bad", fmt_dirty_source()));
+        assert!(
+            !dirty.success,
+            "fmt --check debe fallar sobre Artifact mal formateado: {}",
+            dirty.output
+        );
+        assert_eq!(evidence_artifact_id(&dirty), Some("art-fmt-bad"));
+
+        let clean = FmtTool.execute("", &ctx_with("art-fmt-ok", fmt_clean_source()));
+        assert!(
+            clean.success,
+            "fmt --check debe pasar sobre Artifact formateado: {}",
+            clean.output
+        );
+        assert_eq!(evidence_artifact_id(&clean), Some("art-fmt-ok"));
+    }
+
+    #[test]
+    fn evidence_contains_correct_artifact_id_field() {
+        // E
+        let result = TestTool.execute("", &ctx_with("art-id-field", passing_tests_source()));
+        let entry = result
+            .evidence
+            .iter()
+            .find(|e| e.label == "artifact_id")
+            .expect("artifact_id label");
+        assert_eq!(entry.detail, "art-id-field");
+        assert_eq!(
+            entry.artifact_id.as_ref().map(|id| id.as_str()),
+            Some("art-id-field")
+        );
+    }
+
+    #[test]
+    fn two_artifacts_produce_independent_evidence() {
+        // F
+        let a = TestTool.execute("", &ctx_with("art-independent-a", failing_tests_source()));
+        let b = TestTool.execute("", &ctx_with("art-independent-b", passing_tests_source()));
+        assert!(!a.success);
+        assert!(b.success);
+        assert_eq!(evidence_artifact_id(&a), Some("art-independent-a"));
+        assert_eq!(evidence_artifact_id(&b), Some("art-independent-b"));
+        assert_ne!(evidence_artifact_id(&a), evidence_artifact_id(&b));
+    }
+
+    #[test]
+    fn workspace_repo_remains_intact_after_quality_tools() {
+        // H
+        let cargo_toml = fs::read_to_string("Cargo.toml").expect("Cargo.toml del repo");
+        let main_rs = fs::read_to_string("src/main.rs").expect("src/main.rs del repo");
+        let _ = TestTool.execute("", &ctx_with("art-ws-intact", failing_tests_source()));
+        let _ = ClippyTool.execute("", &ctx_with("art-ws-intact-2", clippy_dirty_source()));
+        let _ = FmtTool.execute("", &ctx_with("art-ws-intact-3", fmt_dirty_source()));
+        assert_eq!(
+            fs::read_to_string("Cargo.toml").unwrap(),
+            cargo_toml,
+            "Cargo.toml del repo no debe mutar"
+        );
+        assert_eq!(
+            fs::read_to_string("src/main.rs").unwrap(),
+            main_rs,
+            "src/main.rs del repo no debe mutar"
+        );
+    }
+
+    #[test]
+    fn temporary_materialization_is_cleaned() {
+        // I — cubierto también en artifact_materialization::tests; refuerzo aquí
+        let art = artifact("art-cleanup", "fn main() {}");
+        let path = {
+            let mat = ArtifactMaterialization::from_artifact(&art).expect("mat");
+            mat.root().to_path_buf()
+        };
+        assert!(!path.exists(), "temp debe limpiarse: {}", path.display());
+    }
+
+    #[test]
+    fn artifact_revision_is_reflected_on_next_execution() {
+        // J
+        let mut art = artifact(
+            "art-rev",
+            r#"
+fn main() {}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn v0() { assert!(true); }
+}
+"#,
+        );
+        let first = TestTool.execute(
+            "",
+            &AgentContext::new("rev").with_working_artifact(art.clone()),
+        );
+        assert!(first.success, "{}", first.output);
+
+        art.replace_source(
+            r#"
+fn main() {}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn v1_must_fail() { assert!(false, "revision marker"); }
+}
+"#,
+        );
+        assert_eq!(art.revision(), 1);
+        let second = TestTool.execute(
+            "",
+            &AgentContext::new("rev").with_working_artifact(art.clone()),
+        );
+        assert!(
+            !second.success,
+            "la revisión nueva debe fallar: {}",
+            second.output
+        );
+        assert_eq!(evidence_artifact_id(&second), Some("art-rev"));
+    }
+
+    #[test]
+    fn artifact_tool_evidence_evaluation_traceability() {
+        // K
+        let result = TestTool.execute("", &ctx_with("art-trace", failing_tests_source()));
+        assert!(!result.success);
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests),
+            &result.evidence,
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Fail);
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.artifact_id.as_ref().map(|id| id.as_str()) == Some("art-trace"))
+        );
+        assert!(
+            evaluation
+                .evidence_used
+                .iter()
+                .any(|e| e.label == "tool" && e.detail == RUN_TESTS)
+        );
+    }
+
+    #[test]
+    fn e2e_autonomous_construction_quality_tools_use_session_artifact() {
+        // E2E mínimo: Agent propone RunTests/Clippy/Fmt sobre Artifact de sesión.
+        fn quality_spec() -> Specification {
+            Specification::new("spec-artifact-quality", "Crear una API REST")
+                .with_requirements(vec![
+                    Requirement::new("req-t", "tests"),
+                    Requirement::new("req-l", "clippy"),
+                    Requirement::new("req-f", "format"),
+                ])
+                .with_acceptance_criteria(vec![
+                    AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests)
+                        .satisfying([crate::harness::RequirementId::new("req-t")]),
+                    AcceptanceCriterion::new("ac-clippy", "clippy", CriterionKind::Clippy)
+                        .satisfying([crate::harness::RequirementId::new("req-l")]),
+                    AcceptanceCriterion::new("ac-fmt", "format", CriterionKind::CheckFormat)
+                        .satisfying([crate::harness::RequirementId::new("req-f")]),
+                ])
+        }
+
+        fn has_pass(ctx: &AgentContext, kind: CriterionKind) -> bool {
+            ctx.observation_history.iter().rev().any(|obs| {
+                matches!(
+                    obs,
+                    AgentObservation::CriterionEvaluated {
+                        kind: k,
+                        verdict: EvaluationVerdict::Pass,
+                        ..
+                    } if *k == kind
+                )
+            })
+        }
+
+        struct QualityArtifactAgent;
+
+        impl Agent for QualityArtifactAgent {
+            fn propose(&mut self, ctx: &AgentContext) -> AgentAction {
+                if !has_pass(ctx, CriterionKind::RunTests) {
+                    return AgentAction::RunTests {
+                        filter: String::new(),
+                    };
+                }
+                if !has_pass(ctx, CriterionKind::Clippy) {
+                    return AgentAction::RunClippy;
+                }
+                if !has_pass(ctx, CriterionKind::CheckFormat) {
+                    return AgentAction::CheckFormat;
+                }
+                AgentAction::Finish {
+                    summary: "artifact quality criteria satisfied".to_string(),
+                }
+            }
+        }
+
+        // Source con test real, clippy limpio y formato rustfmt-compatible (sin newline inicial).
+        let source = "\
+fn main() {}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn session_artifact_test() {
+        assert_eq!(2 * 2, 4);
+    }
+}
+";
+
+        let policy = ActionPolicy::default_session_policy();
+        let policy_name = policy.name().to_string();
+        let mut harness = Harness::new(12);
+        harness.register_tool(Box::new(ValidationTool));
+        harness.register_tool(Box::new(RepairDiagnosticTool));
+        harness.register_tool(Box::new(CorrectionTool));
+        harness.register_tool(Box::new(CompileTool));
+        harness.register_tool(Box::new(TestTool));
+        harness.register_tool(Box::new(ClippyTool));
+        harness.register_tool(Box::new(FmtTool));
+        harness.register_constraint(Box::new(policy));
+
+        let mut agent = QualityArtifactAgent;
+        let result = AutonomousConstructionSession::run_with_harness(
+            AutonomousConstructionConfig::new(quality_spec(), 10).with_initial_source(source),
+            &mut agent,
+            policy_name,
+            harness,
+        );
+
+        assert_eq!(result.status, ConstructionStatus::Completed);
+        let tools = &result.observability.tools_executed_sequence;
+        assert!(tools.iter().any(|t| t == RUN_TESTS));
+        assert!(tools.iter().any(|t| t == RUN_CLIPPY));
+        assert!(tools.iter().any(|t| t == CHECK_FORMAT));
+
+        let loop_result = result.loop_result.as_ref().expect("loop");
+        let test_step = loop_result
+            .history
+            .steps
+            .iter()
+            .find(|step| step.tool_name.as_deref() == Some(RUN_TESTS))
+            .expect("run_tests step");
+        let artifact_id = result.artifact_id.as_ref().expect("session artifact id");
+        assert!(
+            test_step
+                .evidence
+                .iter()
+                .any(|e| e.label == "artifact_id" && e.detail == artifact_id.as_str()),
+            "Evidence de RunTests debe llevar el ArtifactId de sesión"
+        );
+        assert!(test_step.evidence.iter().any(|e| {
+            e.artifact_id.as_ref().map(|id| id.as_str()) == Some(artifact_id.as_str())
+        }));
+        let test_output = test_step
+            .tool_result
+            .as_ref()
+            .map(|r| r.output.as_str())
+            .unwrap_or("");
+        assert!(
+            !test_output.contains("planner::tests::"),
+            "no debe ejecutar tests del workspace anfitrión"
+        );
+    }
+}

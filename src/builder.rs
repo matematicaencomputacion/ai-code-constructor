@@ -148,6 +148,14 @@ fn implementar_funcionalidad() {
     }
 }
 
+/// Source determinista del Artifact inicial a partir de [`PlanKind`].
+///
+/// No usa AI ni [`CodeState`]. Es la misma base que [`build`] aplica en
+/// iteraciones de corrección (no la primera iteración defectuosa del Constructor).
+pub fn initial_source_for_kind(kind: PlanKind) -> String {
+    base_implementation_for(kind)
+}
+
 /// Defecto deliberado de la iteración 1: `println!("Request: …"` sin `);`.
 #[cfg(test)]
 fn defective_request_println(request: &str) -> String {
@@ -543,5 +551,47 @@ mod tests {
         assert!(!code.contains("analizar_requisitos"));
         assert!(braces_are_balanced(&code));
         compiler::compile(&code).expect("Api + feedback de delimitadores debe compilar");
+    }
+
+    #[test]
+    fn initial_source_for_kind_is_deterministic() {
+        for kind in [
+            PlanKind::Api,
+            PlanKind::Calculator,
+            PlanKind::Authentication,
+            PlanKind::Generic,
+        ] {
+            let first = initial_source_for_kind(kind);
+            let second = initial_source_for_kind(kind);
+            assert_eq!(first, second);
+            assert!(!first.trim().is_empty());
+            assert!(first.contains("fn main()"));
+        }
+    }
+
+    #[test]
+    fn initial_source_covers_all_plan_kinds() {
+        let api = initial_source_for_kind(PlanKind::Api);
+        assert!(api.contains("crear_servidor"));
+        assert!(api.contains("Servidor HTTP"));
+
+        let calc = initial_source_for_kind(PlanKind::Calculator);
+        assert!(calc.contains("sumar"));
+
+        let auth = initial_source_for_kind(PlanKind::Authentication);
+        assert!(auth.contains("validar_credenciales"));
+
+        let generic = initial_source_for_kind(PlanKind::Generic);
+        assert!(generic.contains("analizar_requisitos"));
+    }
+
+    #[test]
+    fn initial_source_matches_builder_correction_base() {
+        let mut state = state_with_plan(PlanKind::Api, "Crear una API REST", 2);
+        build(&mut state);
+        assert_eq!(
+            state.code.as_deref(),
+            Some(initial_source_for_kind(PlanKind::Api).as_str())
+        );
     }
 }

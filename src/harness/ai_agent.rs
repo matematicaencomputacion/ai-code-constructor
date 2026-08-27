@@ -77,6 +77,9 @@ impl AiAgent {
                 })
             }
             ModelDecision::Compile { code } => Ok(AgentAction::Compile { code }),
+            ModelDecision::RunTests { filter } => Ok(AgentAction::RunTests { filter }),
+            ModelDecision::RunClippy => Ok(AgentAction::RunClippy),
+            ModelDecision::CheckFormat => Ok(AgentAction::CheckFormat),
             ModelDecision::Finish { summary } => Ok(AgentAction::Finish { summary }),
         }
     }

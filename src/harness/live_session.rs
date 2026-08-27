@@ -15,13 +15,13 @@ use crate::harness::model::{
 };
 use crate::harness::observation::AgentObservation;
 use crate::harness::openai_compatible_client::{ModelClientConfig, OpenAICompatibleModelClient};
-use crate::harness::retrying_model_client::RetryingModelClient;
+use crate::harness::retrying_model_client::{ModelRetryObservability, RetryingModelClient};
 use crate::harness::runtime::Harness;
 use crate::harness::specification::Specification;
 use crate::harness::tools::{CompileTool, CorrectionTool, RepairDiagnosticTool, ValidationTool};
 
 /// Límite estricto de iteraciones para sesiones live.
-pub const LIVE_AGENT_MAX_ITERATIONS: u32 = 8;
+pub const LIVE_AGENT_MAX_ITERATIONS: u32 = 12;
 
 /// Configuración de una sesión live controlada.
 ///
@@ -71,6 +71,91 @@ impl LiveSessionConfig {
         self.evaluation_specification = Some(specification);
         self
     }
+
+    /// Sesión live experimental: Artifact + Specification con criterios de calidad.
+    ///
+    /// Reutiliza ActionPolicy / Quality Tools / Evaluation existentes.
+    /// No impone orden de acciones; el modelo decide desde Observations.
+    pub fn quality_verification_artifact(
+        user_request: impl Into<String>,
+        plan_kind: impl Into<String>,
+        artifact: RustArtifact,
+    ) -> Self {
+        let working_code = artifact.source().to_string();
+        Self {
+            goal: "live:quality-verification".to_string(),
+            user_request: user_request.into(),
+            plan_kind: plan_kind.into(),
+            working_artifact: Some(artifact),
+            working_code,
+            evaluation_specification: Some(live_quality_specification()),
+            max_iterations: LIVE_AGENT_MAX_ITERATIONS,
+            debug_log_prompt: false,
+        }
+    }
+}
+
+/// Specification mínima para demo live de Quality Actions (kinds explícitos).
+pub fn live_quality_specification() -> Specification {
+    use crate::harness::criterion::CriterionKind;
+    use crate::harness::specification::{AcceptanceCriterion, Requirement};
+
+    Specification::new("spec-live-quality", "Crear una API REST")
+        .with_requirements(vec![
+            Requirement::new("req-validate", "validar estructura"),
+            Requirement::new("req-compile", "compilar"),
+            Requirement::new("req-tests", "pasar tests"),
+            Requirement::new("req-clippy", "clippy limpio"),
+            Requirement::new("req-format", "formato correcto"),
+        ])
+        .with_acceptance_criteria(vec![
+            AcceptanceCriterion::new(
+                "ac-validate",
+                "ValidationTool pasa",
+                CriterionKind::Validate,
+            )
+            .satisfying([crate::harness::RequirementId::new("req-validate")]),
+            AcceptanceCriterion::new("ac-compile", "CompileTool pasa", CriterionKind::Compile)
+                .satisfying([crate::harness::RequirementId::new("req-compile")]),
+            AcceptanceCriterion::new("ac-tests", "TestTool pasa", CriterionKind::RunTests)
+                .satisfying([crate::harness::RequirementId::new("req-tests")]),
+            AcceptanceCriterion::new("ac-clippy", "ClippyTool pasa", CriterionKind::Clippy)
+                .satisfying([crate::harness::RequirementId::new("req-clippy")]),
+            AcceptanceCriterion::new("ac-format", "FmtTool pasa", CriterionKind::CheckFormat)
+                .satisfying([crate::harness::RequirementId::new("req-format")]),
+        ])
+}
+
+/// Source rustfmt/clippy-friendly con un test real (Artifact-scoped quality).
+pub fn live_quality_artifact_source() -> String {
+    "\
+fn main() {
+    crear_servidor();
+    definir_endpoints();
+    implementar_handlers();
+}
+
+fn crear_servidor() {
+    println!(\"Servidor HTTP configurado\");
+}
+
+fn definir_endpoints() {
+    println!(\"Endpoints definidos\");
+}
+
+fn implementar_handlers() {
+    println!(\"Handlers implementados\");
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn live_quality_smoke() {
+        assert_eq!(2 + 2, 4);
+    }
+}
+"
+    .to_string()
 }
 
 /// Error controlado al iniciar o ejecutar una sesión live.
@@ -109,6 +194,8 @@ pub struct LiveSessionStepRecord {
     pub evaluation_verdict: Option<String>,
     pub observation_summary: String,
     pub model_latency_ms: Option<u64>,
+    /// Retries del `complete()` asociado a este step, solo si hay alineación 1:1
+    /// `Agent.propose` ↔ `ModelClient.complete` ↔ step (AiAgent).
     pub retry_count: Option<u32>,
 }
 
@@ -121,6 +208,8 @@ pub struct LiveSessionTrace {
     pub action_policy: String,
     pub records: Vec<LiveSessionStepRecord>,
     pub finish_reason: String,
+    /// Total de retries de transporte/modelo de la sesión (fuente causal, no iterations).
+    /// Sin handle de observabilidad: 0.
     pub total_retries: u32,
 }
 
@@ -182,6 +271,9 @@ pub fn build_validate_compile_harness_with_policy(policy: ActionPolicy) -> Harne
     harness.register_tool(Box::new(RepairDiagnosticTool));
     harness.register_tool(Box::new(CorrectionTool));
     harness.register_tool(Box::new(CompileTool));
+    harness.register_tool(Box::new(crate::harness::tools::TestTool));
+    harness.register_tool(Box::new(crate::harness::tools::ClippyTool));
+    harness.register_tool(Box::new(crate::harness::tools::FmtTool));
     harness.register_constraint(Box::new(policy));
     harness
 }
@@ -192,8 +284,16 @@ pub fn run_live_agent_session(
 ) -> Result<LiveSessionResult, LiveSessionError> {
     let model_config = ModelClientConfig::from_env()?;
     let inner = OpenAICompatibleModelClient::new(model_config.clone());
-    let client: Box<dyn ModelClient> = Box::new(RetryingModelClient::new(Box::new(inner)));
-    run_live_agent_session_with_client(client, config, Some(model_config.model))
+    let retrying = RetryingModelClient::new(Box::new(inner));
+    let retry_obs = retrying.observability();
+    let client: Box<dyn ModelClient> = Box::new(retrying);
+    run_live_agent_session_with_client_policy_and_retry_observability(
+        client,
+        config,
+        Some(model_config.model),
+        ActionPolicy::default_session_policy(),
+        Some(retry_obs),
+    )
 }
 
 /// Ejecuta sesión live con [`ActionPolicy::default_session_policy`].
@@ -216,6 +316,19 @@ pub fn run_live_agent_session_with_client_and_policy(
     config: LiveSessionConfig,
     model_name: Option<String>,
     policy: ActionPolicy,
+) -> Result<LiveSessionResult, LiveSessionError> {
+    run_live_agent_session_with_client_policy_and_retry_observability(
+        client, config, model_name, policy, None,
+    )
+}
+
+/// Sesión live con inyección causal opcional de retries de modelo.
+pub fn run_live_agent_session_with_client_policy_and_retry_observability(
+    client: Box<dyn ModelClient>,
+    config: LiveSessionConfig,
+    model_name: Option<String>,
+    policy: ActionPolicy,
+    retry_observability: Option<ModelRetryObservability>,
 ) -> Result<LiveSessionResult, LiveSessionError> {
     if config.user_request.trim().is_empty() {
         return Err(LiveSessionError::Configuration(
@@ -260,7 +373,13 @@ pub fn run_live_agent_session_with_client_and_policy(
     let harness = build_validate_compile_harness_with_policy(policy);
     let loop_result = AgentLoop::new(max_iterations).run(&harness, &mut agent, ctx);
 
-    let session_trace = build_session_trace(&loop_result, &agent.trace, model_name, &policy_name);
+    let session_trace = build_session_trace(
+        &loop_result,
+        &agent.trace,
+        model_name,
+        &policy_name,
+        retry_observability.as_ref(),
+    );
     session_trace.log_summary();
 
     Ok(LiveSessionResult {
@@ -275,7 +394,18 @@ fn build_session_trace(
     model_trace: &ModelInteractionTrace,
     model_name: Option<String>,
     policy_name: &str,
+    retry_observability: Option<&ModelRetryObservability>,
 ) -> LiveSessionTrace {
+    let per_call = retry_observability
+        .map(|obs| obs.per_call())
+        .unwrap_or_default();
+    let total_retries = retry_observability.map(|obs| obs.total()).unwrap_or(0);
+
+    // Causalidad AiAgent: cada step del AgentLoop = un `propose()` = un `complete()`.
+    // Si longitudes coinciden, proyectamos per_call[i] → record[i].retry_count.
+    // Si no, conservamos retry_count=None y solo reportamos total_retries.
+    let align_per_step = per_call.len() == loop_result.history.steps.len();
+
     let mut records = Vec::new();
     for (index, step) in loop_result.history.steps.iter().enumerate() {
         let iteration = (index + 1) as u32;
@@ -297,6 +427,12 @@ fn build_session_trace(
             other => other.is_success(),
         };
 
+        let retry_count = if align_per_step {
+            Some(per_call[index])
+        } else {
+            None
+        };
+
         records.push(LiveSessionStepRecord {
             iteration,
             proposed_action,
@@ -309,12 +445,10 @@ fn build_session_trace(
             evaluation_verdict,
             observation_summary: step.observation.summary(),
             model_latency_ms: None,
-            retry_count: None,
+            retry_count,
         });
     }
 
-    // Retries del ModelClient son independientes del AgentLoop; se reportan agregados.
-    let total_retries = 0;
     let _ = model_trace;
 
     LiveSessionTrace {
@@ -596,7 +730,7 @@ fn implementar_handlers() {
             max_iterations: 100,
             debug_log_prompt: false,
         };
-        assert_eq!(config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS), 8);
+        assert_eq!(config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS), 12);
 
         struct AlwaysFinishClient;
         impl ModelClient for AlwaysFinishClient {
@@ -819,7 +953,7 @@ fn implementar_handlers() {
 
     #[test]
     fn model_client_retry_does_not_consume_agent_loop_iteration() {
-        // M
+        // M + G: iterations ≠ retries; total_retries viene del handle causal
         struct FlakyThenFinish {
             calls: AtomicUsize,
         }
@@ -847,20 +981,171 @@ fn implementar_handlers() {
             Box::new(inner),
             RetryConfig {
                 max_retries: 3,
-                backoff: Duration::from_millis(1),
+                backoff: Duration::from_millis(0),
             },
         );
-        let retries_before = 0;
+        let obs = client.observability();
+        let config = LiveSessionConfig::validate_and_compile_artifact(
+            "Crear una API REST",
+            "Api",
+            "fn main() {}",
+        );
+        let result = run_live_agent_session_with_client_policy_and_retry_observability(
+            Box::new(client),
+            config,
+            None,
+            ActionPolicy::default_session_policy(),
+            Some(obs),
+        )
+        .expect("session");
+        assert_eq!(result.loop_result.iterations, 1);
+        assert_eq!(result.session_trace.total_retries, 2);
+        assert_eq!(
+            result.session_trace.records[0].retry_count,
+            Some(2),
+            "AiAgent: propose↔complete↔step es 1:1"
+        );
+        assert_eq!(result.loop_result.status, LoopStatus::Completed);
+    }
+
+    #[test]
+    fn live_session_step_retry_aligned_when_per_call_matches_steps() {
+        // H: alineación causal explícita
+        struct TwoFinishesThenOk {
+            calls: AtomicUsize,
+        }
+        impl ModelClient for TwoFinishesThenOk {
+            fn complete(
+                &self,
+                _request: &ModelRequest,
+            ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                // Outer completes via Retrying: first group 1 retry, second 0
+                // Simpler: no flaky — three successful completes with 0 retries each
+                let _ = n;
+                Ok(crate::harness::model::ModelResponse {
+                    raw_text: serialize_decision(&ModelDecision::Finish {
+                        summary: "done".to_string(),
+                    }),
+                })
+            }
+        }
+
+        let client = RetryingModelClient::with_config(
+            Box::new(TwoFinishesThenOk {
+                calls: AtomicUsize::new(0),
+            }),
+            RetryConfig {
+                max_retries: 2,
+                backoff: Duration::from_millis(0),
+            },
+        );
+        let obs = client.observability();
+        let config = LiveSessionConfig::validate_and_compile_artifact(
+            "Crear una API REST",
+            "Api",
+            "fn main() {}",
+        );
+        let result = run_live_agent_session_with_client_policy_and_retry_observability(
+            Box::new(client),
+            config,
+            None,
+            ActionPolicy::default_session_policy(),
+            Some(obs),
+        )
+        .expect("session");
+        // Finish on first propose → 1 iteration, 0 retries
+        assert_eq!(result.loop_result.iterations, 1);
+        assert_eq!(result.session_trace.total_retries, 0);
+        assert_eq!(result.session_trace.records.len(), 1);
+        assert_eq!(result.session_trace.records[0].retry_count, Some(0));
+    }
+
+    #[test]
+    fn live_session_three_iterations_zero_retries() {
+        // F: 3 iterations, 3 completes, 0 retries
+        struct ValidateThenCompileThenFinish {
+            calls: AtomicUsize,
+        }
+        impl ModelClient for ValidateThenCompileThenFinish {
+            fn complete(
+                &self,
+                _request: &ModelRequest,
+            ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                let decision = match n {
+                    0 => ModelDecision::Validate {
+                        request: "Crear una API REST".to_string(),
+                        code: None,
+                        plan_kind: "Api".to_string(),
+                    },
+                    1 => ModelDecision::Compile {
+                        code: String::new(),
+                    },
+                    _ => ModelDecision::Finish {
+                        summary: "ok".to_string(),
+                    },
+                };
+                Ok(crate::harness::model::ModelResponse {
+                    raw_text: serialize_decision(&decision),
+                })
+            }
+        }
+
+        let client = RetryingModelClient::with_config(
+            Box::new(ValidateThenCompileThenFinish {
+                calls: AtomicUsize::new(0),
+            }),
+            RetryConfig {
+                max_retries: 2,
+                backoff: Duration::from_millis(0),
+            },
+        );
+        let obs = client.observability();
+        let config = LiveSessionConfig::validate_and_compile_artifact(
+            "Crear una API REST",
+            "Api",
+            api_valid_code(),
+        );
+        let result = run_live_agent_session_with_client_policy_and_retry_observability(
+            Box::new(client),
+            config,
+            None,
+            ActionPolicy::default_session_policy(),
+            Some(obs),
+        )
+        .expect("session");
+        assert_eq!(result.loop_result.iterations, 3);
+        assert_eq!(result.session_trace.total_retries, 0);
+        assert_eq!(
+            result
+                .session_trace
+                .records
+                .iter()
+                .map(|r| r.retry_count)
+                .collect::<Vec<_>>(),
+            vec![Some(0), Some(0), Some(0)]
+        );
+    }
+
+    #[test]
+    fn live_session_without_retry_handle_keeps_total_zero_and_step_none() {
         let config = LiveSessionConfig::validate_and_compile_artifact(
             "Crear una API REST",
             "Api",
             "fn main() {}",
         );
         let result =
-            run_live_agent_session_with_client(Box::new(client), config, None).expect("session");
-        assert_eq!(result.loop_result.iterations, 1);
-        assert!(result.loop_result.iterations > retries_before);
-        assert_eq!(result.loop_result.status, LoopStatus::Completed);
+            run_live_agent_session_with_client(Box::new(MockModelClient::new()), config, None)
+                .expect("session");
+        assert_eq!(result.session_trace.total_retries, 0);
+        assert!(
+            result
+                .session_trace
+                .records
+                .iter()
+                .all(|r| r.retry_count.is_none())
+        );
     }
 
     #[test]
@@ -1058,5 +1343,398 @@ fn implementar_handlers() {
         );
         assert!(!result.session_trace.records.is_empty());
         assert_eq!(result.session_trace.action_policy, "action_policy");
+    }
+
+    fn quality_artifact() -> RustArtifact {
+        RustArtifact::with_id(
+            ArtifactId::new("art-live-quality"),
+            "main.rs",
+            live_quality_artifact_source(),
+        )
+    }
+
+    /// ModelClient observation-driven para wiring live de Quality Actions (sin API real).
+    struct LiveQualityWiringClient;
+
+    impl ModelClient for LiveQualityWiringClient {
+        fn complete(
+            &self,
+            request: &ModelRequest,
+        ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+            let decision = match &request.last_observation {
+                None => ModelDecision::Validate {
+                    request: request.user_request.clone(),
+                    code: request.working_code.clone(),
+                    plan_kind: request
+                        .plan_kind
+                        .clone()
+                        .unwrap_or_else(|| "Api".to_string()),
+                },
+                Some(obs) if obs.kind == "action_rejected" => ModelDecision::RunTests {
+                    filter: String::new(),
+                },
+                Some(obs)
+                    if obs.kind == "criterion_evaluated"
+                        && obs.criterion_kind.as_deref() == Some("Validate")
+                        && obs.evaluation_verdict.as_deref() == Some("Pass") =>
+                {
+                    ModelDecision::Compile {
+                        code: request.working_code.clone().unwrap_or_default(),
+                    }
+                }
+                Some(obs)
+                    if obs.kind == "criterion_evaluated"
+                        && obs.criterion_kind.as_deref() == Some("Compile")
+                        && obs.evaluation_verdict.as_deref() == Some("Pass") =>
+                {
+                    ModelDecision::RunTests {
+                        filter: String::new(),
+                    }
+                }
+                Some(obs)
+                    if obs.kind == "criterion_evaluated"
+                        && obs.criterion_kind.as_deref() == Some("RunTests")
+                        && obs.evaluation_verdict.as_deref() == Some("Pass") =>
+                {
+                    ModelDecision::RunClippy
+                }
+                Some(obs)
+                    if obs.kind == "criterion_evaluated"
+                        && obs.criterion_kind.as_deref() == Some("Clippy")
+                        && obs.evaluation_verdict.as_deref() == Some("Pass") =>
+                {
+                    ModelDecision::CheckFormat
+                }
+                Some(obs)
+                    if obs.kind == "criterion_evaluated"
+                        && obs.criterion_kind.as_deref() == Some("CheckFormat")
+                        && obs.evaluation_verdict.as_deref() == Some("Pass") =>
+                {
+                    ModelDecision::Finish {
+                        summary: "live quality wiring completed".to_string(),
+                    }
+                }
+                Some(obs)
+                    if obs.tool_name.as_deref() == Some(VALIDATE) && obs.success == Some(true) =>
+                {
+                    ModelDecision::Compile {
+                        code: request.working_code.clone().unwrap_or_default(),
+                    }
+                }
+                Some(obs)
+                    if obs.tool_name.as_deref() == Some(COMPILE) && obs.success == Some(true) =>
+                {
+                    ModelDecision::RunTests {
+                        filter: String::new(),
+                    }
+                }
+                _ => ModelDecision::Finish {
+                    summary: "live quality wiring stop".to_string(),
+                },
+            };
+            Ok(crate::harness::model::ModelResponse {
+                raw_text: serialize_decision(&decision),
+            })
+        }
+    }
+
+    #[test]
+    fn live_quality_config_accepts_specification_with_quality_criteria() {
+        // A
+        let config = LiveSessionConfig::quality_verification_artifact(
+            "Crear una API REST",
+            "Api",
+            quality_artifact(),
+        );
+        let spec = config.evaluation_specification.as_ref().expect("spec");
+        assert!(spec.validate().is_ok());
+        let kinds: Vec<_> = spec.acceptance_criteria.iter().map(|c| c.kind).collect();
+        assert!(kinds.contains(&CriterionKind::Validate));
+        assert!(kinds.contains(&CriterionKind::Compile));
+        assert!(kinds.contains(&CriterionKind::RunTests));
+        assert!(kinds.contains(&CriterionKind::Clippy));
+        assert!(kinds.contains(&CriterionKind::CheckFormat));
+    }
+
+    #[test]
+    fn live_quality_session_wires_specification_and_artifact_into_context() {
+        // B + C
+        let config = LiveSessionConfig::quality_verification_artifact(
+            "Crear una API REST",
+            "Api",
+            quality_artifact(),
+        );
+        let result = run_live_agent_session_with_client(
+            Box::new(LiveQualityWiringClient),
+            config,
+            Some("mock-quality".to_string()),
+        )
+        .expect("session");
+        let ctx = &result.loop_result.final_context;
+        assert!(ctx.evaluation_specification.is_some());
+        assert_eq!(
+            ctx.evaluation_specification.as_ref().unwrap().id.as_str(),
+            "spec-live-quality"
+        );
+        assert_eq!(
+            ctx.working_artifact.as_ref().map(|a| a.id().as_str()),
+            Some("art-live-quality")
+        );
+    }
+
+    #[test]
+    fn live_quality_session_keeps_action_policy_and_finish_gate() {
+        // D + H
+        let config = LiveSessionConfig::quality_verification_artifact(
+            "Crear una API REST",
+            "Api",
+            quality_artifact(),
+        );
+        struct PrematureFinishThenCompile;
+        impl ModelClient for PrematureFinishThenCompile {
+            fn complete(
+                &self,
+                request: &ModelRequest,
+            ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+                let decision = match &request.last_observation {
+                    Some(obs) if obs.kind == "action_rejected" => ModelDecision::Compile {
+                        code: request.working_code.clone().unwrap_or_default(),
+                    },
+                    Some(obs)
+                        if obs.kind == "criterion_evaluated"
+                            && obs.evaluation_verdict.as_deref() == Some("Pass") =>
+                    {
+                        ModelDecision::Finish {
+                            summary: "after one pass still incomplete".to_string(),
+                        }
+                    }
+                    _ => ModelDecision::Finish {
+                        summary: "premature".to_string(),
+                    },
+                };
+                Ok(crate::harness::model::ModelResponse {
+                    raw_text: serialize_decision(&decision),
+                })
+            }
+        }
+        let result =
+            run_live_agent_session_with_client(Box::new(PrematureFinishThenCompile), config, None)
+                .expect("session");
+        assert_eq!(result.session_trace.action_policy, "action_policy");
+        assert!(result.loop_result.history.observations.iter().any(|obs| {
+            matches!(
+                obs,
+                AgentObservation::ActionRejected {
+                    constraint,
+                    ..
+                } if constraint == "finish" || constraint.contains("finish")
+            )
+        }));
+    }
+
+    #[test]
+    fn live_quality_tools_remain_artifact_scoped_with_artifact_id() {
+        // E
+        let config = LiveSessionConfig::quality_verification_artifact(
+            "Crear una API REST",
+            "Api",
+            quality_artifact(),
+        );
+        let result =
+            run_live_agent_session_with_client(Box::new(LiveQualityWiringClient), config, None)
+                .expect("session");
+        let test_step = result
+            .loop_result
+            .history
+            .steps
+            .iter()
+            .find(|step| step.tool_name.as_deref() == Some(crate::harness::tools::RUN_TESTS))
+            .expect("run_tests step");
+        assert!(
+            test_step
+                .evidence
+                .iter()
+                .any(|e| e.label == "artifact_id" && e.detail == "art-live-quality"),
+            "RunTests debe conservar ArtifactId de sesión"
+        );
+        assert!(
+            !test_step
+                .tool_result
+                .as_ref()
+                .map(|r| r.output.contains("planner::tests::"))
+                .unwrap_or(false),
+            "no debe ejecutar la suite del workspace anfitrión"
+        );
+    }
+
+    #[test]
+    fn live_quality_criterion_evaluated_reaches_agent_context() {
+        // F
+        let config = LiveSessionConfig::quality_verification_artifact(
+            "Crear una API REST",
+            "Api",
+            quality_artifact(),
+        );
+        let result =
+            run_live_agent_session_with_client(Box::new(LiveQualityWiringClient), config, None)
+                .expect("session");
+        assert!(
+            result
+                .loop_result
+                .history
+                .observations
+                .iter()
+                .any(|obs| matches!(
+                    obs,
+                    AgentObservation::CriterionEvaluated {
+                        kind: CriterionKind::RunTests,
+                        ..
+                    }
+                ))
+        );
+        assert!(!result.loop_result.history.criterion_evaluations.is_empty());
+        assert!(
+            result
+                .loop_result
+                .final_context
+                .observation_history
+                .iter()
+                .any(|obs| matches!(obs, AgentObservation::CriterionEvaluated { .. }))
+        );
+    }
+
+    #[test]
+    fn live_quality_action_rejected_reaches_model_request_path() {
+        // G
+        let saw_rejected = Arc::new(AtomicBool::new(false));
+        struct RejectAwareClient {
+            flag: Arc<AtomicBool>,
+        }
+        impl ModelClient for RejectAwareClient {
+            fn complete(
+                &self,
+                request: &ModelRequest,
+            ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+                match &request.last_observation {
+                    Some(obs) if obs.kind == "action_rejected" => {
+                        self.flag.store(true, Ordering::SeqCst);
+                        Ok(crate::harness::model::ModelResponse {
+                            raw_text: serialize_decision(&ModelDecision::Compile {
+                                code: request.working_code.clone().unwrap_or_default(),
+                            }),
+                        })
+                    }
+                    _ => Ok(crate::harness::model::ModelResponse {
+                        raw_text: serialize_decision(&ModelDecision::Finish {
+                            summary: "premature".to_string(),
+                        }),
+                    }),
+                }
+            }
+        }
+        let config = LiveSessionConfig::quality_verification_artifact(
+            "Crear una API REST",
+            "Api",
+            quality_artifact(),
+        );
+        let _ = run_live_agent_session_with_client(
+            Box::new(RejectAwareClient {
+                flag: Arc::clone(&saw_rejected),
+            }),
+            config,
+            None,
+        )
+        .expect("session");
+        assert!(saw_rejected.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn live_session_without_quality_criteria_still_works() {
+        // I — regresión: validate-and-compile sin Specification de calidad
+        let invalid = introduce_validation_defect(&api_valid_code());
+        let config =
+            LiveSessionConfig::validate_and_compile_artifact("Crear una API REST", "Api", invalid);
+        assert!(config.evaluation_specification.is_none());
+        let result =
+            run_live_agent_session_with_client(Box::new(MockModelClient::new()), config, None)
+                .expect("session");
+        assert_eq!(result.loop_result.status, LoopStatus::Completed);
+        assert!(
+            result
+                .loop_result
+                .tools_executed()
+                .iter()
+                .any(|t| t == VALIDATE)
+        );
+        assert!(
+            result
+                .loop_result
+                .tools_executed()
+                .iter()
+                .any(|t| t == COMPILE)
+        );
+    }
+
+    /// Demo live experimental con modelo real + Quality Actions (NO CI).
+    ///
+    /// Requiere MODEL_BASE_URL, MODEL_API_KEY, MODEL_NAME.
+    /// No afirma Completed: observa el ciclo Observation → decisión.
+    #[test]
+    #[ignore = "requiere endpoint real y variables MODEL_* configuradas por el operador"]
+    fn manual_live_quality_agent_session() {
+        // J
+        let mut config = LiveSessionConfig::quality_verification_artifact(
+            "Crear una API REST",
+            "Api",
+            quality_artifact(),
+        );
+        config.debug_log_prompt = true;
+
+        let result = run_live_agent_session(config).expect("live quality session");
+
+        println!("=== LIVE QUALITY DEMO RESULT ===");
+        println!("model={:?}", result.session_trace.model_name);
+        println!("action_policy={}", result.session_trace.action_policy);
+        println!("status={:?}", result.loop_result.status);
+        println!("iterations={}", result.loop_result.iterations);
+        println!("termination={}", result.loop_result.termination_reason);
+        println!("tools={:?}", result.loop_result.tools_executed());
+        for evaluation in &result.loop_result.history.criterion_evaluations {
+            println!(
+                "criterion id={} kind={:?} verdict={:?}",
+                evaluation.criterion_id.as_str(),
+                evaluation.kind,
+                evaluation.verdict
+            );
+        }
+        for record in &result.session_trace.records {
+            println!(
+                "step iter={} action={} tool={:?} permitted={} rejected={:?} eval={:?} obs={}",
+                record.iteration,
+                record.proposed_action,
+                record.tool_name,
+                record.permitted,
+                record.rejected_constraint,
+                record.evaluation_verdict,
+                record.observation_summary
+            );
+        }
+
+        assert!(!result.session_trace.records.is_empty());
+        assert!(!result.session_trace.contains_secrets());
+        assert_eq!(result.session_trace.action_policy, "action_policy");
+        assert!(
+            result.loop_result.status == LoopStatus::Completed
+                || result.loop_result.status == LoopStatus::Failed
+                || result.loop_result.status == LoopStatus::MaxIterations
+        );
+        assert!(
+            result
+                .loop_result
+                .final_context
+                .evaluation_specification
+                .is_some()
+        );
+        assert!(result.loop_result.final_context.working_artifact.is_some());
     }
 }

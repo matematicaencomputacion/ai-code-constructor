@@ -168,12 +168,9 @@ fn evaluate_exit_status(
         );
     }
 
-    let used = relevant_evidence(evidence, &[tool_name, "exit_status"]);
-    let exit = evidence
-        .iter()
-        .rev()
-        .find(|item| item.label == "exit_status")
-        .map(|item| item.detail.as_str());
+    let used = relevant_evidence(evidence, &["exit_status"]);
+    // Correlación causal: último exit_status perteneciente a una ejecución de esta Tool.
+    let exit = latest_exit_status_for_tool(evidence, tool_name);
 
     match exit {
         Some("0") => (
@@ -192,6 +189,25 @@ fn evaluate_exit_status(
             used,
         ),
     }
+}
+
+/// Último `exit_status` emitido dentro de una ejecución `tool=<tool_name>`.
+///
+/// Recorre Evidence en orden: al ver `tool`, activa/desactiva el scope; solo
+/// cuenta `exit_status` mientras el scope de `tool_name` está activo.
+fn latest_exit_status_for_tool<'a>(evidence: &'a [Evidence], tool_name: &str) -> Option<&'a str> {
+    let mut active = false;
+    let mut last: Option<&str> = None;
+    for item in evidence {
+        if item.label == "tool" {
+            active = item.detail == tool_name;
+            continue;
+        }
+        if active && item.label == "exit_status" {
+            last = Some(item.detail.as_str());
+        }
+    }
+    last
 }
 
 fn tool_present(evidence: &[Evidence], tool_name: &str) -> bool {
@@ -636,5 +652,196 @@ mod tests {
         assert_ne!(a.criterion_id.as_str(), b.criterion_id.as_str());
         assert_eq!(a.verdict, b.verdict);
         assert_eq!(a.verdict, EvaluationVerdict::Fail);
+    }
+
+    fn quality_evidence(tool: &str, exit: &str) -> Vec<Evidence> {
+        vec![
+            Evidence::new("tool", tool),
+            Evidence::new("exit_status", exit),
+        ]
+    }
+
+    #[test]
+    fn run_tests_pass_with_favorable_evidence() {
+        // A
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests),
+            &quality_evidence(RUN_TESTS, "0"),
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Pass);
+    }
+
+    #[test]
+    fn run_tests_fail_with_unfavorable_evidence() {
+        // B
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests),
+            &quality_evidence(RUN_TESTS, "1"),
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Fail);
+    }
+
+    #[test]
+    fn run_tests_insufficient_without_evidence() {
+        // C
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests),
+            &[],
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::InsufficientEvidence);
+    }
+
+    #[test]
+    fn clippy_pass_with_favorable_evidence() {
+        // D
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-clippy", "clippy", CriterionKind::Clippy),
+            &quality_evidence(RUN_CLIPPY, "0"),
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Pass);
+    }
+
+    #[test]
+    fn clippy_fail_with_unfavorable_evidence() {
+        // E
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-clippy", "clippy", CriterionKind::Clippy),
+            &quality_evidence(RUN_CLIPPY, "1"),
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Fail);
+    }
+
+    #[test]
+    fn clippy_insufficient_without_evidence() {
+        // F
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-clippy", "clippy", CriterionKind::Clippy),
+            &[],
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::InsufficientEvidence);
+    }
+
+    #[test]
+    fn check_format_pass_with_favorable_evidence() {
+        // G
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-fmt", "formato", CriterionKind::CheckFormat),
+            &quality_evidence(CHECK_FORMAT, "0"),
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Pass);
+    }
+
+    #[test]
+    fn check_format_fail_with_unfavorable_evidence() {
+        // H
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-fmt", "formato", CriterionKind::CheckFormat),
+            &quality_evidence(CHECK_FORMAT, "1"),
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Fail);
+    }
+
+    #[test]
+    fn check_format_insufficient_without_evidence() {
+        // I
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-fmt", "formato", CriterionKind::CheckFormat),
+            &[],
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::InsufficientEvidence);
+    }
+
+    #[test]
+    fn changing_run_tests_id_does_not_change_semantics() {
+        // J
+        let engine = EvaluationEngine::new();
+        let evidence = quality_evidence(RUN_TESTS, "0");
+        let a = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests),
+            &evidence,
+        );
+        let b = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("totally-other-id", "tests", CriterionKind::RunTests),
+            &evidence,
+        );
+        assert_ne!(a.criterion_id, b.criterion_id);
+        assert_eq!(a.verdict, b.verdict);
+        assert_eq!(a.verdict, EvaluationVerdict::Pass);
+    }
+
+    #[test]
+    fn same_run_tests_kind_with_different_ids_same_evaluation() {
+        // K
+        let engine = EvaluationEngine::new();
+        let evidence = quality_evidence(RUN_TESTS, "1");
+        let a = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("id-a", "x", CriterionKind::RunTests),
+            &evidence,
+        );
+        let b = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("id-b", "y", CriterionKind::RunTests),
+            &evidence,
+        );
+        assert_eq!(a.verdict, b.verdict);
+        assert_eq!(a.verdict, EvaluationVerdict::Fail);
+    }
+
+    #[test]
+    fn run_tests_history_fail_then_pass_evaluates_pass() {
+        // L
+        let engine = EvaluationEngine::new();
+        let mut evidence = quality_evidence(RUN_TESTS, "1");
+        evidence.extend(quality_evidence(RUN_TESTS, "0"));
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests),
+            &evidence,
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Pass);
+    }
+
+    #[test]
+    fn clippy_history_fail_then_pass_evaluates_pass() {
+        // M
+        let engine = EvaluationEngine::new();
+        let mut evidence = quality_evidence(RUN_CLIPPY, "1");
+        evidence.extend(quality_evidence(RUN_CLIPPY, "0"));
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-clippy", "clippy", CriterionKind::Clippy),
+            &evidence,
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Pass);
+    }
+
+    #[test]
+    fn exit_status_is_scoped_to_tool_not_global_last() {
+        // Interleaving: run_tests FAIL, luego compile/clippy PASS no debe “arreglar” RunTests.
+        let engine = EvaluationEngine::new();
+        let evidence = vec![
+            Evidence::new("tool", RUN_TESTS),
+            Evidence::new("exit_status", "1"),
+            Evidence::new("tool", COMPILE),
+            Evidence::new("compile_status", "ok"),
+            Evidence::new("tool", RUN_CLIPPY),
+            Evidence::new("exit_status", "0"),
+        ];
+        let tests = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests),
+            &evidence,
+        );
+        let clippy = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-clippy", "clippy", CriterionKind::Clippy),
+            &evidence,
+        );
+        assert_eq!(tests.verdict, EvaluationVerdict::Fail);
+        assert_eq!(clippy.verdict, EvaluationVerdict::Pass);
     }
 }

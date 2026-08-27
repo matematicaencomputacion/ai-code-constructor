@@ -476,4 +476,178 @@ mod tests {
         assert_eq!(result.status, LoopStatus::MaxIterations);
         assert_eq!(result.iterations, 3);
     }
+
+    fn quality_spec() -> Specification {
+        Specification::new("spec-quality", "Crear una API REST")
+            .with_requirements(vec![
+                Requirement::new("req-v", "validar"),
+                Requirement::new("req-c", "compilar"),
+                Requirement::new("req-t", "tests"),
+                Requirement::new("req-l", "clippy"),
+            ])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-validate", "valida", CriterionKind::Validate)
+                    .satisfying([crate::harness::RequirementId::new("req-v")]),
+                AcceptanceCriterion::new("ac-compile", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req-c")]),
+                AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests)
+                    .satisfying([crate::harness::RequirementId::new("req-t")]),
+                AcceptanceCriterion::new("ac-clippy", "clippy", CriterionKind::Clippy)
+                    .satisfying([crate::harness::RequirementId::new("req-l")]),
+            ])
+    }
+
+    fn push_criterion(
+        ctx: &mut AgentContext,
+        criterion: &AcceptanceCriterion,
+        evidence: &[Evidence],
+    ) {
+        let evaluation = EvaluationEngine::new().evaluate_criterion(criterion, evidence);
+        ctx.push_observation(observation_from_criterion_evaluation(
+            SpecificationId::new("spec-quality"),
+            &evaluation,
+        ));
+    }
+
+    #[test]
+    fn finish_rejected_when_run_tests_is_fail() {
+        // N
+        let spec = quality_spec();
+        let mut ctx = artifact_ctx("fn main() {}").with_evaluation_specification(spec.clone());
+        push_criterion(
+            &mut ctx,
+            &spec.acceptance_criteria[0],
+            &[
+                Evidence::new("tool", crate::harness::tools::VALIDATE),
+                Evidence::new("validate_status", "ok"),
+            ],
+        );
+        push_criterion(
+            &mut ctx,
+            &spec.acceptance_criteria[1],
+            &[
+                Evidence::new("tool", COMPILE),
+                Evidence::new("compile_status", "ok"),
+            ],
+        );
+        push_criterion(
+            &mut ctx,
+            &spec.acceptance_criteria[2],
+            &[
+                Evidence::new("tool", crate::harness::tools::RUN_TESTS),
+                Evidence::new("exit_status", "1"),
+            ],
+        );
+        push_criterion(
+            &mut ctx,
+            &spec.acceptance_criteria[3],
+            &[
+                Evidence::new("tool", crate::harness::tools::RUN_CLIPPY),
+                Evidence::new("exit_status", "0"),
+            ],
+        );
+        let decision = FinishConstraint.check(
+            &AgentAction::Finish {
+                summary: "done".to_string(),
+            },
+            &ctx,
+        );
+        assert!(
+            matches!(decision, ConstraintDecision::Reject { reason } if reason.contains("FAIL"))
+        );
+    }
+
+    #[test]
+    fn finish_rejected_when_clippy_has_insufficient_evidence() {
+        // O
+        let spec = quality_spec();
+        let mut ctx = artifact_ctx("fn main() {}").with_evaluation_specification(spec.clone());
+        push_criterion(
+            &mut ctx,
+            &spec.acceptance_criteria[0],
+            &[
+                Evidence::new("tool", crate::harness::tools::VALIDATE),
+                Evidence::new("validate_status", "ok"),
+            ],
+        );
+        push_criterion(
+            &mut ctx,
+            &spec.acceptance_criteria[1],
+            &[
+                Evidence::new("tool", COMPILE),
+                Evidence::new("compile_status", "ok"),
+            ],
+        );
+        push_criterion(
+            &mut ctx,
+            &spec.acceptance_criteria[2],
+            &[
+                Evidence::new("tool", crate::harness::tools::RUN_TESTS),
+                Evidence::new("exit_status", "0"),
+            ],
+        );
+        // Clippy: tool presente sin exit_status → InsufficientEvidence
+        push_criterion(
+            &mut ctx,
+            &spec.acceptance_criteria[3],
+            &[Evidence::new("tool", crate::harness::tools::RUN_CLIPPY)],
+        );
+        let decision = FinishConstraint.check(
+            &AgentAction::Finish {
+                summary: "done".to_string(),
+            },
+            &ctx,
+        );
+        assert!(matches!(
+            decision,
+            ConstraintDecision::Reject { reason }
+                if reason.contains("InsufficientEvidence") || reason.contains("evidencia insuficiente")
+        ));
+    }
+
+    #[test]
+    fn finish_allowed_only_when_all_required_criteria_pass() {
+        // P
+        let spec = quality_spec();
+        let mut ctx = artifact_ctx("fn main() {}").with_evaluation_specification(spec.clone());
+        for (criterion, evidence) in [
+            (
+                &spec.acceptance_criteria[0],
+                vec![
+                    Evidence::new("tool", crate::harness::tools::VALIDATE),
+                    Evidence::new("validate_status", "ok"),
+                ],
+            ),
+            (
+                &spec.acceptance_criteria[1],
+                vec![
+                    Evidence::new("tool", COMPILE),
+                    Evidence::new("compile_status", "ok"),
+                ],
+            ),
+            (
+                &spec.acceptance_criteria[2],
+                vec![
+                    Evidence::new("tool", crate::harness::tools::RUN_TESTS),
+                    Evidence::new("exit_status", "0"),
+                ],
+            ),
+            (
+                &spec.acceptance_criteria[3],
+                vec![
+                    Evidence::new("tool", crate::harness::tools::RUN_CLIPPY),
+                    Evidence::new("exit_status", "0"),
+                ],
+            ),
+        ] {
+            push_criterion(&mut ctx, criterion, &evidence);
+        }
+        let decision = FinishConstraint.check(
+            &AgentAction::Finish {
+                summary: "all pass".to_string(),
+            },
+            &ctx,
+        );
+        assert_eq!(decision, ConstraintDecision::Allow);
+    }
 }
