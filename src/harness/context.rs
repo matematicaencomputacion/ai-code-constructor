@@ -7,8 +7,8 @@ use crate::harness::specification::Specification;
 
 /// Contexto observable que el agente y el Harness comparten durante la ejecución.
 ///
-/// [`RustArtifact`] es la fuente canónica del código de trabajo.
-/// `working_code()` es un accessor de compatibilidad derivado del Artifact.
+/// [`RustArtifact`] es la fuente canónica del código de trabajo (árbol multi-file).
+/// `working_code()` es un accessor de compatibilidad = contenido del archivo **primary**.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentContext {
     pub goal: String,
@@ -41,12 +41,12 @@ impl AgentContext {
         }
     }
 
-    /// Vista derivada del source del Artifact (compatibilidad temporal).
+    /// Vista derivada del source **primary** del Artifact (compatibilidad single-file).
     pub fn working_code(&self) -> Option<&str> {
         self.working_artifact.as_ref().map(RustArtifact::source)
     }
 
-    /// Compatibilidad: crea un [`RustArtifact`] canónico a partir de un String.
+    /// Compatibilidad: crea un [`RustArtifact`] single-file (`src/main.rs`) a partir de un String.
     pub fn with_working_code(mut self, code: impl Into<String>) -> Self {
         self.set_working_artifact(RustArtifact::new("main.rs", code));
         self
@@ -72,8 +72,8 @@ impl AgentContext {
         self.working_artifact = Some(artifact);
     }
 
-    /// Actualiza el source del Artifact existente; crea uno si aún no hay.
-    /// Conserva [`crate::harness::ArtifactId`] cuando el Artifact ya existe.
+    /// Actualiza el source **primary** del Artifact existente; crea uno single-file si aún no hay.
+    /// Conserva [`crate::harness::ArtifactId`] y los archivos hermanos no-primary.
     pub fn update_working_source(&mut self, source: impl Into<String>) {
         match &mut self.working_artifact {
             Some(artifact) => artifact.replace_source(source),

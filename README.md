@@ -367,14 +367,18 @@ inside the harness** without corrupting the original `CodeState`.
 
 ## RustArtifact (controlled artifact)
 
-`RustArtifact` (`harness/artifact.rs`) is the **working product** domain object:
+`RustArtifact` (`harness/artifact.rs`) is the **working product** domain object (contract v2):
 
 - stable `ArtifactId` (independent of source content),
-- `name`, `source`, `language`, `contract_version`, `revision`,
+- logical multi-file tree: `ArtifactPath` → source (`src/…`, `tests/…`),
+- **primary** file for single-file compatibility (`source()` / `replace_source` / `working_code()`),
+- `name` (label), `language`, `contract_version`, `revision`,
 - optional `specification_id` for in-memory Specification → Artifact traceability,
-- `AgentContext.working_artifact` is the canonical source; `working_code()` is a derived accessor,
-- CompileTool / ValidationTool / CorrectionTool consume and trace the Artifact,
-- LiveSession and ConstructorBridge can materialize a `RustArtifact` without mutating `CodeState`.
+- `AgentContext.working_artifact` is canonical; `working_code()` returns the **primary** source,
+- `replace_source` updates only the primary and preserves sibling files,
+- `ArtifactMaterialization` writes every file under an ephemeral Cargo crate (RAII), never the host workspace,
+- CompileTool / ValidationTool / CorrectionTool still operate on the primary buffer (compat);
+  Test / Clippy / Fmt run on the full materialized crate.
 
 ---
 
@@ -490,6 +494,7 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - Deterministic Initial Artifact from `builder::initial_source_for_kind(PlanKind)` (caller override optional)
 - Autonomous construction observability (`ConstructionObservability` derived from LoopResult / Evaluation)
 - Artifact-scoped quality tools: Test/Clippy/Fmt materialize `RustArtifact` into an ephemeral Cargo crate (RAII), never the host workspace
+- Multi-file `RustArtifact` (`ArtifactPath` + primary compat) + multi-file materialization
 - Live quality demo wiring (`LiveSessionConfig::quality_verification_artifact`)
 - CI quality gate
 
@@ -505,7 +510,9 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 
 ### Next (reasonable architectural units)
 
-- Multi-file Artifact / richer workspace materialization
+- Compile via materialized crate (unify rustc/cargo worlds)
+- Multi-file corrections (`path` on Correction)
+- Builder multi-file initial artifacts (when a PlanKind justifies it)
 
 ### Long-term vision (not implemented)
 

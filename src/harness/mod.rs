@@ -11,6 +11,7 @@ mod agent_prompt;
 mod ai_agent;
 pub mod artifact;
 mod artifact_materialization;
+mod artifact_path;
 mod autonomous_construction;
 mod bridge;
 mod constraint;
@@ -66,10 +67,13 @@ pub use agent_prompt::{SYSTEM_PROMPT_VERSION, system_prompt_v1};
 pub use ai_agent::AiAgent;
 #[allow(unused_imports)]
 pub use artifact::{
-    ARTIFACT_CONTRACT_VERSION, ArtifactContractVersion, ArtifactId, ArtifactLanguage, RustArtifact,
+    ARTIFACT_CONTRACT_VERSION, ArtifactContractVersion, ArtifactFile, ArtifactId, ArtifactLanguage,
+    RustArtifact,
 };
 #[allow(unused_imports)]
 pub use artifact_materialization::ArtifactMaterialization;
+#[allow(unused_imports)]
+pub use artifact_path::ArtifactPath;
 #[allow(unused_imports)]
 pub use autonomous_construction::{
     AutonomousConstructionConfig, AutonomousConstructionSession, ConstructionObservability,
