@@ -427,4 +427,352 @@ mod tests {
             "no debe ejecutar tests del workspace anfitrión"
         );
     }
+
+    fn multi_file_passing_artifact(id: &str) -> RustArtifact {
+        use crate::harness::artifact_path::ArtifactPath;
+        RustArtifact::try_from_files(
+            ArtifactId::new(id),
+            "main.rs",
+            ArtifactPath::parse("src/main.rs").unwrap(),
+            [
+                (
+                    ArtifactPath::parse("src/main.rs").unwrap(),
+                    "\
+mod helper;
+
+fn main() {
+    let _ = helper::answer();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::helper;
+
+    #[test]
+    fn multi_file_pass() {
+        assert_eq!(helper::answer(), 42);
+    }
+}
+"
+                    .to_string(),
+                ),
+                (
+                    ArtifactPath::parse("src/helper.rs").unwrap(),
+                    "pub fn answer() -> i32 {\n    42\n}\n".to_string(),
+                ),
+            ],
+        )
+        .expect("multi-file artifact")
+    }
+
+    #[test]
+    fn multi_file_test_clippy_fmt_tools() {
+        // J + K + L
+        let art = multi_file_passing_artifact("art-multi-quality");
+        let ctx = AgentContext::new("multi").with_working_artifact(art.clone());
+        let tests = TestTool.execute("", &ctx);
+        assert!(tests.success, "{}", tests.output);
+        assert_eq!(evidence_artifact_id(&tests), Some("art-multi-quality"));
+
+        let clippy = ClippyTool.execute("", &ctx);
+        assert!(clippy.success, "{}", clippy.output);
+
+        let fmt = FmtTool.execute("", &ctx);
+        assert!(fmt.success, "{}", fmt.output);
+    }
+
+    #[test]
+    fn multi_file_invalid_artifact_fails_while_repo_stays_healthy() {
+        // M + N
+        use crate::harness::artifact_path::ArtifactPath;
+        let cargo_toml = fs::read_to_string("Cargo.toml").unwrap();
+        let main_rs = fs::read_to_string("src/main.rs").unwrap();
+        let art = RustArtifact::try_from_files(
+            ArtifactId::new("art-multi-broken"),
+            "main.rs",
+            ArtifactPath::parse("src/main.rs").unwrap(),
+            [
+                (
+                    ArtifactPath::parse("src/main.rs").unwrap(),
+                    "mod missing_mod;\nfn main() {}\n".to_string(),
+                ),
+                (
+                    ArtifactPath::parse("src/helper.rs").unwrap(),
+                    "pub fn unused() {}\n".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        let result = TestTool.execute("", &AgentContext::new("broken").with_working_artifact(art));
+        assert!(!result.success, "crate inválido debe fallar");
+        assert_eq!(fs::read_to_string("Cargo.toml").unwrap(), cargo_toml);
+        assert_eq!(fs::read_to_string("src/main.rs").unwrap(), main_rs);
+    }
+
+    #[test]
+    fn multi_file_revision_preserves_siblings() {
+        // O
+        use crate::harness::artifact_path::ArtifactPath;
+        let helper = ArtifactPath::parse("src/helper.rs").unwrap();
+        let mut art = multi_file_passing_artifact("art-multi-rev");
+        let helper_before = art.file(&helper).unwrap().to_string();
+        art.replace_source(
+            "\
+mod helper;
+fn main() {}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn now_fails() { assert_eq!(helper::answer(), 0); }
+}
+",
+        );
+        assert_eq!(art.revision(), 1);
+        assert_eq!(art.file(&helper), Some(helper_before.as_str()));
+        let result = TestTool.execute("", &AgentContext::new("rev").with_working_artifact(art));
+        assert!(!result.success, "{}", result.output);
+    }
+
+    #[test]
+    fn multi_file_e2e_tool_evidence_evaluation() {
+        // Q
+        let art = multi_file_passing_artifact("art-multi-e2e");
+        let result = TestTool.execute("", &AgentContext::new("e2e").with_working_artifact(art));
+        assert!(result.success, "{}", result.output);
+        let engine = EvaluationEngine::new();
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests),
+            &result.evidence,
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Pass);
+        assert_eq!(evidence_artifact_id(&result), Some("art-multi-e2e"));
+    }
+
+    #[test]
+    fn single_file_autonomous_construction_still_works() {
+        // P — regression mínima con quality tools sobre Artifact single-file
+        fn quality_spec() -> Specification {
+            Specification::new("spec-sf-still", "Crear una API REST")
+                .with_requirements(vec![Requirement::new("req-t", "tests")])
+                .with_acceptance_criteria(vec![
+                    AcceptanceCriterion::new("ac-tests", "tests", CriterionKind::RunTests)
+                        .satisfying([crate::harness::RequirementId::new("req-t")]),
+                ])
+        }
+
+        struct FinishAfterTests;
+        impl Agent for FinishAfterTests {
+            fn propose(&mut self, ctx: &AgentContext) -> AgentAction {
+                let passed = ctx.observation_history.iter().any(|obs| {
+                    matches!(
+                        obs,
+                        AgentObservation::CriterionEvaluated {
+                            kind: CriterionKind::RunTests,
+                            verdict: EvaluationVerdict::Pass,
+                            ..
+                        }
+                    )
+                });
+                if passed {
+                    AgentAction::Finish {
+                        summary: "ok".to_string(),
+                    }
+                } else {
+                    AgentAction::RunTests {
+                        filter: String::new(),
+                    }
+                }
+            }
+        }
+
+        let source = "\
+fn main() {}
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ok() { assert_eq!(1, 1); }
+}
+";
+        let policy = ActionPolicy::default_session_policy();
+        let policy_name = policy.name().to_string();
+        let mut harness = Harness::new(8);
+        harness.register_tool(Box::new(ValidationTool));
+        harness.register_tool(Box::new(RepairDiagnosticTool));
+        harness.register_tool(Box::new(CorrectionTool));
+        harness.register_tool(Box::new(CompileTool));
+        harness.register_tool(Box::new(TestTool));
+        harness.register_tool(Box::new(ClippyTool));
+        harness.register_tool(Box::new(FmtTool));
+        harness.register_constraint(Box::new(policy));
+
+        let result = AutonomousConstructionSession::run_with_harness(
+            AutonomousConstructionConfig::new(quality_spec(), 6).with_initial_source(source),
+            &mut FinishAfterTests,
+            policy_name,
+            harness,
+        );
+        assert_eq!(result.status, ConstructionStatus::Completed);
+        assert_eq!(result.final_artifact.as_ref().unwrap().file_count(), 1);
+    }
+
+    #[test]
+    fn compile_tool_requires_working_artifact() {
+        // A
+        let result = CompileTool.execute("fn main() {}", &AgentContext::new("no-art"));
+        assert!(!result.success);
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "missing_artifact")
+        );
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "compile_status" && e.detail == "error")
+        );
+    }
+
+    #[test]
+    fn compile_tool_single_and_multi_file_pass() {
+        // B + C + D
+        let single = CompileTool.execute(
+            "",
+            &AgentContext::new("sf").with_working_code("fn main() {}\n"),
+        );
+        assert!(single.success, "{}", single.output);
+
+        let multi = multi_file_passing_artifact("art-compile-multi");
+        let result = CompileTool.execute("", &AgentContext::new("mf").with_working_artifact(multi));
+        assert!(
+            result.success,
+            "CompileTool debe ver helper.rs materializado: {}",
+            result.output
+        );
+        assert_eq!(evidence_artifact_id(&result), Some("art-compile-multi"));
+    }
+
+    #[test]
+    fn compile_tool_multi_file_invalid_fails_host_intact() {
+        // E + I
+        use crate::harness::artifact_path::ArtifactPath;
+        let cargo_toml = fs::read_to_string("Cargo.toml").unwrap();
+        let main_rs = fs::read_to_string("src/main.rs").unwrap();
+        let art = RustArtifact::try_from_files(
+            ArtifactId::new("art-compile-broken"),
+            "main.rs",
+            ArtifactPath::parse("src/main.rs").unwrap(),
+            [
+                (
+                    ArtifactPath::parse("src/main.rs").unwrap(),
+                    "mod missing_sibling;\nfn main() {}\n".to_string(),
+                ),
+                (
+                    ArtifactPath::parse("src/helper.rs").unwrap(),
+                    "pub fn x() {}\n".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        let result =
+            CompileTool.execute("", &AgentContext::new("broken").with_working_artifact(art));
+        assert!(!result.success, "{}", result.output);
+        assert!(
+            result
+                .evidence
+                .iter()
+                .any(|e| e.label == "compile_status" && e.detail == "error")
+        );
+        assert_eq!(fs::read_to_string("Cargo.toml").unwrap(), cargo_toml);
+        assert_eq!(fs::read_to_string("src/main.rs").unwrap(), main_rs);
+    }
+
+    #[test]
+    fn compile_tool_independent_artifacts_and_revision() {
+        // F + G + H
+        let a = artifact("art-c-a", "fn main() { /*a*/ }\n");
+        let mut b = artifact("art-c-b", "fn main() { /*b*/ }\n");
+        let ra = CompileTool.execute("", &AgentContext::new("a").with_working_artifact(a));
+        let rb = CompileTool.execute("", &AgentContext::new("b").with_working_artifact(b.clone()));
+        assert!(ra.success && rb.success);
+        assert_eq!(evidence_artifact_id(&ra), Some("art-c-a"));
+        assert_eq!(evidence_artifact_id(&rb), Some("art-c-b"));
+
+        b.replace_source("fn main() { let x: = 1; }\n");
+        assert_eq!(b.revision(), 1);
+        let r_bad = CompileTool.execute("", &AgentContext::new("b2").with_working_artifact(b));
+        assert!(
+            !r_bad.success,
+            "debe compilar la revisión actual: {}",
+            r_bad.output
+        );
+        assert_eq!(evidence_artifact_id(&r_bad), Some("art-c-b"));
+    }
+
+    #[test]
+    fn compile_tool_temp_cleaned_and_evaluation_pass_fail() {
+        // J + K + L
+        let art = artifact("art-c-eval", "fn main() {}\n");
+        let path = {
+            let mat = ArtifactMaterialization::from_artifact(&art).unwrap();
+            mat.root().to_path_buf()
+        };
+        assert!(!path.exists());
+
+        let pass = CompileTool.execute("", &AgentContext::new("pass").with_working_artifact(art));
+        let engine = EvaluationEngine::new();
+        let criterion = AcceptanceCriterion::new("ac-compile", "compila", CriterionKind::Compile);
+        assert_eq!(
+            engine
+                .evaluate_criterion(&criterion, &pass.evidence)
+                .verdict,
+            EvaluationVerdict::Pass
+        );
+
+        let fail = CompileTool.execute(
+            "",
+            &AgentContext::new("fail").with_working_code("fn main() {"),
+        );
+        assert_eq!(
+            engine
+                .evaluate_criterion(&criterion, &fail.evidence)
+                .verdict,
+            EvaluationVerdict::Fail
+        );
+    }
+
+    #[test]
+    fn compile_tool_harness_multi_file_integration() {
+        // N
+        use crate::harness::artifact_path::ArtifactPath;
+        let art = multi_file_passing_artifact("art-compile-harness");
+        let mut harness = Harness::new(4);
+        harness.register_tool(Box::new(CompileTool));
+        harness.register_constraint(Box::new(ActionPolicy::default_session_policy()));
+        let mut ctx = AgentContext::new("harness-mf").with_working_artifact(art);
+        let outcome = harness.execute_step(
+            AgentAction::Compile {
+                code: String::new(),
+            },
+            &mut ctx,
+        );
+        assert!(outcome.permitted);
+        assert!(outcome.tool_executed);
+        let tool = outcome.tool_result.as_ref().expect("tool result");
+        assert!(tool.success, "{}", tool.output);
+        assert!(
+            tool.evidence
+                .iter()
+                .any(|e| e.label == "artifact_id" && e.detail == "art-compile-harness")
+        );
+        // primary untouched siblings
+        assert!(
+            ctx.working_artifact
+                .as_ref()
+                .unwrap()
+                .file(&ArtifactPath::parse("src/helper.rs").unwrap())
+                .is_some()
+        );
+    }
 }

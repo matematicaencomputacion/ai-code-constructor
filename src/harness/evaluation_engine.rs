@@ -490,11 +490,7 @@ mod tests {
 
     #[test]
     fn tool_result_success_is_not_automatic_criterion_pass() {
-        let tool_result = ToolResult {
-            success: true,
-            output: "ok".to_string(),
-            evidence: vec![Evidence::new("tool", REPAIR_DIAGNOSTIC)],
-        };
+        let tool_result = ToolResult::success("ok", vec![Evidence::new("tool", REPAIR_DIAGNOSTIC)]);
         let engine = EvaluationEngine::new();
         let evaluation = engine.evaluate_criterion(
             &AcceptanceCriterion::new("ac-compile-001", "compila", CriterionKind::Compile),
@@ -535,7 +531,9 @@ mod tests {
     #[test]
     fn compile_tool_chain_produces_pass_evaluation_without_llm() {
         let tool = CompileTool;
-        let result = tool.execute("fn main() {}", &AgentContext::new("eval-chain"));
+        let ctx = crate::harness::context::AgentContext::new("eval-chain")
+            .with_working_code("fn main() {}");
+        let result = tool.execute("", &ctx);
         let engine = EvaluationEngine::new();
         let evaluation = engine.evaluate_criterion(
             &AcceptanceCriterion::new(

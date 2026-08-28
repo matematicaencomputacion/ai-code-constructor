@@ -3,8 +3,8 @@
 //! No reemplaza [`crate::main::run_constructor`]. Reutiliza AgentLoop, ActionPolicy,
 //! EvaluationEngine y el Harness de sesión (Validate / Repair / Correct / Compile).
 //!
-//! Initial Artifact: por defecto desde [`crate::builder::initial_source_for_kind`]
-//! (PlanKind → source determinista). El caller puede inyectar un source explícito
+//! Initial Artifact: por defecto desde [`crate::builder::initial_artifact_definition_for_kind`]
+//! (PlanKind → archivos deterministas con primary). El caller puede inyectar un source explícito
 //! para tests (p. ej. defectos controlados).
 //!
 //! Observabilidad: [`ConstructionObservability`] es un resumen **derivado** de
@@ -19,6 +19,7 @@ use crate::harness::agent::Agent;
 use crate::harness::agent_loop::{AgentLoop, LoopResult, LoopStatus};
 use crate::harness::ai_agent::AiAgent;
 use crate::harness::artifact::{ArtifactId, RustArtifact};
+use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::constraint::Constraint;
 use crate::harness::context::AgentContext;
 use crate::harness::criterion::CriterionKind;
@@ -183,13 +184,32 @@ pub fn initial_artifact_from_plan(
     plan: &BuildPlan,
     artifact_name: impl Into<String>,
 ) -> RustArtifact {
-    let source = builder::initial_source_for_kind(plan.kind);
-    RustArtifact::with_id(
-        ArtifactId::new(format!("artifact:{}", specification_id.as_str())),
-        artifact_name,
-        source,
-    )
-    .with_specification_id(specification_id)
+    let definition = builder::initial_artifact_definition_for_kind(plan.kind);
+    let artifact_id = ArtifactId::new(format!("artifact:{}", specification_id.as_str()));
+    let artifact_name = artifact_name.into();
+
+    let artifact = if definition.file_count() == 1 {
+        RustArtifact::with_id(
+            artifact_id,
+            artifact_name,
+            builder::initial_source_for_kind(plan.kind),
+        )
+    } else {
+        let primary = ArtifactPath::parse(definition.primary_path)
+            .expect("primary path del Builder debe ser válido");
+        let files: Vec<(ArtifactPath, String)> = definition
+            .files()
+            .map(|(path, source)| {
+                ArtifactPath::parse(path)
+                    .map(|parsed| (parsed, source.to_string()))
+                    .expect("path del Builder debe ser válido")
+            })
+            .collect();
+        RustArtifact::try_from_files(artifact_id, artifact_name, primary, files)
+            .expect("definición inicial del Builder debe ser válida")
+    };
+
+    artifact.with_specification_id(specification_id)
 }
 
 /// Orquestador: Specification → Plan → Artifact → AgentLoop → Evaluation → Result.
@@ -522,7 +542,7 @@ fn build_observability(
     }
 }
 
-fn plan_kind_label(kind: PlanKind) -> String {
+pub(crate) fn plan_kind_label(kind: PlanKind) -> String {
     match kind {
         PlanKind::Api => "Api".to_string(),
         PlanKind::Calculator => "Calculator".to_string(),

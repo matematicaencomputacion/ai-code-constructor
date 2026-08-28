@@ -1,4 +1,6 @@
 mod builder;
+#[cfg(test)]
+mod builder_multi_file_tests;
 mod compiler;
 #[allow(dead_code)] // capa nueva; aún no cableada al ciclo Constructor
 mod harness;

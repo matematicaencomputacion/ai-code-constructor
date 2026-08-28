@@ -461,7 +461,8 @@ mod tests {
         assert_eq!(planned.specification_id, spec.id);
 
         let artifact_code = "fn main() { println!(\"broken\"";
-        let tool_result = CompileTool.execute(artifact_code, &AgentContext::new("e2e-eval"));
+        let ctx = AgentContext::new("e2e-eval").with_working_code(artifact_code);
+        let tool_result = CompileTool.execute("", &ctx);
         assert!(!tool_result.success);
 
         let evaluation = EvaluationEngine::new()

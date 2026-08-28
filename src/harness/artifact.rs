@@ -1,15 +1,20 @@
 //! Snapshot controlado del artefacto Rust sobre el que trabajará el Agent.
 //!
 //! [`RustArtifact`] es el objeto de dominio RESULT / WORKING PRODUCT.
+//! Contrato v2: árbol lógico multi-file ([`ArtifactPath`] → source) con
+//! archivo **primary** para compatibilidad single-file (`source()` / `replace_source`).
 //! Permanece separado de [`crate::state::CodeState`].
 
+use std::collections::BTreeMap;
+
+use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::specification::SpecificationId;
 
-/// Versión del contrato de Artifact (evolución futura v1 → v2).
+/// Versión del contrato de Artifact.
 pub type ArtifactContractVersion = u32;
 
-/// Versión activa del contrato implementado en esta unidad.
-pub const ARTIFACT_CONTRACT_VERSION: ArtifactContractVersion = 1;
+/// Versión activa: multi-file con primary compatible.
+pub const ARTIFACT_CONTRACT_VERSION: ArtifactContractVersion = 2;
 
 /// Identidad estable del Artifact (no deriva del contenido del source).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -39,12 +44,24 @@ impl ArtifactLanguage {
     }
 }
 
-/// Artefacto Rust versionado: identidad estable + source revisable.
+/// Vista de un archivo del Artifact (path + source).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactFile {
+    pub path: ArtifactPath,
+    pub source: String,
+}
+
+/// Artefacto Rust versionado: identidad estable + árbol de archivos revisable.
+///
+/// Fuente canónica: [`Self::files`]. El **primary** es el archivo que exponen
+/// `source()` / `replace_source()` / `AgentContext::working_code()` (compat single-file).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RustArtifact {
     id: ArtifactId,
+    /// Etiqueta de compatibilidad (p. ej. `"main.rs"`); no es el path materializado.
     name: String,
-    source: String,
+    primary: ArtifactPath,
+    files: BTreeMap<ArtifactPath, String>,
     language: ArtifactLanguage,
     contract_version: ArtifactContractVersion,
     revision: u64,
@@ -53,23 +70,55 @@ pub struct RustArtifact {
 }
 
 impl RustArtifact {
-    /// Crea un artefacto con `revision == 0` e identidad derivada del nombre (no del source).
+    /// Crea un artefacto single-file con `revision == 0`.
+    ///
+    /// El contenido vive en `src/main.rs` (primary). `name` se conserva como etiqueta.
     pub fn new(name: impl Into<String>, source: impl Into<String>) -> Self {
         let name = name.into();
         Self::with_id(ArtifactId::new(format!("artifact:{name}")), name, source)
     }
 
-    /// Crea un artefacto con identidad explícita.
+    /// Crea un artefacto single-file con identidad explícita (`src/main.rs` = primary).
     pub fn with_id(id: ArtifactId, name: impl Into<String>, source: impl Into<String>) -> Self {
+        let primary = ArtifactPath::parse("src/main.rs").expect("path canónico src/main.rs");
+        let mut files = BTreeMap::new();
+        files.insert(primary.clone(), source.into());
         Self {
             id,
             name: name.into(),
-            source: source.into(),
+            primary,
+            files,
             language: ArtifactLanguage::Rust,
             contract_version: ARTIFACT_CONTRACT_VERSION,
             revision: 0,
             specification_id: None,
         }
+    }
+
+    /// Construye un Artifact multi-file. `primary` debe existir en `files`.
+    pub fn try_from_files(
+        id: ArtifactId,
+        name: impl Into<String>,
+        primary: ArtifactPath,
+        files: impl IntoIterator<Item = (ArtifactPath, String)>,
+    ) -> Result<Self, String> {
+        let files: BTreeMap<ArtifactPath, String> = files.into_iter().collect();
+        if files.is_empty() {
+            return Err("RustArtifact requiere al menos un archivo".to_string());
+        }
+        if !files.contains_key(&primary) {
+            return Err(format!("primary `{}` no está en files", primary.as_str()));
+        }
+        Ok(Self {
+            id,
+            name: name.into(),
+            primary,
+            files,
+            language: ArtifactLanguage::Rust,
+            contract_version: ARTIFACT_CONTRACT_VERSION,
+            revision: 0,
+            specification_id: None,
+        })
     }
 
     pub fn id(&self) -> &ArtifactId {
@@ -80,8 +129,34 @@ impl RustArtifact {
         &self.name
     }
 
+    /// Contenido del archivo **primary** (compat single-file).
     pub fn source(&self) -> &str {
-        &self.source
+        self.files
+            .get(&self.primary)
+            .map(String::as_str)
+            .unwrap_or("")
+    }
+
+    pub fn primary_path(&self) -> &ArtifactPath {
+        &self.primary
+    }
+
+    pub fn primary_source(&self) -> &str {
+        self.source()
+    }
+
+    pub fn file(&self, path: &ArtifactPath) -> Option<&str> {
+        self.files.get(path).map(String::as_str)
+    }
+
+    pub fn files(&self) -> impl Iterator<Item = (&ArtifactPath, &str)> {
+        self.files
+            .iter()
+            .map(|(path, source)| (path, source.as_str()))
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
     }
 
     pub fn language(&self) -> ArtifactLanguage {
@@ -105,14 +180,79 @@ impl RustArtifact {
         self
     }
 
-    /// Reemplaza el source e incrementa `revision` en 1 solo si el contenido cambia.
-    /// No modifica [`ArtifactId`].
+    /// Reemplaza el source del **primary** e incrementa `revision` solo si cambia.
+    /// Conserva el resto de archivos. No modifica [`ArtifactId`].
     pub fn replace_source(&mut self, new_source: impl Into<String>) {
         let next = new_source.into();
-        if next != self.source {
-            self.source = next;
+        let current = self
+            .files
+            .get(&self.primary)
+            .map(String::as_str)
+            .unwrap_or("");
+        if next != current {
+            self.files.insert(self.primary.clone(), next);
             self.revision += 1;
         }
+    }
+
+    /// Inserta o actualiza un archivo. Incrementa `revision` solo si el contenido cambia
+    /// o el path es nuevo.
+    pub fn upsert_file(
+        &mut self,
+        path: ArtifactPath,
+        source: impl Into<String>,
+    ) -> Result<(), String> {
+        let next = source.into();
+        match self.files.get(&path) {
+            Some(prev) if prev == &next => Ok(()),
+            _ => {
+                self.files.insert(path, next);
+                self.revision += 1;
+                Ok(())
+            }
+        }
+    }
+
+    /// Elimina un archivo no-primary. Incrementa `revision` si existía.
+    pub fn remove_file(&mut self, path: &ArtifactPath) -> Result<(), String> {
+        if path == &self.primary {
+            return Err(format!(
+                "no se puede eliminar el archivo primary `{}`",
+                path.as_str()
+            ));
+        }
+        if self.files.remove(path).is_some() {
+            self.revision += 1;
+            Ok(())
+        } else {
+            Err(format!("archivo inexistente: {}", path.as_str()))
+        }
+    }
+
+    pub(crate) fn insert_file_internal(&mut self, path: ArtifactPath, source: String) {
+        self.files.insert(path, source);
+    }
+
+    pub(crate) fn remove_file_internal(&mut self, path: &ArtifactPath) {
+        self.files.remove(path);
+    }
+
+    pub(crate) fn take_file_internal(&mut self, path: &ArtifactPath) -> Option<String> {
+        self.files.remove(path)
+    }
+
+    pub(crate) fn set_primary_internal(&mut self, path: ArtifactPath) {
+        self.primary = path;
+    }
+
+    pub(crate) fn files_snapshot(&self) -> BTreeMap<ArtifactPath, String> {
+        self.files.clone()
+    }
+
+    pub(crate) fn commit_files_state(&mut self, mut next: RustArtifact) {
+        self.files = std::mem::take(&mut next.files);
+        self.primary = next.primary;
+        self.revision += 1;
     }
 }
 
@@ -145,6 +285,8 @@ mod tests {
         assert_eq!(artifact.name(), "main.rs");
         assert_eq!(artifact.language(), ArtifactLanguage::Rust);
         assert_eq!(artifact.contract_version(), ARTIFACT_CONTRACT_VERSION);
+        assert_eq!(artifact.primary_path().as_str(), "src/main.rs");
+        assert_eq!(artifact.file_count(), 1);
     }
 
     #[test]
@@ -223,5 +365,56 @@ mod tests {
         assert_eq!(state.iteration, original_iteration);
         assert_ne!(artifact.source(), original_code);
         assert_eq!(artifact.revision(), 1);
+    }
+
+    #[test]
+    fn replace_source_preserves_sibling_files() {
+        let main = ArtifactPath::parse("src/main.rs").unwrap();
+        let lib = ArtifactPath::parse("src/lib.rs").unwrap();
+        let mut artifact = RustArtifact::try_from_files(
+            ArtifactId::new("art-multi"),
+            "main.rs",
+            main,
+            [
+                (
+                    ArtifactPath::parse("src/main.rs").unwrap(),
+                    "fn main() { helper::run(); }".to_string(),
+                ),
+                (
+                    ArtifactPath::parse("src/lib.rs").unwrap(),
+                    "pub fn run() {}".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+        artifact.replace_source("fn main() { helper::run(); println!(\"x\"); }");
+        assert_eq!(artifact.revision(), 1);
+        assert_eq!(
+            artifact.file(&lib).unwrap(),
+            "pub fn run() {}",
+            "lib.rs no debe destruirse al corregir primary"
+        );
+        assert_eq!(artifact.file_count(), 2);
+    }
+
+    #[test]
+    fn upsert_and_remove_preserve_structure() {
+        let mut artifact = RustArtifact::new("main.rs", "fn main() {}");
+        let helper = ArtifactPath::parse("src/helper.rs").unwrap();
+        artifact
+            .upsert_file(helper.clone(), "pub fn x() {}".to_string())
+            .unwrap();
+        assert_eq!(artifact.revision(), 1);
+        assert_eq!(artifact.file(&helper), Some("pub fn x() {}"));
+        artifact.remove_file(&helper).unwrap();
+        assert_eq!(artifact.revision(), 2);
+        assert!(artifact.file(&helper).is_none());
+        let primary = artifact.primary_path().clone();
+        assert!(
+            artifact
+                .remove_file(&primary)
+                .unwrap_err()
+                .contains("primary")
+        );
     }
 }

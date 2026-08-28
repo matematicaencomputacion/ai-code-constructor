@@ -10,7 +10,10 @@ mod agent_loop;
 mod agent_prompt;
 mod ai_agent;
 pub mod artifact;
+mod artifact_file_operation;
 mod artifact_materialization;
+mod artifact_mutation;
+mod artifact_path;
 mod autonomous_construction;
 mod bridge;
 mod constraint;
@@ -40,17 +43,27 @@ mod ai_agent_quality_actions_tests;
 #[cfg(test)]
 mod artifact_context_tests;
 #[cfg(test)]
+mod artifact_file_operations_tests;
+#[cfg(test)]
 mod artifact_scoped_quality_tests;
 #[cfg(test)]
 mod autonomous_construction_tests;
+#[cfg(test)]
+mod live_session_builder_initial_artifact_tests;
+#[cfg(test)]
+mod model_decision_multi_file_correction_tests;
+#[cfg(test)]
+mod model_multi_file_contract_tests;
+#[cfg(test)]
+mod multi_file_correction_tests;
 
 // API pública del harness; aún no consumida por el ciclo Constructor.
 #[allow(unused_imports)]
 pub use action::AgentAction;
 #[allow(unused_imports)]
 pub use action_policy::{
-    ActionConstraint, ActionPolicy, ApplyCorrectionConstraint, ArtifactStateConstraint,
-    FinishConstraint, PolicyVerdict, RepairDiagnosticConstraint,
+    ActionConstraint, ActionPolicy, ApplyCorrectionConstraint, ApplyFileOperationsConstraint,
+    ArtifactStateConstraint, FinishConstraint, PolicyVerdict, RepairDiagnosticConstraint,
 };
 #[allow(unused_imports)]
 pub use agent::{
@@ -66,10 +79,13 @@ pub use agent_prompt::{SYSTEM_PROMPT_VERSION, system_prompt_v1};
 pub use ai_agent::AiAgent;
 #[allow(unused_imports)]
 pub use artifact::{
-    ARTIFACT_CONTRACT_VERSION, ArtifactContractVersion, ArtifactId, ArtifactLanguage, RustArtifact,
+    ARTIFACT_CONTRACT_VERSION, ArtifactContractVersion, ArtifactFile, ArtifactId, ArtifactLanguage,
+    RustArtifact,
 };
 #[allow(unused_imports)]
 pub use artifact_materialization::ArtifactMaterialization;
+#[allow(unused_imports)]
+pub use artifact_path::ArtifactPath;
 #[allow(unused_imports)]
 pub use autonomous_construction::{
     AutonomousConstructionConfig, AutonomousConstructionSession, ConstructionObservability,
@@ -88,6 +104,7 @@ pub use context::AgentContext;
 #[allow(unused_imports)]
 pub use correction::{
     Correction, CorrectionOperation, CorrectionTarget, SESSION_CODE_TARGET, apply_corrections,
+    apply_corrections_to_artifact,
 };
 #[allow(unused_imports)]
 pub use correction_policy::{
@@ -108,18 +125,19 @@ pub use evaluation_observation::{
 };
 #[allow(unused_imports)]
 pub use live_session::{
-    LIVE_AGENT_MAX_ITERATIONS, LiveSessionConfig, LiveSessionError, LiveSessionResult,
-    LiveSessionStepRecord, LiveSessionTrace, build_validate_compile_harness,
-    build_validate_compile_harness_with_policy, live_quality_artifact_source,
-    live_quality_specification, run_live_agent_session, run_live_agent_session_with_client,
-    run_live_agent_session_with_client_and_policy,
+    LIVE_AGENT_MAX_ITERATIONS, LiveSessionConfig, LiveSessionError,
+    LiveSessionFromSpecificationOptions, LiveSessionResult, LiveSessionStepRecord,
+    LiveSessionTrace, build_validate_compile_harness, build_validate_compile_harness_with_policy,
+    live_quality_artifact_source, live_quality_specification, run_live_agent_session,
+    run_live_agent_session_with_client, run_live_agent_session_with_client_and_policy,
     run_live_agent_session_with_client_policy_and_retry_observability,
 };
 #[allow(unused_imports)]
 pub use model::{
     AiSessionConfig, MockModelClient, ModelClient, ModelDecision, ModelError,
     ModelInteractionTrace, ModelRequest, ModelResponse, ModelResponseError, StructuredCorrection,
-    model_request_from_context, parse_model_response, redact_secrets, serialize_decision,
+    StructuredFileOperation, model_request_from_context, parse_model_response, redact_secrets,
+    serialize_decision, structured_to_file_operation,
 };
 #[allow(unused_imports)]
 pub use observation::AgentObservation;
@@ -147,9 +165,10 @@ pub use tool::{Tool, ToolResult};
 pub use tool_permission::ToolPermissionConstraint;
 #[allow(unused_imports)]
 pub use tools::{
-    APPLY_CORRECTION, CHECK_FORMAT, COMPILE, ClippyTool, CompileTool, CorrectionTool, FmtTool,
-    REPAIR_DIAGNOSTIC, RUN_CLIPPY, RUN_TESTS, RepairDiagnosticTool, TestTool, VALIDATE,
-    ValidationTool, encode_correction_input, encode_repair_diagnostic_input, encode_validate_input,
+    APPLY_CORRECTION, APPLY_FILE_OPERATIONS, CHECK_FORMAT, COMPILE, ClippyTool, CompileTool,
+    CorrectionTool, FileOperationsTool, FmtTool, REPAIR_DIAGNOSTIC, RUN_CLIPPY, RUN_TESTS,
+    RepairDiagnosticTool, TestTool, VALIDATE, ValidationTool, encode_correction_input,
+    encode_file_operations_input, encode_repair_diagnostic_input, encode_validate_input,
 };
 
 #[cfg(test)]
@@ -166,11 +185,7 @@ mod tests {
         }
 
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
-            ToolResult {
-                success: true,
-                output: input.to_string(),
-                evidence: vec![Evidence::new("echo_output", input)],
-            }
+            ToolResult::success(input.to_string(), vec![Evidence::new("echo_output", input)])
         }
     }
 
@@ -188,11 +203,10 @@ mod tests {
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
             self.executed.store(true, Ordering::SeqCst);
             self.calls.fetch_add(1, Ordering::SeqCst);
-            ToolResult {
-                success: true,
-                output: input.to_string(),
-                evidence: vec![Evidence::new("tracking", self.name)],
-            }
+            ToolResult::success(
+                input.to_string(),
+                vec![Evidence::new("tracking", self.name)],
+            )
         }
     }
 
@@ -215,6 +229,7 @@ mod tests {
                 | AgentAction::Validate { .. }
                 | AgentAction::RepairDiagnostic { .. }
                 | AgentAction::ApplyCorrection { .. }
+                | AgentAction::ApplyFileOperations { .. }
                 | AgentAction::InvokeTool { .. }
                 | AgentAction::NoOp => ConstraintDecision::Allow,
             }
@@ -321,13 +336,12 @@ mod tests {
 
     #[test]
     fn compile_tool_compiles_valid_code() {
-        // A
+        // A — requiere working_artifact (crate materializado)
         let tool = CompileTool;
-        let result = tool.execute(
-            "fn main() { println!(\"ok\"); }\n",
-            &AgentContext::new("compile-ok"),
-        );
-        assert!(result.success);
+        let ctx =
+            AgentContext::new("compile-ok").with_working_code("fn main() { println!(\"ok\"); }\n");
+        let result = tool.execute("", &ctx);
+        assert!(result.success, "{}", result.output);
         assert!(
             result
                 .evidence
@@ -340,10 +354,9 @@ mod tests {
     fn compile_tool_fails_invalid_code_with_evidence() {
         // B
         let tool = CompileTool;
-        let result = tool.execute(
-            "fn main() { println!(\"broken\"\n",
-            &AgentContext::new("compile-fail"),
-        );
+        let ctx = AgentContext::new("compile-fail")
+            .with_working_code("fn main() { println!(\"broken\"\n");
+        let result = tool.execute("", &ctx);
         assert!(!result.success);
         assert!(result.evidence.iter().any(|e| e.label == "compiler_stderr"));
         assert!(

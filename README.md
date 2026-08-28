@@ -367,14 +367,20 @@ inside the harness** without corrupting the original `CodeState`.
 
 ## RustArtifact (controlled artifact)
 
-`RustArtifact` (`harness/artifact.rs`) is the **working product** domain object:
+`RustArtifact` (`harness/artifact.rs`) is the **working product** domain object (contract v2):
 
 - stable `ArtifactId` (independent of source content),
-- `name`, `source`, `language`, `contract_version`, `revision`,
+- logical multi-file tree: `ArtifactPath` → source (`src/…`, `tests/…`),
+- **primary** file for single-file compatibility (`source()` / `replace_source` / `working_code()`),
+- `name` (label), `language`, `contract_version`, `revision`,
 - optional `specification_id` for in-memory Specification → Artifact traceability,
-- `AgentContext.working_artifact` is the canonical source; `working_code()` is a derived accessor,
-- CompileTool / ValidationTool / CorrectionTool consume and trace the Artifact,
-- LiveSession and ConstructorBridge can materialize a `RustArtifact` without mutating `CodeState`.
+- `AgentContext.working_artifact` is canonical; `working_code()` returns the **primary** source,
+- `replace_source` updates only the primary and preserves sibling files,
+- `ArtifactMaterialization` writes every file under an ephemeral Cargo crate (RAII), never the host workspace,
+- `CompileTool` / Test / Clippy / Fmt run on that materialized crate (`cargo check` / `test` / `clippy` / `fmt`);
+  ValidationTool still uses the **primary** buffer (compat).
+- `Correction` may target an existing `ArtifactPath`; legacy corrections without path still use **primary**.
+- Model JSON corrections may include optional `"path"` per operation; omitted path edits the primary file.
 
 ---
 
@@ -392,6 +398,10 @@ OpenAICompatibleModelClient
 
 First use case implemented: validate and compile an existing Rust artifact with
 a **real model choosing actions** (not a hardcoded sequence in `AiAgent`).
+
+`LiveSessionConfig::from_specification` resolves Specification → `plan_specification` →
+Builder Initial Artifact (single- or multi-file) without manual `working_code`.
+Legacy constructors (`validate_and_compile_artifact`, `with_artifact`, etc.) remain available.
 
 Manual test (excluded from CI):
 
@@ -487,10 +497,16 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - ActionPolicy / ActionConstraints: permission ≠ action validity (Artifact / Repair / Correction / Finish)
 - LiveSession uses `ActionPolicy::default_session_policy()` by default (injectable)
 - Autonomous construction session: Specification → Plan → Artifact → AgentLoop → ConstructionResult
-- Deterministic Initial Artifact from `builder::initial_source_for_kind(PlanKind)` (caller override optional)
+- Deterministic Initial Artifact from `builder::initial_artifact_definition_for_kind(PlanKind)` (caller override optional)
+- `PlanKind::Authentication` produces `src/main.rs` + `src/auth.rs`; other kinds remain single-file
 - Autonomous construction observability (`ConstructionObservability` derived from LoopResult / Evaluation)
 - Artifact-scoped quality tools: Test/Clippy/Fmt materialize `RustArtifact` into an ephemeral Cargo crate (RAII), never the host workspace
+- Multi-file `RustArtifact` (`ArtifactPath` + primary compat) + multi-file materialization
+- `CompileTool` via materialized crate (`cargo check`), same isolation as quality tools
 - Live quality demo wiring (`LiveSessionConfig::quality_verification_artifact`)
+- LiveSession can start from `LiveSessionConfig::from_specification` (Specification → Plan → Builder → Initial Artifact, including multi-file Authentication)
+- Artifacts can evolve structurally via `apply_file_operations` (`create_file`, `delete_file`, `rename_file`) on the canonical `RustArtifact`
+- Mutation tools preview changes (`ToolResult.artifact_preview`); the Harness performs a single canonical commit (`commit_artifact_preview`). Correction batches are atomic (+1 `revision` per successful batch, same as file operations)
 - CI quality gate
 
 ### Experimental
@@ -505,7 +521,7 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 
 ### Next (reasonable architectural units)
 
-- Multi-file Artifact / richer workspace materialization
+- Extend multi-file initial artifacts to additional PlanKinds when justified
 
 ### Long-term vision (not implemented)
 

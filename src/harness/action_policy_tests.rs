@@ -139,6 +139,7 @@ mod tests {
             &AgentAction::ApplyCorrection {
                 corrections: vec![Correction {
                     target: CorrectionTarget::SessionCode,
+                    path: None,
                     operation: CorrectionOperation::ReplaceText {
                         search: "zzz".to_string(),
                         replacement: "y".to_string(),
@@ -243,11 +244,7 @@ mod tests {
                 _ctx: &AgentContext,
             ) -> crate::harness::tool::ToolResult {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                crate::harness::tool::ToolResult {
-                    success: true,
-                    output: "ok".to_string(),
-                    evidence: vec![],
-                }
+                crate::harness::tool::ToolResult::success("ok", vec![])
             }
         }
 
