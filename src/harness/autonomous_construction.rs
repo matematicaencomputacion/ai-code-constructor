@@ -27,6 +27,7 @@ use crate::harness::evaluation::EvaluationVerdict;
 use crate::harness::evaluation_engine::{
     EvaluationEngine, SpecificationEvaluation, SpecificationEvaluationStatus,
 };
+use crate::harness::goal_driven::{Goal, GoalDrivenLoop, GoalDrivenResult, GoalDrivenStatus};
 use crate::harness::live_session::build_validate_compile_harness_with_policy;
 use crate::harness::model::{AiSessionConfig, ModelClient};
 use crate::harness::observation::AgentObservation;
@@ -212,6 +213,52 @@ pub fn initial_artifact_from_plan(
     artifact.with_specification_id(specification_id)
 }
 
+/// Resultado de construcción con capa goal-driven.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalDrivenConstructionResult {
+    pub construction: ConstructionResult,
+    pub goal_result: Option<GoalDrivenResult>,
+}
+
+impl GoalDrivenConstructionResult {
+    pub fn is_goal_satisfied(&self) -> bool {
+        self.goal_result
+            .as_ref()
+            .map(GoalDrivenResult::is_goal_satisfied)
+            .unwrap_or(false)
+    }
+}
+
+fn invalid_specification_result(
+    specification_id: SpecificationId,
+    error: SpecificationValidationError,
+    policy_name: String,
+    started: Instant,
+) -> ConstructionResult {
+    let termination_reason = format!("specification inválida: {error}");
+    let status = ConstructionStatus::InvalidSpecification;
+    ConstructionResult {
+        status,
+        specification_id,
+        artifact_id: None,
+        final_artifact: None,
+        build_plan: None,
+        loop_result: None,
+        specification_evaluation: None,
+        termination_reason: termination_reason.clone(),
+        validation_error: Some(error),
+        action_policy: policy_name,
+        observability: build_observability(
+            status,
+            started.elapsed().as_millis() as u64,
+            None,
+            None,
+            &termination_reason,
+            None,
+        ),
+    }
+}
+
 /// Orquestador: Specification → Plan → Artifact → AgentLoop → Evaluation → Result.
 ///
 /// No implementa otro loop; delega en [`AgentLoop`].
@@ -382,6 +429,137 @@ impl AutonomousConstructionSession {
             validation_error: None,
             action_policy: policy_name,
             observability,
+        }
+    }
+
+    /// Ejecuta con ciclo goal-driven (evaluación → gap → acción → evidencia → re-evaluación).
+    pub fn run_goal_driven(
+        config: AutonomousConstructionConfig,
+        agent: &mut dyn Agent,
+    ) -> GoalDrivenConstructionResult {
+        Self::run_goal_driven_with_policy(config, agent, ActionPolicy::default_session_policy())
+    }
+
+    /// Como [`Self::run_goal_driven`], con ActionPolicy inyectada.
+    pub fn run_goal_driven_with_policy(
+        config: AutonomousConstructionConfig,
+        agent: &mut dyn Agent,
+        policy: ActionPolicy,
+    ) -> GoalDrivenConstructionResult {
+        let policy_name = policy.name().to_string();
+        let harness = build_validate_compile_harness_with_policy(policy);
+        Self::run_goal_driven_with_harness(config, agent, policy_name, harness)
+    }
+
+    /// Goal-driven con Harness inyectado.
+    pub fn run_goal_driven_with_harness(
+        config: AutonomousConstructionConfig,
+        agent: &mut dyn Agent,
+        policy_name: impl Into<String>,
+        harness: crate::harness::runtime::Harness,
+    ) -> GoalDrivenConstructionResult {
+        let started = Instant::now();
+        let specification_id = config.specification.id.clone();
+        let policy_name = policy_name.into();
+        let goal = Goal::from_specification(config.specification.clone());
+
+        if let Err(error) = config.specification.validate() {
+            return GoalDrivenConstructionResult {
+                construction: invalid_specification_result(
+                    specification_id,
+                    error,
+                    policy_name,
+                    started,
+                ),
+                goal_result: None,
+            };
+        }
+
+        let planned = match plan_specification(&config.specification) {
+            Ok(plan) => plan,
+            Err(SpecificationPlannerError::InvalidSpecification(error)) => {
+                return GoalDrivenConstructionResult {
+                    construction: invalid_specification_result(
+                        specification_id,
+                        error,
+                        policy_name,
+                        started,
+                    ),
+                    goal_result: None,
+                };
+            }
+        };
+
+        let initial_artifact = match &config.initial_source {
+            Some(source) => RustArtifact::with_id(
+                ArtifactId::new(format!("artifact:{}", specification_id.as_str())),
+                config.artifact_name.clone(),
+                source.clone(),
+            )
+            .with_specification_id(specification_id.clone()),
+            None => initial_artifact_from_plan(
+                specification_id.clone(),
+                &planned.plan,
+                config.artifact_name.clone(),
+            ),
+        };
+
+        let ctx = AgentContext::new(format!(
+            "goal-driven:{}:{}",
+            specification_id.as_str(),
+            goal.description()
+        ))
+        .with_working_artifact(initial_artifact)
+        .with_evaluation_specification(config.specification.clone());
+
+        let max_iterations = config.max_iterations.max(1);
+        let mut goal_loop = GoalDrivenLoop::with_defaults(max_iterations);
+        let goal_result = goal_loop.run(&harness, agent, &goal, ctx);
+
+        let evidence = &goal_result.loop_result.history.evidence;
+        let specification_evaluation =
+            EvaluationEngine::new().evaluate_specification(&config.specification, evidence);
+
+        let status = match goal_result.status {
+            GoalDrivenStatus::GoalSatisfied => ConstructionStatus::Completed,
+            GoalDrivenStatus::MaxIterations => ConstructionStatus::MaxIterations,
+            GoalDrivenStatus::Escalated | GoalDrivenStatus::Failed => ConstructionStatus::Failed,
+        };
+
+        let termination_reason = goal_result.termination_reason.clone();
+        let observability = build_observability(
+            status,
+            started.elapsed().as_millis() as u64,
+            Some(&goal_result.loop_result),
+            Some(&specification_evaluation),
+            &termination_reason,
+            None,
+        );
+
+        GoalDrivenConstructionResult {
+            construction: ConstructionResult {
+                status,
+                specification_id,
+                artifact_id: goal_result
+                    .loop_result
+                    .final_context
+                    .working_artifact
+                    .as_ref()
+                    .map(|a| a.id().clone()),
+                final_artifact: goal_result
+                    .loop_result
+                    .final_context
+                    .working_artifact
+                    .clone(),
+                build_plan: Some(planned),
+                loop_result: Some(goal_result.loop_result.clone()),
+                specification_evaluation: Some(specification_evaluation),
+                termination_reason,
+                validation_error: None,
+                action_policy: policy_name,
+                observability,
+            },
+            goal_result: Some(goal_result),
         }
     }
 

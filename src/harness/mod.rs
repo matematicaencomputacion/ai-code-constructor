@@ -24,6 +24,7 @@ mod criterion;
 mod evaluation;
 mod evaluation_engine;
 mod evaluation_observation;
+mod goal_driven;
 mod live_session;
 mod model;
 mod observation;
@@ -48,6 +49,8 @@ mod artifact_file_operations_tests;
 mod artifact_scoped_quality_tests;
 #[cfg(test)]
 mod autonomous_construction_tests;
+#[cfg(test)]
+mod goal_driven_integration_tests;
 #[cfg(test)]
 mod live_session_builder_initial_artifact_tests;
 #[cfg(test)]
@@ -89,8 +92,8 @@ pub use artifact_path::ArtifactPath;
 #[allow(unused_imports)]
 pub use autonomous_construction::{
     AutonomousConstructionConfig, AutonomousConstructionSession, ConstructionObservability,
-    ConstructionResult, ConstructionStatus, CriterionObservabilityEntry, ToolExecutionSummary,
-    initial_artifact_from_plan,
+    ConstructionResult, ConstructionStatus, CriterionObservabilityEntry,
+    GoalDrivenConstructionResult, ToolExecutionSummary, initial_artifact_from_plan,
 };
 #[allow(unused_imports)]
 pub use bridge::{
@@ -122,6 +125,12 @@ pub use evaluation_engine::{
 pub use evaluation_observation::{
     EvaluationAwareAgent, ToolEvaluationStep, criterion_kind_for_tool, evaluate_tool_evidence,
     observation_from_criterion_evaluation, observation_from_specification_evaluation,
+};
+#[allow(unused_imports)]
+pub use goal_driven::{
+    CriterionGap, EvaluationPlan, EvaluationPlanEntry, GapDrivenAgent, Goal, GoalDrivenHistory,
+    GoalDrivenLoop, GoalDrivenResult, GoalDrivenStatus, GoalEscalation, GoalEvaluation,
+    GoalEvaluator, GoalGap, GoalProgressTracker, GoalStatus, ProgressSignal, evaluate_after_tool,
 };
 #[allow(unused_imports)]
 pub use live_session::{
