@@ -467,4 +467,87 @@ fn implementar_handlers() {
             "gap guidance no debe re-proponer Finish en cada iteración"
         );
     }
+
+    /// E2E controlado: Goal insatisfecha → Finish prematuro del modelo →
+    /// `apply_gap_guidance` redirige → Compile genera evidencia → Goal satisfecha → Finish permitido.
+    ///
+    /// Ejercita el path de producción real (`AiAgent::propose` + `AgentLoop`) sin APIs externas.
+    #[test]
+    fn gap_guidance_e2e_premature_finish_redirects_to_goal_satisfied() {
+        use crate::harness::criterion::CriterionKind;
+        use crate::harness::goal_driven::{
+            Goal, GoalEvaluator, GoalStatus, collect_evidence_from_context,
+        };
+        use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+
+        let spec = Specification::new("spec-gap-e2e", "El código debe compilar")
+            .with_requirements(vec![Requirement::new("req-c", "compilar")])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-compile", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req-c")]),
+            ]);
+        let goal = Goal::from_specification(spec.clone());
+        let working_code = "fn main() { println!(\"ok\"); }\n";
+
+        let ctx = AgentContext::new("gap-e2e")
+            .with_working_code(working_code)
+            .with_evaluation_specification(spec.clone());
+        let initial_eval =
+            GoalEvaluator::new().evaluate(&goal, &collect_evidence_from_context(&ctx));
+        assert_ne!(
+            initial_eval.status,
+            GoalStatus::Satisfied,
+            "artifacto inicial debe fallar Goal (sin evidencia de compile)"
+        );
+        assert!(
+            !initial_eval.gap.is_empty(),
+            "debe existir GoalGap accionable antes del loop"
+        );
+
+        let mut harness = Harness::new(6);
+        harness.register_tool(Box::new(CompileTool));
+        harness.register_constraint(Box::new(
+            ToolPermissionConstraint::default_constructor_tools(),
+        ));
+        let session = AiSessionConfig::new("compilar", "Generic").with_gap_guidance(true);
+        let mut agent = AiAgent::new(Box::new(AlwaysFinishModelClient), session);
+        let result = AgentLoop::new(6).run(&harness, &mut agent, ctx);
+
+        let first_request = agent.trace.requests.first().expect("request inicial");
+        assert!(first_request.goal_evaluation.is_some());
+        assert!(first_request.goal_gap.is_some());
+        assert!(
+            matches!(
+                agent
+                    .trace
+                    .parsed_decisions
+                    .first()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap(),
+                ModelDecision::Compile { .. }
+            ),
+            "apply_gap_guidance debe redirigir Finish prematuro a Compile"
+        );
+        assert!(
+            matches!(
+                result.history.proposed_actions.first(),
+                Some(AgentAction::Compile { .. })
+            ),
+            "primera acción ejecutable debe ser Compile, no Finish"
+        );
+        assert!(
+            result.tools_executed().contains(&COMPILE.to_string()),
+            "el agente debe ejecutar Compile para cerrar el gap"
+        );
+
+        let final_eval = GoalEvaluator::new()
+            .evaluate(&goal, &collect_evidence_from_context(&result.final_context));
+        assert_eq!(
+            final_eval.status,
+            GoalStatus::Satisfied,
+            "Goal debe alcanzarse tras generar evidencia de compile"
+        );
+        assert_eq!(result.status, LoopStatus::Completed);
+    }
 }
