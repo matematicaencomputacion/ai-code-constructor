@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::harness::model::{
-    ModelClient, ModelError, ModelRequest, ModelResponse, append_artifact_files_to_message_parts,
-    append_goal_context_to_message_parts, redact_secrets,
+    ModelClient, ModelError, ModelRequest, ModelResponse, append_artifact_files_to_message_parts, append_diagnostic_context_to_message_parts,
+    append_goal_context_to_message_parts, append_recent_evidence_to_message_parts, redact_secrets,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -201,6 +201,8 @@ fn build_user_message(request: &ModelRequest) -> String {
         &request.artifact_files,
     );
     append_goal_context_to_message_parts(&mut parts, request);
+    append_diagnostic_context_to_message_parts(&mut parts, &request.diagnostic_context);
+    append_recent_evidence_to_message_parts(&mut parts, &request.recent_evidence);
     if let Some(artifact_id) = &request.artifact_id {
         parts.push(format!("artifact_id={artifact_id}"));
     }
@@ -244,6 +246,10 @@ fn build_user_message(request: &ModelRequest) -> String {
                 "repairer_feedback={}",
                 obs.repairer_feedback.join(" | ")
             ));
+        }
+        for (index, (label, detail)) in obs.evidence_details.iter().enumerate() {
+            parts.push(format!("last_observation_evidence_{index}_label={label}"));
+            parts.push(format!("last_observation_evidence_{index}_detail={detail}"));
         }
     }
     parts.join("\n")
@@ -459,6 +465,7 @@ mod tests {
             goal_evaluation: None,
             goal_gap: None,
             recommended_action: None,
+            diagnostic_context: Default::default(),
             system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
         }
     }
