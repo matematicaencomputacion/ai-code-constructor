@@ -690,6 +690,38 @@ pub fn validate_model_decision_against_recommendation(
         return decision;
     }
 
+    // Tras RepairDiagnostic exitoso, ApplyCorrection es el paso esperado aunque
+    // el gap de Compile siga recomendando RepairDiagnostic.
+    if matches!(decision, ModelDecision::ApplyCorrection { .. })
+        && request.last_observation.as_ref().is_some_and(|obs| {
+            obs.kind == "tool_outcome"
+                && obs.tool_name.as_deref() == Some(REPAIR_DIAGNOSTIC)
+                && obs.success == Some(true)
+        })
+    {
+        return decision;
+    }
+
+    // Tras ApplyCorrection exitoso, re-compilar antes de re-evaluar el gap de Compile.
+    if matches!(decision, ModelDecision::Compile { .. })
+        && request.last_observation.as_ref().is_some_and(|obs| {
+            obs.kind == "tool_outcome"
+                && obs.tool_name.as_deref() == Some(APPLY_CORRECTION)
+                && obs.success == Some(true)
+        })
+    {
+        return decision;
+    }
+
+    // Tras FAIL de un criterio, RepairDiagnostic precede a re-ejecutar la Tool.
+    if matches!(decision, ModelDecision::RepairDiagnostic { .. })
+        && request.last_observation.as_ref().is_some_and(|obs| {
+            obs.kind == "criterion_evaluated" && obs.evaluation_verdict.as_deref() == Some("Fail")
+        })
+    {
+        return decision;
+    }
+
     if let Some(rec) = &request.recommended_action {
         if rec.kind == "FinishAllowed" {
             return decision;

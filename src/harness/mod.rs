@@ -51,6 +51,8 @@ mod artifact_scoped_quality_tests;
 #[cfg(test)]
 mod autonomous_construction_tests;
 #[cfg(test)]
+mod goal_driven_autonomous_construction_e2e_tests;
+#[cfg(test)]
 mod goal_driven_integration_tests;
 #[cfg(test)]
 mod live_session_builder_initial_artifact_tests;
