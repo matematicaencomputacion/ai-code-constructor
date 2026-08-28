@@ -31,10 +31,7 @@ mod tests {
     use std::time::Duration;
 
     fn session() -> AiSessionConfig {
-        AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        }
+        AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string())
     }
 
     fn artifact_source_passing_tests() -> String {

@@ -24,6 +24,7 @@ mod criterion;
 mod evaluation;
 mod evaluation_engine;
 mod evaluation_observation;
+mod feature_flags;
 mod goal_driven;
 mod live_session;
 mod model;

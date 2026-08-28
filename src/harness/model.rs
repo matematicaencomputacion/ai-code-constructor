@@ -18,6 +18,23 @@ use crate::harness::tools::{APPLY_CORRECTION, COMPILE, REPAIR_DIAGNOSTIC, VALIDA
 pub struct AiSessionConfig {
     pub user_request: String,
     pub plan_kind: String,
+    /// Redirige Finish prematuro vía [`apply_gap_guidance`] cuando está activo.
+    pub gap_guidance: bool,
+}
+
+impl AiSessionConfig {
+    pub fn new(user_request: impl Into<String>, plan_kind: impl Into<String>) -> Self {
+        Self {
+            user_request: user_request.into(),
+            plan_kind: plan_kind.into(),
+            gap_guidance: false,
+        }
+    }
+
+    pub fn with_gap_guidance(mut self, enabled: bool) -> Self {
+        self.gap_guidance = enabled;
+        self
+    }
 }
 
 /// Observación serializada para el modelo.
@@ -1520,10 +1537,7 @@ mod tests {
 
     #[test]
     fn model_request_from_context_includes_observation_and_code() {
-        let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string());
         let mut ctx = AgentContext::new("ai").with_working_code("fn main() {}");
         ctx.step = 2;
         ctx.push_observation(AgentObservation::ToolOutcome {
@@ -1565,10 +1579,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let session = AiSessionConfig {
-            user_request: "Corregir helper".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Corregir helper".to_string(), "Api".to_string());
         let ctx = AgentContext::new("ai").with_working_artifact(artifact);
 
         let request = model_request_from_context(&ctx, &session).expect("request");
@@ -1676,10 +1687,7 @@ mod tests {
 
     #[test]
     fn system_prompt_in_model_request_lists_quality_actions() {
-        let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string());
         let request = model_request_from_context(
             &AgentContext::new("ai").with_working_code("fn main() {}"),
             &session,
@@ -1712,10 +1720,7 @@ mod tests {
     #[test]
     fn mock_model_client_changes_decision_with_observation() {
         let client = MockModelClient::new();
-        let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string());
 
         let initial =
             model_request_from_context(&AgentContext::new("ai").with_working_code("NET"), &session)
@@ -1752,10 +1757,7 @@ mod tests {
 
     #[test]
     fn model_request_includes_goal_gap_when_unsatisfied() {
-        let session = AiSessionConfig {
-            user_request: "compilar".to_string(),
-            plan_kind: "Generic".to_string(),
-        };
+        let session = AiSessionConfig::new("compilar".to_string(), "Generic".to_string());
         let ctx = AgentContext::new("gap-test")
             .with_working_code("fn main() {}")
             .with_evaluation_specification(compile_only_spec());
@@ -1777,10 +1779,7 @@ mod tests {
     fn model_request_reflects_satisfied_goal() {
         use crate::harness::tools::COMPILE;
 
-        let session = AiSessionConfig {
-            user_request: "compilar".to_string(),
-            plan_kind: "Generic".to_string(),
-        };
+        let session = AiSessionConfig::new("compilar".to_string(), "Generic".to_string());
         let mut ctx = AgentContext::new("gap-satisfied")
             .with_working_code("fn main() {}")
             .with_evaluation_specification(compile_only_spec());
@@ -1851,10 +1850,7 @@ mod tests {
     #[test]
     fn mock_model_client_uses_goal_gap_for_initial_action() {
         let client = MockModelClient::new();
-        let session = AiSessionConfig {
-            user_request: "compilar".to_string(),
-            plan_kind: "Generic".to_string(),
-        };
+        let session = AiSessionConfig::new("compilar".to_string(), "Generic".to_string());
         let ctx = AgentContext::new("gap-mock")
             .with_working_code("fn main() {}")
             .with_evaluation_specification(compile_only_spec());

@@ -608,10 +608,7 @@ impl AutonomousConstructionSession {
             Ok(planned) => plan_kind_label(planned.plan.kind),
             Err(_) => "Generic".to_string(),
         };
-        let session = AiSessionConfig {
-            user_request: config.specification.goal.clone(),
-            plan_kind,
-        };
+        let session = AiSessionConfig::new(config.specification.goal.clone(), plan_kind);
         let mut agent = AiAgent::new(client, session);
         let policy_name = policy.name().to_string();
         let harness = build_validate_compile_harness_with_policy(policy);

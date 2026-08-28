@@ -200,10 +200,7 @@ mod tests {
             Box::new(ScriptModelClient {
                 raw: serialize_decision(&decision),
             }),
-            AiSessionConfig {
-                user_request: "r".to_string(),
-                plan_kind: "Api".to_string(),
-            },
+            AiSessionConfig::new("r".to_string(), "Api".to_string()),
         );
         let action =
             agent.propose(&AgentContext::new("a").with_working_artifact(multi_helper_artifact()));
@@ -336,10 +333,7 @@ mod tests {
             Box::new(ScriptModelClient {
                 raw: serialize_decision(&decision),
             }),
-            AiSessionConfig {
-                user_request: "Crear una API REST".to_string(),
-                plan_kind: "Api".to_string(),
-            },
+            AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string()),
         );
         let mut ctx = AgentContext::new("legacy").with_working_code("Servidor NET");
         ctx.step = 1;

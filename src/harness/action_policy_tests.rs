@@ -403,10 +403,7 @@ mod tests {
         // T
         let mut agent = AiAgent::new(
             Box::new(MockModelClient::new()),
-            AiSessionConfig {
-                user_request: "Crear una API REST".to_string(),
-                plan_kind: "Api".to_string(),
-            },
+            AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string()),
         );
         let action = agent.propose(&artifact_ctx("fn main() {}"));
         assert!(matches!(action, AgentAction::Validate { .. }));

@@ -367,10 +367,7 @@ fn implementar_handlers() {
             .with_initial_source("fn main() {}");
         let mut agent = AiAgent::new(
             Box::new(MockModelClient::new()),
-            AiSessionConfig {
-                user_request: "Crear una API REST".to_string(),
-                plan_kind: "Api".to_string(),
-            },
+            AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string()),
         );
         let result = AutonomousConstructionSession::run_with_policy(config, &mut agent, policy);
         assert_eq!(result.action_policy, "action_policy");
@@ -396,10 +393,7 @@ fn implementar_handlers() {
         let mut agent = TrackingAgent {
             inner: AiAgent::new(
                 Box::new(MockModelClient::new()),
-                AiSessionConfig {
-                    user_request: "Crear una API REST".to_string(),
-                    plan_kind: "Api".to_string(),
-                },
+                AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string()),
             ),
             flag: Arc::clone(&executed),
         };

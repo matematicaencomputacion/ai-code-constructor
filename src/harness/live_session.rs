@@ -430,10 +430,7 @@ pub fn run_live_agent_session_with_client_policy_and_retry_observability(
     }
 
     let max_iterations = config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS);
-    let session = AiSessionConfig {
-        user_request: config.user_request.clone(),
-        plan_kind: config.plan_kind.clone(),
-    };
+    let session = AiSessionConfig::new(config.user_request.clone(), config.plan_kind.clone());
     let mut ctx = match config.working_artifact.clone() {
         Some(artifact) => AgentContext::new(&config.goal).with_working_artifact(artifact),
         None => AgentContext::new(&config.goal).with_working_code(config.working_code.clone()),
@@ -1306,10 +1303,7 @@ fn implementar_handlers() {
         // R
         let mut agent = AiAgent::new(
             Box::new(MockModelClient::new()),
-            AiSessionConfig {
-                user_request: "Crear una API REST".to_string(),
-                plan_kind: "Api".to_string(),
-            },
+            AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string()),
         );
         let action = agent.propose(&AgentContext::new("r").with_working_code("fn main() {}"));
         assert!(matches!(action, AgentAction::Validate { .. }));

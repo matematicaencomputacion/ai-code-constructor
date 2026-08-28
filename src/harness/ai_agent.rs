@@ -3,10 +3,11 @@ use crate::harness::agent::Agent;
 use crate::harness::artifact_file_operation::ArtifactFileOperation;
 use crate::harness::context::AgentContext;
 use crate::harness::correction::Correction;
+use crate::harness::feature_flags::ai_agent_gap_guidance_enabled;
 use crate::harness::model::{
     AiSessionConfig, ModelClient, ModelDecision, ModelError, ModelInteractionTrace,
-    ModelResponseError, model_request_from_context, parse_model_response, structured_to_correction,
-    structured_to_file_operation, validate_apply_correction,
+    ModelResponseError, apply_gap_guidance, model_request_from_context, parse_model_response,
+    structured_to_correction, structured_to_file_operation, validate_apply_correction,
 };
 
 /// Primer Agent basado en IA: serializa contexto, consulta [`ModelClient`]
@@ -137,6 +138,11 @@ impl Agent for AiAgent {
                 return Self::finish_with_error(error.to_string());
             }
         };
+        let decision = if ai_agent_gap_guidance_enabled(self.session.gap_guidance) {
+            apply_gap_guidance(decision, &request)
+        } else {
+            decision
+        };
         self.trace.record_decision(Ok(decision.clone()));
 
         let action = match Self::decision_to_action(decision, ctx) {
@@ -165,8 +171,8 @@ mod tests {
     use crate::harness::runtime::Harness;
     use crate::harness::tool_permission::ToolPermissionConstraint;
     use crate::harness::tools::{
-        APPLY_CORRECTION, COMPILE, CorrectionTool, REPAIR_DIAGNOSTIC, RepairDiagnosticTool,
-        VALIDATE, ValidationTool,
+        APPLY_CORRECTION, COMPILE, CompileTool, CorrectionTool, REPAIR_DIAGNOSTIC,
+        RepairDiagnosticTool, VALIDATE, ValidationTool,
     };
 
     fn api_valid_code() -> String {
@@ -221,10 +227,7 @@ fn implementar_handlers() {
             errors: vec!["error".to_string()],
         };
         let client = ScriptModelClient::new(vec![serialize_decision(&decision)]);
-        let session = AiSessionConfig {
-            user_request: "r".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("r".to_string(), "Api".to_string());
         let mut agent = AiAgent::new(Box::new(client), session);
         let mut ctx = AgentContext::new("ai");
         ctx.step = 1;
@@ -235,10 +238,7 @@ fn implementar_handlers() {
     #[test]
     fn ai_agent_rejects_invalid_response_without_tool_execution() {
         let client = MockModelClient::invalid();
-        let session = AiSessionConfig {
-            user_request: "r".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("r".to_string(), "Api".to_string());
         let mut agent = AiAgent::new(Box::new(client), session);
         let action = agent.propose(&AgentContext::new("ai"));
         assert!(matches!(action, AgentAction::Finish { .. }));
@@ -256,10 +256,7 @@ fn implementar_handlers() {
             }],
         };
         let client = ScriptModelClient::new(vec![serialize_decision(&decision)]);
-        let session = AiSessionConfig {
-            user_request: "r".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("r".to_string(), "Api".to_string());
         let mut agent = AiAgent::new(Box::new(client), session);
         let mut ctx = AgentContext::new("ai").with_working_code("Servidor NET");
         ctx.step = 1;
@@ -288,10 +285,7 @@ fn implementar_handlers() {
             ToolPermissionConstraint::default_constructor_tools(),
         ));
 
-        let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string());
         let mut agent = AiAgent::new(Box::new(MockModelClient::new()), session);
         let ctx = AgentContext::new("ai-e2e").with_working_code(invalid);
 
@@ -324,10 +318,7 @@ fn implementar_handlers() {
             ToolPermissionConstraint::default_constructor_tools(),
         ));
 
-        let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string());
         let mut agent = AiAgent::new(Box::new(MockModelClient::invalid()), session);
         let result = AgentLoop::new(3).run(
             &harness,
@@ -354,10 +345,7 @@ fn implementar_handlers() {
                     .satisfying([crate::harness::RequirementId::new("req")]),
             ]);
         let client = MockModelClient::new();
-        let session = AiSessionConfig {
-            user_request: "compilar".to_string(),
-            plan_kind: "Generic".to_string(),
-        };
+        let session = AiSessionConfig::new("compilar".to_string(), "Generic".to_string());
         let mut agent = AiAgent::new(Box::new(client), session);
         let ctx = AgentContext::new("ai-gap")
             .with_working_code("fn main() {}")
@@ -377,6 +365,106 @@ fn implementar_handlers() {
             &ModelDecision::Compile {
                 code: "fn main() {}".to_string(),
             }
+        );
+    }
+
+    struct AlwaysFinishModelClient;
+
+    impl ModelClient for AlwaysFinishModelClient {
+        fn complete(
+            &self,
+            _request: &crate::harness::model::ModelRequest,
+        ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+            Ok(crate::harness::model::ModelResponse {
+                raw_text: serialize_decision(&ModelDecision::Finish {
+                    summary: "premature from model".to_string(),
+                }),
+            })
+        }
+    }
+
+    #[test]
+    fn ai_agent_gap_guidance_redirects_premature_finish_from_model() {
+        use crate::harness::criterion::CriterionKind;
+        use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+
+        let spec = Specification::new("spec-gap-guidance", "compilar")
+            .with_requirements(vec![Requirement::new("req", "compilar")])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-c", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req")]),
+            ]);
+        let session = AiSessionConfig::new("compilar", "Generic").with_gap_guidance(true);
+        let mut agent = AiAgent::new(Box::new(AlwaysFinishModelClient), session);
+        let ctx = AgentContext::new("gap-guidance-on")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(spec);
+        let action = agent.propose(&ctx);
+        assert!(matches!(action, AgentAction::Compile { .. }));
+        assert!(matches!(
+            agent
+                .trace
+                .parsed_decisions
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+            ModelDecision::Compile { .. }
+        ));
+    }
+
+    #[test]
+    fn ai_agent_gap_guidance_disabled_preserves_finish_proposal() {
+        use crate::harness::criterion::CriterionKind;
+        use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+
+        let spec = Specification::new("spec-gap-off", "compilar")
+            .with_requirements(vec![Requirement::new("req", "compilar")])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-c", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req")]),
+            ]);
+        let session = AiSessionConfig::new("compilar", "Generic");
+        let mut agent = AiAgent::new(Box::new(AlwaysFinishModelClient), session);
+        let ctx = AgentContext::new("gap-guidance-off")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(spec);
+        let action = agent.propose(&ctx);
+        assert!(matches!(action, AgentAction::Finish { .. }));
+    }
+
+    #[test]
+    fn ai_agent_gap_guidance_does_not_spin_on_finish_in_loop() {
+        use crate::harness::criterion::CriterionKind;
+        use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+
+        let spec = Specification::new("spec-gap-loop", "compilar")
+            .with_requirements(vec![Requirement::new("req", "compilar")])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-c", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req")]),
+            ]);
+        let mut harness = Harness::new(10);
+        harness.register_tool(Box::new(CompileTool));
+        harness.register_constraint(Box::new(
+            ToolPermissionConstraint::default_constructor_tools(),
+        ));
+        let session = AiSessionConfig::new("compilar", "Generic").with_gap_guidance(true);
+        let mut agent = AiAgent::new(Box::new(AlwaysFinishModelClient), session);
+        let ctx = AgentContext::new("gap-loop")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(spec);
+        let result = AgentLoop::new(4).run(&harness, &mut agent, ctx);
+        assert!(result.tools_executed().contains(&COMPILE.to_string()));
+        assert!(
+            result
+                .history
+                .proposed_actions
+                .iter()
+                .filter(|action| matches!(action, AgentAction::Finish { .. }))
+                .count()
+                < 4,
+            "gap guidance no debe re-proponer Finish en cada iteración"
         );
     }
 }
