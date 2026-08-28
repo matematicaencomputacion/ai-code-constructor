@@ -1828,11 +1828,16 @@ impl MockModelClient {
                 }
             }
             Some(obs) if obs.kind == "action_rejected" => {
-                // Finish bloqueado por criterio en FAIL: reparar, no spamear Compile.
-                if obs.summary.contains("en FAIL") {
+                if obs.summary.contains("en FAIL")
+                    || request.diagnostic_context.compile_status.as_deref() == Some("error")
+                {
                     ModelDecision::RepairDiagnostic {
-                        errors: mock_repair_errors(request, obs),
+                        errors: diagnostic_errors_from_request(request),
                     }
+                } else if let Some(decision) =
+                    self.decision_from_recommendation_if_unsatisfied(request)
+                {
+                    decision
                 } else {
                     ModelDecision::Compile {
                         code: request.working_code.clone().unwrap_or_default(),
@@ -1934,9 +1939,15 @@ impl MockModelClient {
                     }
                 }
             }
-            Some(_) => ModelDecision::Finish {
-                summary: "ai mock stop".to_string(),
-            },
+            Some(_) => {
+                if let Some(decision) = self.decision_from_recommendation_if_unsatisfied(request) {
+                    decision
+                } else {
+                    ModelDecision::Finish {
+                        summary: "ai mock stop".to_string(),
+                    }
+                }
+            }
         }
     }
 
@@ -2051,10 +2062,32 @@ fn infer_corrections_from_diagnostic_context(request: &ModelRequest) -> Vec<Stru
     infer_validation_corrections_from_diagnostics(request)
 }
 
+fn compile_stderr_from_request(request: &ModelRequest) -> String {
+    let mut parts = request.diagnostic_context.compiler_stderr.clone();
+    for (label, detail) in &request.diagnostic_context.evidence_pairs {
+        if label == "compiler_stderr" && !parts.contains(detail) {
+            parts.push(detail.clone());
+        }
+    }
+    for (label, detail) in &request.recent_evidence {
+        if label == "compiler_stderr" && !parts.contains(detail) {
+            parts.push(detail.clone());
+        }
+    }
+    if let Some(obs) = &request.last_observation {
+        for (label, detail) in &obs.evidence_details {
+            if label == "compiler_stderr" && !parts.contains(detail) {
+                parts.push(detail.clone());
+            }
+        }
+    }
+    parts.join("\n")
+}
+
 fn infer_compile_corrections_from_diagnostics(
     request: &ModelRequest,
 ) -> Option<Vec<StructuredCorrection>> {
-    let stderr = request.diagnostic_context.compiler_stderr.join("\n");
+    let stderr = compile_stderr_from_request(request);
     if stderr.trim().is_empty() {
         return None;
     }
@@ -2182,6 +2215,28 @@ fn extract_found_token_from_stderr(stderr: &str) -> Option<String> {
                         return Some(token);
                     }
                 }
+            }
+        }
+    }
+    for line in stderr.lines() {
+        if !line.contains("error") {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find('`') {
+            let after = &rest[start + 1..];
+            if let Some(end) = after.find('`') {
+                let token = &after[..end];
+                if !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
+                    return Some(token.to_string());
+                }
+                rest = &after[end + 1..];
+            } else {
+                break;
             }
         }
     }
