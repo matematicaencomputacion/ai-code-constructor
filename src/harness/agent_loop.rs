@@ -193,10 +193,7 @@ mod tests {
         }
 
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
-            ToolResult::success(
-                input.to_string(),
-                vec![Evidence::new("echo_output", input)],
-            )
+            ToolResult::success(input.to_string(), vec![Evidence::new("echo_output", input)])
         }
     }
 

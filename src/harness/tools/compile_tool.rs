@@ -27,13 +27,13 @@ impl Tool for CompileTool {
     fn execute(&self, _input: &str, ctx: &AgentContext) -> ToolResult {
         let Some(artifact) = ctx.working_artifact.as_ref() else {
             return ToolResult::failure(
-            format!("working_artifact ausente para tool `{COMPILE}`"),
-            vec![
-                Evidence::new("tool", COMPILE),
-                Evidence::new("compile_status", "error"),
-                Evidence::new("missing_artifact", "working_artifact required"),
-            ],
-        );
+                format!("working_artifact ausente para tool `{COMPILE}`"),
+                vec![
+                    Evidence::new("tool", COMPILE),
+                    Evidence::new("compile_status", "error"),
+                    Evidence::new("missing_artifact", "working_artifact required"),
+                ],
+            );
         };
 
         let materialization = match ArtifactMaterialization::from_artifact(artifact) {

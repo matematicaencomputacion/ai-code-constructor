@@ -108,7 +108,10 @@ impl Tool for FileOperationsTool {
         let preview = match preview_file_operations_to_artifact(base_artifact, &operations) {
             Ok(value) => value,
             Err(error) => {
-                return ToolResult::failure(error.clone(), file_operation_error_evidence(&operations, &error));
+                return ToolResult::failure(
+                    error.clone(),
+                    file_operation_error_evidence(&operations, &error),
+                );
             }
         };
 

@@ -161,28 +161,17 @@ impl Harness {
                 self.dispatch_named_tool(action, tools::REPAIR_DIAGNOSTIC, &input, ctx)
             }
             AgentAction::ApplyCorrection { .. } | AgentAction::ApplyFileOperations { .. } => {
-                let outcome = match action.clone() {
+                match action.clone() {
                     AgentAction::ApplyCorrection { corrections } => {
                         let input = tools::encode_correction_input(&corrections);
-                        self.commit_mutation_tool(
-                            action,
-                            tools::APPLY_CORRECTION,
-                            &input,
-                            ctx,
-                        )
+                        self.commit_mutation_tool(action, tools::APPLY_CORRECTION, &input, ctx)
                     }
                     AgentAction::ApplyFileOperations { operations } => {
                         let input = tools::encode_file_operations_input(&operations);
-                        self.commit_mutation_tool(
-                            action,
-                            tools::APPLY_FILE_OPERATIONS,
-                            &input,
-                            ctx,
-                        )
+                        self.commit_mutation_tool(action, tools::APPLY_FILE_OPERATIONS, &input, ctx)
                     }
                     _ => unreachable!("mutation actions only"),
-                };
-                outcome
+                }
             }
             AgentAction::InvokeTool { tool_name, input } => {
                 self.dispatch_named_tool(action, &tool_name, &input, ctx)

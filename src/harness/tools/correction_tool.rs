@@ -292,8 +292,8 @@ fn describe_operation(operation: &CorrectionOperation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::artifact_mutation::commit_artifact_preview;
     use crate::harness::artifact::{ArtifactId, RustArtifact};
+    use crate::harness::artifact_mutation::commit_artifact_preview;
     use crate::harness::specification::Specification;
 
     #[test]
