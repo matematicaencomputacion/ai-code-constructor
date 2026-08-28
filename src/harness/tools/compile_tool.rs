@@ -7,11 +7,17 @@
 
 use std::process::Command;
 
+#[cfg(test)]
+use std::sync::Mutex;
+
 use crate::harness::artifact_materialization::ArtifactMaterialization;
 use crate::harness::context::AgentContext;
 use crate::harness::evaluation::Evidence;
 use crate::harness::tool::{Tool, ToolResult};
 use crate::harness::tools::COMPILE;
+
+#[cfg(test)]
+static COMPILE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Compila el working Artifact (single- o multi-file) como crate temporal.
 ///
@@ -49,6 +55,12 @@ impl Tool for CompileTool {
                 );
             }
         };
+
+        // En tests, serializar cargo check: ejecución paralela compite por locks del cache.
+        #[cfg(test)]
+        let _compile_guard = COMPILE_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // `cargo check`: verificación de compilación del crate completo (todos los files).
         // Suficiente para CriterionKind::Compile / compile_status; no requiere binario.

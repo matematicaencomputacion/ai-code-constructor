@@ -2095,6 +2095,18 @@ fn compile_failed_in_request(request: &ModelRequest) -> bool {
     if request.diagnostic_context.compile_status.as_deref() == Some("error") {
         return true;
     }
+    if request.recommended_action.as_ref().is_some_and(|rec| {
+        rec.kind == "RepairDiagnostic" && rec.criterion_kind.as_deref() == Some("Compile")
+    }) {
+        return true;
+    }
+    for obs in &request.recent_observations {
+        if obs.criterion_kind.as_deref() == Some("Compile")
+            && obs.evaluation_verdict.as_deref() == Some("Fail")
+        {
+            return true;
+        }
+    }
     request.last_observation.as_ref().is_some_and(|obs| {
         obs.criterion_kind.as_deref() == Some("Compile")
             && obs.evaluation_verdict.as_deref() == Some("Fail")
