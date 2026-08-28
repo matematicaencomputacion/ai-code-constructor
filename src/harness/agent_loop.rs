@@ -193,11 +193,10 @@ mod tests {
         }
 
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
-            ToolResult {
-                success: true,
-                output: input.to_string(),
-                evidence: vec![Evidence::new("echo_output", input)],
-            }
+            ToolResult::success(
+                input.to_string(),
+                vec![Evidence::new("echo_output", input)],
+            )
         }
     }
 
@@ -215,11 +214,10 @@ mod tests {
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
             self.executed.store(true, Ordering::SeqCst);
             self.calls.fetch_add(1, Ordering::SeqCst);
-            ToolResult {
-                success: true,
-                output: input.to_string(),
-                evidence: vec![Evidence::new("tracking", self.name)],
-            }
+            ToolResult::success(
+                input.to_string(),
+                vec![Evidence::new("tracking", self.name)],
+            )
         }
     }
 
@@ -656,11 +654,10 @@ fn implementar_handlers() {
             }
 
             fn execute(&self, _input: &str, _ctx: &AgentContext) -> ToolResult {
-                ToolResult {
-                    success: true,
-                    output: "incomplete".to_string(),
-                    evidence: vec![Evidence::new("tool", COMPILE)],
-                }
+                ToolResult::success(
+                    "incomplete".to_string(),
+                    vec![Evidence::new("tool", COMPILE)],
+                )
             }
         }
 

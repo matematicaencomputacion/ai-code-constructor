@@ -506,6 +506,7 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - Live quality demo wiring (`LiveSessionConfig::quality_verification_artifact`)
 - LiveSession can start from `LiveSessionConfig::from_specification` (Specification → Plan → Builder → Initial Artifact, including multi-file Authentication)
 - Artifacts can evolve structurally via `apply_file_operations` (`create_file`, `delete_file`, `rename_file`) on the canonical `RustArtifact`
+- Mutation tools preview changes (`ToolResult.artifact_preview`); the Harness performs a single canonical commit (`commit_artifact_preview`). Correction batches are atomic (+1 `revision` per successful batch, same as file operations)
 - CI quality gate
 
 ### Experimental
