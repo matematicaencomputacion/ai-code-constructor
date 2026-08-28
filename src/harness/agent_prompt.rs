@@ -47,6 +47,8 @@ User message context:
 - goal_evaluation_*: summary of Goal status (Satisfied / Unsatisfied / Inconclusive), criteria counts, and evaluation message.
 - goal_gap_*: unsatisfied AcceptanceCriteria with kind, verdict, message, and suggested_action (tool name hint).
 - recommended_action_*: operational directive from the deterministic Goal layer (kind, tool, criterion, priority, reason). When present and goal_evaluation_status is not Satisfied, you MUST follow it.
+- diagnostic_compiler_stderr_N, diagnostic_validator_errors, diagnostic_repairer_feedback, diagnostic_evidence_N_label/detail: aggregated Tool diagnostics preserved across turns.
+- recent_evidence_N_label/detail and last_observation_evidence_N_label/detail: Evidence label+detail pairs from recent Observations.
 
 RecommendedAction contract (system decides WHAT; you decide HOW within the action class):
 - FinishAllowed: goal satisfied; you MAY respond with finish.
@@ -64,7 +66,8 @@ Decision policy:
 - Read last_observation_summary, validator_errors, repairer_feedback, evaluation_verdict, criterion_kind, working_code, artifact_files, goal_evaluation, goal_gap, and recommended_action.
 - When recommended_action_kind is present and goal_evaluation_status is not Satisfied, follow recommended_action_kind and recommended_action_tool; incompatible decisions are corrected deterministically by the Harness.
 - Finish ONLY when recommended_action_kind is FinishAllowed or goal_evaluation_status is Satisfied.
-- After validation FAIL: prefer repair_diagnostic.
+- After validation FAIL: prefer repair_diagnostic (populate errors from diagnostic_validator_errors or validator_errors).
+- After compile FAIL (CriterionEvaluated Fail + Compile): prefer repair_diagnostic using diagnostic_compiler_stderr.
 - After repair feedback: prefer apply_correction with minimal edits.
 - After apply_correction success: re-validate.
 - After validation PASS: compile when compilation is still required.

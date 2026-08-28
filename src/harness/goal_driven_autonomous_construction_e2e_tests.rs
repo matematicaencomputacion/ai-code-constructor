@@ -25,8 +25,7 @@ mod tests {
         collect_evidence_from_context, select_primary_recommendation,
     };
     use crate::harness::model::{
-        AiSessionConfig, MockModelClient, ModelClient, ModelDecision, ModelError, ModelRequest,
-        ModelResponse, StructuredCorrection, serialize_decision, structured_to_correction,
+        AiSessionConfig, DiagnosticContextModelClient, MockModelClient, ModelDecision,
     };
     use crate::harness::observation::AgentObservation;
     use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
@@ -102,113 +101,6 @@ fn implementar_handlers() {
                 AcceptanceCriterion::new("ac-compile", "compila", CriterionKind::Compile)
                     .satisfying([crate::harness::RequirementId::new("req-c")]),
             ])
-    }
-
-    /// Mock que respeta RecommendedAction y repara `broken` → `42` tras RepairDiagnostic.
-    #[derive(Debug, Clone, Default)]
-    struct BrokenHelperRepairModelClient;
-
-    impl ModelClient for BrokenHelperRepairModelClient {
-        fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
-            let decision = if let Some(obs) = &request.last_observation {
-                match obs.kind.as_str() {
-                    "criterion_evaluated" if obs.evaluation_verdict.as_deref() == Some("Fail") => {
-                        ModelDecision::RepairDiagnostic {
-                            errors: vec![
-                                obs.evaluation_message
-                                    .clone()
-                                    .unwrap_or_else(|| "compilación fallida".to_string()),
-                            ],
-                        }
-                    }
-                    "tool_outcome"
-                        if obs.tool_name.as_deref() == Some(REPAIR_DIAGNOSTIC)
-                            && obs.success == Some(true) =>
-                    {
-                        ModelDecision::ApplyCorrection {
-                            corrections: vec![StructuredCorrection::ReplaceText {
-                                path: Some("src/helper.rs".to_string()),
-                                search: "broken".to_string(),
-                                replacement: "42".to_string(),
-                            }],
-                        }
-                    }
-                    "tool_outcome"
-                        if obs.tool_name.as_deref() == Some(APPLY_CORRECTION)
-                            && obs.success == Some(true) =>
-                    {
-                        ModelDecision::Compile {
-                            code: request.working_code.clone().unwrap_or_default(),
-                        }
-                    }
-                    "tool_outcome"
-                        if obs.tool_name.as_deref() == Some(COMPILE)
-                            && obs.success == Some(true) =>
-                    {
-                        if request
-                            .goal_evaluation
-                            .as_ref()
-                            .is_some_and(|eval| eval.status == "Satisfied")
-                        {
-                            ModelDecision::Finish {
-                                summary: "goal satisfied tras reparar helper".to_string(),
-                            }
-                        } else {
-                            ModelDecision::Compile {
-                                code: request.working_code.clone().unwrap_or_default(),
-                            }
-                        }
-                    }
-                    "criterion_evaluated" if obs.evaluation_verdict.as_deref() == Some("Pass") => {
-                        if request
-                            .goal_evaluation
-                            .as_ref()
-                            .is_some_and(|eval| eval.status == "Satisfied")
-                        {
-                            ModelDecision::Finish {
-                                summary: "goal satisfied".to_string(),
-                            }
-                        } else {
-                            ModelDecision::Compile {
-                                code: request.working_code.clone().unwrap_or_default(),
-                            }
-                        }
-                    }
-                    _ => {
-                        if let Some(rec) = &request.recommended_action {
-                            if let Some(fallback) =
-                                crate::harness::model::model_decision_from_recommended_action(
-                                    rec, request,
-                                )
-                            {
-                                fallback
-                            } else {
-                                ModelDecision::Finish {
-                                    summary: "mock stop".to_string(),
-                                }
-                            }
-                        } else {
-                            ModelDecision::Finish {
-                                summary: "mock stop".to_string(),
-                            }
-                        }
-                    }
-                }
-            } else if let Some(rec) = &request.recommended_action {
-                crate::harness::model::model_decision_from_recommended_action(rec, request)
-                    .unwrap_or(ModelDecision::Compile {
-                        code: request.working_code.clone().unwrap_or_default(),
-                    })
-            } else {
-                ModelDecision::Compile {
-                    code: request.working_code.clone().unwrap_or_default(),
-                }
-            };
-
-            Ok(ModelResponse {
-                raw_text: serialize_decision(&decision),
-            })
-        }
     }
 
     /// E2E principal: defecto de validación → reparación → goal satisfecha.
@@ -378,7 +270,7 @@ fn implementar_handlers() {
     fn goal_driven_autonomous_construction_multi_file_repair_e2e() {
         use crate::harness::action_policy::ActionPolicy;
         use crate::harness::goal_driven::GoalDrivenLoop;
-        use crate::harness::live_session::build_validate_compile_harness_with_policy;
+        use crate::harness::live_session::build_diagnostic_compile_harness_with_policy;
 
         let spec = compile_only_spec("spec-gd-helper-e2e");
         let goal = Goal::from_specification(spec.clone());
@@ -402,10 +294,10 @@ fn implementar_handlers() {
         );
 
         let session = AiSessionConfig::new("compilar helper", "Generic").with_gap_guidance(true);
-        let mut agent = AiAgent::new(Box::new(BrokenHelperRepairModelClient), session);
+        let mut agent = AiAgent::new(Box::new(DiagnosticContextModelClient::new()), session);
         let mut loop_ = GoalDrivenLoop::with_defaults(10);
         let harness =
-            build_validate_compile_harness_with_policy(ActionPolicy::default_session_policy());
+            build_diagnostic_compile_harness_with_policy(ActionPolicy::default_session_policy());
 
         let run_ctx = AgentContext::new("gd-helper-e2e")
             .with_working_artifact(initial_artifact)
@@ -464,27 +356,20 @@ fn implementar_handlers() {
             .expect("artifact final");
         let final_helper = final_artifact.file(&helper_path).expect("helper final");
         assert_ne!(final_helper, initial_helper.as_str());
-        assert!(final_helper.contains("42"));
         assert!(!final_helper.contains("broken"));
+        assert!(
+            final_helper.contains('0'),
+            "corrección genérica debe producir literal numérico válido: {final_helper}"
+        );
 
-        let correction = structured_to_correction(&StructuredCorrection::ReplaceText {
-            path: Some("src/helper.rs".to_string()),
-            search: "broken".to_string(),
-            replacement: "42".to_string(),
-        })
-        .expect("correction");
         assert!(
             result
                 .loop_result
                 .history
                 .proposed_actions
                 .iter()
-                .any(|a| matches!(
-                    a,
-                    AgentAction::ApplyCorrection { corrections }
-                        if corrections.iter().any(|c| c == &correction)
-                )),
-            "debe proponer ApplyCorrection con reemplazo broken→42"
+                .any(|a| matches!(a, AgentAction::ApplyCorrection { .. })),
+            "debe proponer ApplyCorrection derivado del contexto diagnóstico"
         );
     }
 }

@@ -40,6 +40,17 @@ impl AiSessionConfig {
     }
 }
 
+/// Contexto diagnóstico agregado desde observaciones recientes (Tools → Evidence).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SerializedDiagnosticContext {
+    pub compile_status: Option<String>,
+    pub compiler_stderr: Vec<String>,
+    pub validator_errors: Vec<String>,
+    pub repairer_feedback: Vec<String>,
+    /// Pares label→detail de evidencia diagnóstica reciente (sin truncar agresivamente).
+    pub evidence_pairs: Vec<(String, String)>,
+}
+
 /// Observación serializada para el modelo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SerializedObservation {
@@ -50,6 +61,8 @@ pub struct SerializedObservation {
     pub validator_errors: Vec<String>,
     pub repairer_feedback: Vec<String>,
     pub evidence_labels: Vec<String>,
+    /// Detalle de evidencia diagnóstica (p. ej. compiler_stderr completo hasta límite).
+    pub evidence_details: Vec<(String, String)>,
     /// Verdict de Evaluation (`Pass` / `Fail` / `InsufficientEvidence`), si aplica.
     pub evaluation_verdict: Option<String>,
     pub specification_id: Option<String>,
@@ -140,6 +153,8 @@ pub struct ModelRequest {
     pub goal_gap: Option<SerializedGoalGap>,
     /// Acción recomendada primaria derivada de Goal + evaluación + gap.
     pub recommended_action: Option<SerializedRecommendedAction>,
+    /// Evidencia diagnóstica agregada de Tools recientes (compile, validate, repair).
+    pub diagnostic_context: SerializedDiagnosticContext,
     /// Prompt system versionado incluido en cada petición al modelo.
     pub system_prompt: String,
 }
@@ -359,6 +374,7 @@ pub fn model_request_from_context(
         .collect::<Vec<_>>();
 
     let recent_evidence = collect_recent_evidence(ctx);
+    let diagnostic_context = collect_diagnostic_context(ctx);
 
     let (artifact_primary_path, artifact_files) = ctx
         .working_artifact
@@ -414,8 +430,231 @@ pub fn model_request_from_context(
         goal_evaluation,
         goal_gap,
         recommended_action,
+        diagnostic_context,
         system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
     })
+}
+
+const DIAGNOSTIC_EVIDENCE_LABELS: &[&str] = &[
+    "compiler_stderr",
+    "compile_status",
+    "spawn_error",
+    "materialization_error",
+    "validate_status",
+    "diagnostic_status",
+    "correction_status",
+];
+
+fn is_diagnostic_evidence_label(label: &str) -> bool {
+    DIAGNOSTIC_EVIDENCE_LABELS.contains(&label)
+        || label.starts_with("validator_error_")
+        || label.starts_with("repairer_feedback_")
+}
+
+fn collect_diagnostic_context(ctx: &AgentContext) -> SerializedDiagnosticContext {
+    let mut compile_status = None;
+    let mut compiler_stderr = Vec::new();
+    let mut validator_errors = Vec::new();
+    let mut repairer_feedback = Vec::new();
+    let mut evidence_pairs = Vec::new();
+
+    for observation in ctx.observation_history.iter().rev().take(8) {
+        let obs_errors: Vec<String> = observation
+            .validator_errors()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for error in obs_errors {
+            if !validator_errors.contains(&error) {
+                validator_errors.push(error);
+            }
+        }
+
+        let obs_feedback: Vec<String> = observation
+            .repairer_feedback()
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        for item in obs_feedback {
+            if !repairer_feedback.contains(&item) {
+                repairer_feedback.push(item);
+            }
+        }
+
+        let evidence = match observation {
+            AgentObservation::ToolOutcome { evidence, .. }
+            | AgentObservation::CriterionEvaluated { evidence, .. } => evidence,
+            AgentObservation::SpecificationEvaluated { criteria, .. } => {
+                let flat: Vec<_> = criteria
+                    .iter()
+                    .flat_map(|item| item.evidence_used.iter())
+                    .collect();
+                for item in &flat {
+                    push_diagnostic_evidence(
+                        item,
+                        &mut compile_status,
+                        &mut compiler_stderr,
+                        &mut validator_errors,
+                        &mut repairer_feedback,
+                        &mut evidence_pairs,
+                    );
+                }
+                continue;
+            }
+            _ => continue,
+        };
+
+        for item in evidence {
+            push_diagnostic_evidence(
+                item,
+                &mut compile_status,
+                &mut compiler_stderr,
+                &mut validator_errors,
+                &mut repairer_feedback,
+                &mut evidence_pairs,
+            );
+        }
+    }
+
+    SerializedDiagnosticContext {
+        compile_status,
+        compiler_stderr,
+        validator_errors,
+        repairer_feedback,
+        evidence_pairs,
+    }
+}
+
+fn push_diagnostic_evidence(
+    item: &crate::harness::evaluation::Evidence,
+    compile_status: &mut Option<String>,
+    compiler_stderr: &mut Vec<String>,
+    validator_errors: &mut Vec<String>,
+    repairer_feedback: &mut Vec<String>,
+    evidence_pairs: &mut Vec<(String, String)>,
+) {
+    if !is_diagnostic_evidence_label(&item.label) {
+        return;
+    }
+    let detail = truncate_diagnostic_detail(&item.detail);
+    if evidence_pairs
+        .iter()
+        .any(|(label, value)| label == &item.label && value == &detail)
+    {
+        return;
+    }
+    evidence_pairs.push((item.label.clone(), detail.clone()));
+
+    match item.label.as_str() {
+        "compile_status" if compile_status.is_none() => {
+            *compile_status = Some(detail.clone());
+        }
+        "compiler_stderr" if !compiler_stderr.contains(&detail) => {
+            compiler_stderr.push(detail);
+        }
+        label if label.starts_with("validator_error_") => {
+            if !validator_errors.contains(&detail) {
+                validator_errors.push(detail);
+            }
+        }
+        label
+            if label.starts_with("repairer_feedback_") && !repairer_feedback.contains(&detail) =>
+        {
+            repairer_feedback.push(detail);
+        }
+        _ => {}
+    }
+}
+
+fn truncate_diagnostic_detail(text: &str) -> String {
+    if text.chars().count() <= 4_000 {
+        text.to_string()
+    } else {
+        format!("{}…", text.chars().take(4_000).collect::<String>())
+    }
+}
+
+/// Emite contexto diagnóstico agregado en el mensaje de usuario del modelo.
+pub fn append_diagnostic_context_to_message_parts(
+    parts: &mut Vec<String>,
+    context: &SerializedDiagnosticContext,
+) {
+    if let Some(status) = &context.compile_status {
+        parts.push(format!("diagnostic_compile_status={status}"));
+    }
+    for (index, stderr) in context.compiler_stderr.iter().enumerate() {
+        parts.push(format!("diagnostic_compiler_stderr_{index}={stderr}"));
+    }
+    if !context.validator_errors.is_empty() {
+        parts.push(format!(
+            "diagnostic_validator_errors={}",
+            context.validator_errors.join(" | ")
+        ));
+    }
+    if !context.repairer_feedback.is_empty() {
+        parts.push(format!(
+            "diagnostic_repairer_feedback={}",
+            context.repairer_feedback.join(" | ")
+        ));
+    }
+    for (index, (label, detail)) in context.evidence_pairs.iter().enumerate() {
+        parts.push(format!("diagnostic_evidence_{index}_label={label}"));
+        parts.push(format!("diagnostic_evidence_{index}_detail={detail}"));
+    }
+}
+
+/// Emite evidencia reciente (label+detail) en el mensaje de usuario.
+pub fn append_recent_evidence_to_message_parts(
+    parts: &mut Vec<String>,
+    evidence: &[(String, String)],
+) {
+    for (index, (label, detail)) in evidence.iter().enumerate() {
+        parts.push(format!("recent_evidence_{index}_label={label}"));
+        parts.push(format!("recent_evidence_{index}_detail={detail}"));
+    }
+}
+
+fn is_diagnostic_noise(error: &str) -> bool {
+    error.starts_with("rejected:")
+        || error.starts_with("tool:repair_diagnostic:")
+        || error.contains("Finish bloqueado")
+}
+
+fn sanitize_diagnostic_errors(errors: Vec<String>) -> Vec<String> {
+    let filtered: Vec<String> = errors
+        .into_iter()
+        .filter(|error| !is_diagnostic_noise(error))
+        .collect();
+    if filtered.is_empty() {
+        vec!["diagnóstico requerido".to_string()]
+    } else {
+        filtered
+    }
+}
+
+fn diagnostic_errors_from_request(request: &ModelRequest) -> Vec<String> {
+    let stderr = compile_stderr_from_request(request);
+    if !stderr.trim().is_empty() {
+        return sanitize_diagnostic_errors(vec![stderr]);
+    }
+
+    let mut errors = request.diagnostic_context.validator_errors.clone();
+    if errors.is_empty() {
+        errors = request
+            .last_observation
+            .as_ref()
+            .map(|obs| obs.validator_errors.clone())
+            .unwrap_or_default();
+    }
+    if errors.is_empty()
+        && let Some(obs) = &request.last_observation
+        && let Some(message) = &obs.evaluation_message
+        && !message.is_empty()
+        && !is_diagnostic_noise(message)
+    {
+        errors.push(message.clone());
+    }
+    sanitize_diagnostic_errors(errors)
 }
 
 fn artifact_file_snapshots_from_artifact(
@@ -759,9 +998,7 @@ pub fn model_decision_from_recommended_action(
             let kind = parse_criterion_kind_label(kind_label)?;
             decision_for_criterion_kind(kind, request)
         }
-        "RepairDiagnostic" => Some(ModelDecision::RepairDiagnostic {
-            errors: vec![action.reason.clone()],
-        }),
+        "RepairDiagnostic" => Some(repair_diagnostic_decision(request)),
         "NoDeterministicAction" => None,
         _ => None,
     }
@@ -874,6 +1111,7 @@ fn serialize_observation(observation: &AgentObservation) -> SerializedObservatio
                 .collect(),
             _ => Vec::new(),
         },
+        evidence_details: diagnostic_evidence_details(observation),
         evaluation_verdict,
         specification_id: observation
             .specification_id()
@@ -893,6 +1131,24 @@ fn serialize_observation(observation: &AgentObservation) -> SerializedObservatio
             _ => None,
         },
     }
+}
+
+fn diagnostic_evidence_details(observation: &AgentObservation) -> Vec<(String, String)> {
+    let evidence: Vec<&crate::harness::evaluation::Evidence> = match observation {
+        AgentObservation::ToolOutcome { evidence, .. }
+        | AgentObservation::CriterionEvaluated { evidence, .. } => evidence.iter().collect(),
+        AgentObservation::SpecificationEvaluated { criteria, .. } => criteria
+            .iter()
+            .flat_map(|item| item.evidence_used.iter())
+            .collect(),
+        _ => return Vec::new(),
+    };
+
+    evidence
+        .iter()
+        .filter(|item| is_diagnostic_evidence_label(&item.label))
+        .map(|item| (item.label.clone(), truncate_diagnostic_detail(&item.detail)))
+        .collect()
 }
 
 fn observation_kind(observation: &AgentObservation) -> String {
@@ -1593,11 +1849,14 @@ impl MockModelClient {
                 }
             }
             Some(obs) if obs.kind == "action_rejected" => {
-                // Finish bloqueado por criterio en FAIL: reparar, no spamear Compile.
-                if obs.summary.contains("en FAIL") {
-                    ModelDecision::RepairDiagnostic {
-                        errors: mock_repair_errors(request, obs),
-                    }
+                if obs.summary.contains("en FAIL")
+                    || request.diagnostic_context.compile_status.as_deref() == Some("error")
+                {
+                    repair_diagnostic_decision(request)
+                } else if let Some(decision) =
+                    self.decision_from_recommendation_if_unsatisfied(request)
+                {
+                    decision
                 } else {
                     ModelDecision::Compile {
                         code: request.working_code.clone().unwrap_or_default(),
@@ -1630,9 +1889,7 @@ impl MockModelClient {
                 if obs.kind == "criterion_evaluated"
                     && obs.evaluation_verdict.as_deref() == Some("Fail") =>
             {
-                ModelDecision::RepairDiagnostic {
-                    errors: mock_repair_errors(request, obs),
-                }
+                repair_diagnostic_decision(request)
             }
             Some(obs)
                 if obs.tool_name.as_deref() == Some(VALIDATE) && obs.success == Some(false) =>
@@ -1645,20 +1902,32 @@ impl MockModelClient {
                 if obs.tool_name.as_deref() == Some(REPAIR_DIAGNOSTIC)
                     && obs.success == Some(true) =>
             {
-                let corrections = infer_mock_corrections(request);
-                ModelDecision::ApplyCorrection { corrections }
+                let corrections = infer_corrections_from_diagnostic_context(request);
+                if corrections.is_empty() {
+                    ModelDecision::Compile {
+                        code: request.working_code.clone().unwrap_or_default(),
+                    }
+                } else {
+                    ModelDecision::ApplyCorrection { corrections }
+                }
             }
             Some(obs)
                 if obs.tool_name.as_deref() == Some(APPLY_CORRECTION)
                     && obs.success == Some(true) =>
             {
-                ModelDecision::Validate {
-                    request: request.user_request.clone(),
-                    code: request.working_code.clone(),
-                    plan_kind: request
-                        .plan_kind
-                        .clone()
-                        .unwrap_or_else(|| "Generic".to_string()),
+                if should_recompile_after_correction(request) {
+                    ModelDecision::Compile {
+                        code: request.working_code.clone().unwrap_or_default(),
+                    }
+                } else {
+                    ModelDecision::Validate {
+                        request: request.user_request.clone(),
+                        code: request.working_code.clone(),
+                        plan_kind: request
+                            .plan_kind
+                            .clone()
+                            .unwrap_or_else(|| "Generic".to_string()),
+                    }
                 }
             }
             Some(obs)
@@ -1687,9 +1956,15 @@ impl MockModelClient {
                     }
                 }
             }
-            Some(_) => ModelDecision::Finish {
-                summary: "ai mock stop".to_string(),
-            },
+            Some(_) => {
+                if let Some(decision) = self.decision_from_recommendation_if_unsatisfied(request) {
+                    decision
+                } else {
+                    ModelDecision::Finish {
+                        summary: "ai mock stop".to_string(),
+                    }
+                }
+            }
         }
     }
 
@@ -1735,33 +2010,295 @@ impl ModelClient for MockModelClient {
     }
 }
 
-fn mock_repair_errors(request: &ModelRequest, obs: &SerializedObservation) -> Vec<String> {
-    let mut errors = obs.validator_errors.clone();
-    if errors.is_empty() {
-        for recent in request.recent_observations.iter().rev() {
-            if !recent.validator_errors.is_empty() {
-                errors = recent.validator_errors.clone();
-                break;
+fn mock_repair_errors(request: &ModelRequest, _obs: &SerializedObservation) -> Vec<String> {
+    diagnostic_errors_from_request(request)
+}
+
+fn should_recompile_after_correction(request: &ModelRequest) -> bool {
+    if request.diagnostic_context.compile_status.as_deref() == Some("error") {
+        return true;
+    }
+    if !request.diagnostic_context.compiler_stderr.is_empty() {
+        return true;
+    }
+    request.recommended_action.as_ref().is_some_and(|rec| {
+        rec.kind == "RepairDiagnostic"
+            || rec.criterion_kind.as_deref() == Some("Compile")
+            || rec.tool_name.as_deref() == Some(COMPILE)
+    })
+}
+
+fn infer_corrections_from_diagnostic_context(request: &ModelRequest) -> Vec<StructuredCorrection> {
+    if let Some(corrections) = infer_compile_corrections_from_diagnostics(request)
+        && !corrections.is_empty()
+    {
+        return corrections;
+    }
+    infer_validation_corrections_from_diagnostics(request)
+}
+
+fn compile_stderr_from_request(request: &ModelRequest) -> String {
+    let mut parts = request.diagnostic_context.compiler_stderr.clone();
+    for (label, detail) in &request.diagnostic_context.evidence_pairs {
+        if matches!(
+            label.as_str(),
+            "compiler_stderr" | "spawn_error" | "materialization_error"
+        ) && !parts.contains(detail)
+        {
+            parts.push(detail.clone());
+        }
+    }
+    for (label, detail) in &request.recent_evidence {
+        if matches!(
+            label.as_str(),
+            "compiler_stderr" | "spawn_error" | "materialization_error"
+        ) && !parts.contains(detail)
+        {
+            parts.push(detail.clone());
+        }
+    }
+    if let Some(obs) = &request.last_observation {
+        for (label, detail) in &obs.evidence_details {
+            if matches!(
+                label.as_str(),
+                "compiler_stderr" | "spawn_error" | "materialization_error"
+            ) && !parts.contains(detail)
+            {
+                parts.push(detail.clone());
             }
         }
     }
-    if errors.is_empty()
-        && let Some(msg) = &obs.evaluation_message
-        && !msg.is_empty()
-    {
-        errors.push(msg.clone());
-    }
-    if errors.is_empty() && !obs.summary.is_empty() {
-        errors.push(obs.summary.clone());
-    }
-    if errors.is_empty() {
-        errors.push("mock repair: validation failed".to_string());
-    }
-    errors
+    parts.join("\n")
 }
 
-fn infer_mock_corrections(request: &ModelRequest) -> Vec<StructuredCorrection> {
+fn infer_compile_corrections_from_diagnostics(
+    request: &ModelRequest,
+) -> Option<Vec<StructuredCorrection>> {
+    let stderr = compile_stderr_from_request(request);
+    if stderr.trim().is_empty() {
+        if has_unsatisfied_compile_gap(request) {
+            return infer_compile_corrections_from_artifact_files(request);
+        }
+        return None;
+    }
+
+    infer_compile_corrections_from_stderr(request, &stderr)
+}
+
+fn compile_tool_ran_in_request(request: &ModelRequest) -> bool {
+    if request.diagnostic_context.compile_status.is_some() {
+        return true;
+    }
+    if request
+        .diagnostic_context
+        .evidence_pairs
+        .iter()
+        .any(|(label, detail)| label == "tool" && detail == COMPILE)
+    {
+        return true;
+    }
+    request
+        .recent_observations
+        .iter()
+        .any(|obs| obs.tool_name.as_deref() == Some(COMPILE))
+}
+
+fn has_unsatisfied_compile_gap(request: &ModelRequest) -> bool {
+    request
+        .goal_gap
+        .as_ref()
+        .and_then(|gap| gap.primary())
+        .is_some_and(|primary| primary.kind == "Compile")
+        || request.recommended_action.as_ref().is_some_and(|rec| {
+            rec.criterion_kind.as_deref() == Some("Compile") && rec.kind != "FinishAllowed"
+        })
+}
+
+fn repair_diagnostic_decision(request: &ModelRequest) -> ModelDecision {
+    let errors = diagnostic_errors_from_request(request);
+    if errors.iter().all(|error| error == "diagnóstico requerido")
+        && !compile_tool_ran_in_request(request)
+        && has_unsatisfied_compile_gap(request)
+    {
+        return ModelDecision::Compile {
+            code: request.working_code.clone().unwrap_or_default(),
+        };
+    }
+    ModelDecision::RepairDiagnostic { errors }
+}
+
+fn compile_failed_in_request(request: &ModelRequest) -> bool {
+    if request.diagnostic_context.compile_status.as_deref() == Some("error") {
+        return true;
+    }
+    if compile_tool_ran_in_request(request) && has_unsatisfied_compile_gap(request) {
+        return true;
+    }
+    if request.recommended_action.as_ref().is_some_and(|rec| {
+        rec.kind == "RepairDiagnostic" && rec.criterion_kind.as_deref() == Some("Compile")
+    }) {
+        return true;
+    }
+    for obs in &request.recent_observations {
+        if obs.criterion_kind.as_deref() == Some("Compile")
+            && obs.evaluation_verdict.as_deref() == Some("Fail")
+        {
+            return true;
+        }
+    }
+    request.last_observation.as_ref().is_some_and(|obs| {
+        obs.criterion_kind.as_deref() == Some("Compile")
+            && obs.evaluation_verdict.as_deref() == Some("Fail")
+    })
+}
+
+fn infer_compile_corrections_from_artifact_files(
+    request: &ModelRequest,
+) -> Option<Vec<StructuredCorrection>> {
+    let mut corrections = Vec::new();
+    for file in &request.artifact_files {
+        for token in bare_identifier_lines(&file.source) {
+            let replacement = infer_replacement_for_token(&token, &file.source, "");
+            if !replacement.is_empty() && replacement != token {
+                corrections.push(StructuredCorrection::ReplaceText {
+                    path: Some(file.path.clone()),
+                    search: token,
+                    replacement,
+                });
+            }
+        }
+    }
+    if corrections.is_empty() {
+        None
+    } else {
+        Some(corrections)
+    }
+}
+
+fn bare_identifier_lines(source: &str) -> Vec<String> {
+    const KEYWORDS: &[&str] = &[
+        "as", "async", "await", "break", "const", "continue", "crate", "else", "enum", "extern",
+        "false", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
+        "pub", "ref", "return", "self", "Self", "static", "struct", "super", "trait", "true",
+        "type", "unsafe", "use", "where", "while",
+    ];
+    source
+        .lines()
+        .filter_map(|line| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with("//") {
+                return None;
+            }
+            if trimmed
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                && trimmed
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+                && !KEYWORDS.contains(&trimmed)
+            {
+                Some(trimmed.to_string())
+            } else {
+                None
+            }
+        })
+        .collect()
+}
+
+fn infer_compile_corrections_from_stderr(
+    request: &ModelRequest,
+    stderr: &str,
+) -> Option<Vec<StructuredCorrection>> {
+    let feedback = request
+        .last_observation
+        .as_ref()
+        .map(|obs| obs.repairer_feedback.clone())
+        .filter(|items| !items.is_empty())
+        .unwrap_or_else(|| request.diagnostic_context.repairer_feedback.clone());
+
+    if feedback
+        .iter()
+        .any(|item| item.contains("delimitador") || item.contains("delimiter"))
+        && let Some(code) = &request.working_code
+    {
+        let open = code.matches('{').count();
+        let close = code.matches('}').count();
+        if open > close {
+            return Some(vec![StructuredCorrection::InsertText {
+                path: None,
+                position: code.len(),
+                text: "\n}".repeat(open - close),
+            }]);
+        }
+    }
+
+    let mut corrections = Vec::new();
+    for file in &request.artifact_files {
+        if let Some(token) = extract_found_token_from_stderr(stderr)
+            && file.source.contains(&token)
+        {
+            let replacement = infer_replacement_for_token(&token, &file.source, stderr);
+            if !replacement.is_empty() && replacement != token {
+                corrections.push(StructuredCorrection::ReplaceText {
+                    path: Some(file.path.clone()),
+                    search: token,
+                    replacement,
+                });
+            }
+        }
+    }
+
+    if corrections.is_empty()
+        && let Some(code) = &request.working_code
+        && let Some(token) = extract_found_token_from_stderr(stderr)
+        && code.contains(&token)
+    {
+        let replacement = infer_replacement_for_token(&token, code, stderr);
+        if !replacement.is_empty() && replacement != token {
+            corrections.push(StructuredCorrection::ReplaceText {
+                path: request.artifact_primary_path.clone(),
+                search: token,
+                replacement,
+            });
+        }
+    }
+
+    if corrections.is_empty() {
+        None
+    } else {
+        Some(corrections)
+    }
+}
+
+fn infer_validation_corrections_from_diagnostics(
+    request: &ModelRequest,
+) -> Vec<StructuredCorrection> {
     let code = request.working_code.as_deref().unwrap_or_default();
+    let errors = if request.diagnostic_context.validator_errors.is_empty() {
+        request
+            .last_observation
+            .as_ref()
+            .map(|obs| obs.validator_errors.clone())
+            .unwrap_or_default()
+    } else {
+        request.diagnostic_context.validator_errors.clone()
+    };
+
+    let mut corrections = Vec::new();
+    for error in &errors {
+        corrections.extend(infer_validation_marker_corrections(code, error));
+    }
+    corrections
+}
+
+fn infer_validation_marker_corrections(
+    working_code: &str,
+    error: &str,
+) -> Vec<StructuredCorrection> {
+    if !error.contains("API REST") {
+        return Vec::new();
+    }
     let pairs = [
         ("HTTP", "NET"),
         ("Endpoints", "Routes"),
@@ -1772,16 +2309,92 @@ fn infer_mock_corrections(request: &ModelRequest) -> Vec<StructuredCorrection> {
         ("Server", "Host"),
         ("server", "host"),
     ];
-
     pairs
         .iter()
-        .filter(|(required, substitute)| !code.contains(required) && code.contains(substitute))
+        .filter(|(required, substitute)| {
+            !working_code.contains(required) && working_code.contains(substitute)
+        })
         .map(|(required, substitute)| StructuredCorrection::ReplaceText {
             path: None,
             search: (*substitute).to_string(),
             replacement: (*required).to_string(),
         })
         .collect()
+}
+
+fn extract_found_token_from_stderr(stderr: &str) -> Option<String> {
+    for line in stderr.lines() {
+        for marker in ["found `", "cannot find value `", "cannot find type `"] {
+            if let Some(start) = line.find(marker) {
+                let rest = &line[start + marker.len()..];
+                if let Some(end) = rest.find('`') {
+                    let token = rest[..end].to_string();
+                    if !token.is_empty() {
+                        return Some(token);
+                    }
+                }
+            }
+        }
+    }
+    for line in stderr.lines() {
+        if !line.contains("error") {
+            continue;
+        }
+        let mut rest = line;
+        while let Some(start) = rest.find('`') {
+            let after = &rest[start + 1..];
+            if let Some(end) = after.find('`') {
+                let token = &after[..end];
+                if !token.is_empty()
+                    && token
+                        .chars()
+                        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+                {
+                    return Some(token.to_string());
+                }
+                rest = &after[end + 1..];
+            } else {
+                break;
+            }
+        }
+    }
+    None
+}
+
+fn infer_replacement_for_token(token: &str, source: &str, stderr: &str) -> String {
+    if source.contains("-> i32") || source.contains("-> i64") || source.contains("-> u32") {
+        return "0".to_string();
+    }
+    if source.contains("-> f32") || source.contains("-> f64") {
+        return "0.0".to_string();
+    }
+    if source.contains("-> bool") {
+        return "false".to_string();
+    }
+    if source.contains("-> &str") || source.contains("-> String") {
+        return "\"\"".to_string();
+    }
+    if stderr.contains("unclosed delimiter") || stderr.contains("mismatched closing delimiter") {
+        return String::new();
+    }
+    format!("/* fix {token} */")
+}
+
+/// Cliente mock genérico: decisiones derivadas de [`SerializedDiagnosticContext`]
+/// y observaciones serializadas (sin reglas error→corrección opacas fuera del request).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DiagnosticContextModelClient;
+
+impl DiagnosticContextModelClient {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl ModelClient for DiagnosticContextModelClient {
+    fn complete(&self, request: &ModelRequest) -> Result<ModelResponse, ModelError> {
+        MockModelClient::new().complete(request)
+    }
 }
 
 #[cfg(test)]
@@ -2104,6 +2717,7 @@ mod tests {
                 priority: 0,
                 reason: "evidencia insuficiente".to_string(),
             }),
+            diagnostic_context: SerializedDiagnosticContext::default(),
             system_prompt: String::new(),
         };
         let mut parts = Vec::new();
@@ -2161,6 +2775,7 @@ mod tests {
                 priority: 0,
                 reason: "evidencia insuficiente".to_string(),
             }),
+            diagnostic_context: SerializedDiagnosticContext::default(),
             system_prompt: String::new(),
         }
     }
@@ -2199,6 +2814,7 @@ mod tests {
                 priority: 0,
                 reason: "goal satisfecha".to_string(),
             }),
+            diagnostic_context: SerializedDiagnosticContext::default(),
             system_prompt: String::new(),
         };
         let finish = ModelDecision::Finish {
@@ -2262,6 +2878,7 @@ mod tests {
                 priority: 0,
                 reason: "compilación fallida".to_string(),
             }),
+            diagnostic_context: SerializedDiagnosticContext::default(),
             system_prompt: String::new(),
         };
         let repair = ModelDecision::RepairDiagnostic {
@@ -2363,6 +2980,7 @@ mod tests {
                 priority: 0,
                 reason: "evidencia insuficiente para ac-compile".to_string(),
             }),
+            diagnostic_context: SerializedDiagnosticContext::default(),
             system_prompt: String::new(),
         };
         let guided = apply_gap_guidance(
@@ -2409,6 +3027,7 @@ mod tests {
                 priority: 1,
                 reason: "evidencia insuficiente".to_string(),
             }),
+            diagnostic_context: SerializedDiagnosticContext::default(),
             system_prompt: String::new(),
         };
         let gap = request.goal_gap.as_ref().expect("gap");
@@ -2474,6 +3093,11 @@ mod tests {
                 priority: 0,
                 reason: "compilación fallida".to_string(),
             }),
+            diagnostic_context: SerializedDiagnosticContext {
+                compile_status: Some("error".to_string()),
+                compiler_stderr: vec!["error: cannot find value `broken`".to_string()],
+                ..SerializedDiagnosticContext::default()
+            },
             system_prompt: String::new(),
         };
         let guided = apply_gap_guidance(
@@ -2520,6 +3144,7 @@ mod tests {
                 priority: 0,
                 reason: "goal satisfecha".to_string(),
             }),
+            diagnostic_context: SerializedDiagnosticContext::default(),
             system_prompt: String::new(),
         };
         let finish = ModelDecision::Finish {

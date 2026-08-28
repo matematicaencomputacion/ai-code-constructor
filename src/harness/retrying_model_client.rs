@@ -245,6 +245,7 @@ mod tests {
             goal_evaluation: None,
             goal_gap: None,
             recommended_action: None,
+            diagnostic_context: Default::default(),
         }
     }
 

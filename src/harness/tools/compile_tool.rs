@@ -6,12 +6,17 @@
 //! Evidence preserva el contrato EvaluationEngine: `tool=compile` + `compile_status`.
 
 use std::process::Command;
+use std::sync::Mutex;
 
 use crate::harness::artifact_materialization::ArtifactMaterialization;
 use crate::harness::context::AgentContext;
 use crate::harness::evaluation::Evidence;
 use crate::harness::tool::{Tool, ToolResult};
 use crate::harness::tools::COMPILE;
+
+/// Serializa invocaciones a `cargo check`: en la suite de tests muchos casos
+/// comparten cache global de Cargo y la ejecución paralela provoca stderr vacío/flaky.
+static COMPILE_EXECUTION_LOCK: Mutex<()> = Mutex::new(());
 
 /// Compila el working Artifact (single- o multi-file) como crate temporal.
 ///
@@ -49,6 +54,10 @@ impl Tool for CompileTool {
                 );
             }
         };
+
+        let _compile_guard = COMPILE_EXECUTION_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
 
         // `cargo check`: verificación de compilación del crate completo (todos los files).
         // Suficiente para CriterionKind::Compile / compile_status; no requiere binario.

@@ -53,7 +53,13 @@ impl EvaluationEngine {
     ) -> CriterionEvaluation {
         let (verdict, message, evidence_used) = match criterion.kind {
             CriterionKind::Compile => {
-                evaluate_tool_status(evidence, COMPILE, "compile_status", "ok", "compilación")
+                let (verdict, message, evidence_used) =
+                    evaluate_tool_status(evidence, COMPILE, "compile_status", "ok", "compilación");
+                (
+                    verdict,
+                    message,
+                    attach_compile_diagnostics(evidence, verdict, evidence_used),
+                )
             }
             CriterionKind::Validate => {
                 evaluate_tool_status(evidence, VALIDATE, "validate_status", "ok", "validación")
@@ -214,6 +220,36 @@ fn tool_present(evidence: &[Evidence], tool_name: &str) -> bool {
     evidence
         .iter()
         .any(|item| item.label == "tool" && item.detail == tool_name)
+}
+
+const COMPILE_DIAGNOSTIC_LABELS: &[&str] =
+    &["compiler_stderr", "spawn_error", "materialization_error"];
+
+fn attach_compile_diagnostics(
+    evidence: &[Evidence],
+    verdict: EvaluationVerdict,
+    mut evidence_used: Vec<Evidence>,
+) -> Vec<Evidence> {
+    if verdict != EvaluationVerdict::Fail {
+        return evidence_used;
+    }
+    for label in COMPILE_DIAGNOSTIC_LABELS {
+        if evidence_used.iter().any(|item| item.label == *label) {
+            continue;
+        }
+        if let Some(item) = latest_evidence_label(evidence, label) {
+            evidence_used.push(item);
+        }
+    }
+    evidence_used
+}
+
+fn latest_evidence_label(evidence: &[Evidence], label: &str) -> Option<Evidence> {
+    evidence
+        .iter()
+        .rev()
+        .find(|item| item.label == label)
+        .cloned()
 }
 
 fn relevant_evidence(evidence: &[Evidence], labels: &[&str]) -> Vec<Evidence> {
@@ -391,6 +427,29 @@ mod tests {
             &compile_fail_evidence(),
         );
         assert_eq!(evaluation.verdict, EvaluationVerdict::Fail);
+    }
+
+    #[test]
+    fn compile_fail_evaluation_preserves_compiler_stderr_in_evidence_used() {
+        let engine = EvaluationEngine::new();
+        let stderr = "error[E0425]: cannot find value `broken` in this scope";
+        let evidence = vec![
+            Evidence::new("tool", COMPILE),
+            Evidence::new("compile_status", "error"),
+            Evidence::new("compiler_stderr", stderr),
+        ];
+        let evaluation = engine.evaluate_criterion(
+            &AcceptanceCriterion::new("ac-compile-001", "compila", CriterionKind::Compile),
+            &evidence,
+        );
+        assert_eq!(evaluation.verdict, EvaluationVerdict::Fail);
+        assert!(
+            evaluation
+                .evidence_used
+                .iter()
+                .any(|item| item.label == "compiler_stderr" && item.detail.contains("broken")),
+            "compiler_stderr debe fluir a evidence_used del criterio Compile"
+        );
     }
 
     #[test]
