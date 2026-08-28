@@ -258,9 +258,12 @@ fn implementar_handlers() {
         let repair_pos = tools.iter().position(|t| t == REPAIR_DIAGNOSTIC).unwrap();
         let correct_pos = tools.iter().position(|t| t == APPLY_CORRECTION).unwrap();
         let compile_pos = tools.iter().position(|t| t == COMPILE).unwrap();
+        assert!(
+            compile_pos < validate_pos,
+            "prioridad Compile antes que Validate; tools={tools:?}"
+        );
         assert!(validate_pos < repair_pos);
         assert!(repair_pos < correct_pos);
-        assert!(correct_pos < compile_pos);
 
         assert!(loop_result.history.observations.iter().any(|o| matches!(
             o,

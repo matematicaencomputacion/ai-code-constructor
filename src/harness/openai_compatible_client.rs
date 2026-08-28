@@ -458,6 +458,7 @@ mod tests {
             recent_evidence: Vec::new(),
             goal_evaluation: None,
             goal_gap: None,
+            recommended_action: None,
             system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
         }
     }

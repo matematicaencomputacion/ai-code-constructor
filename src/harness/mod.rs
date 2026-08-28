@@ -131,8 +131,9 @@ pub use evaluation_observation::{
 pub use goal_driven::{
     CriterionGap, EvaluationPlan, EvaluationPlanEntry, GapDrivenAgent, Goal, GoalDrivenHistory,
     GoalDrivenLoop, GoalDrivenResult, GoalDrivenStatus, GoalEscalation, GoalEvaluation,
-    GoalEvaluator, GoalGap, GoalProgressTracker, GoalStatus, ProgressSignal,
-    collect_evidence_from_context, evaluate_after_tool,
+    GoalEvaluator, GoalGap, GoalProgressTracker, GoalStatus, ProgressSignal, RecommendedAction,
+    collect_evidence_from_context, criterion_kind_priority, evaluate_after_tool,
+    recommend_all_from_gap, recommend_for_criterion_gap, select_primary_recommendation,
 };
 #[allow(unused_imports)]
 pub use live_session::{
@@ -147,10 +148,10 @@ pub use live_session::{
 pub use model::{
     AiSessionConfig, MockModelClient, ModelClient, ModelDecision, ModelError,
     ModelInteractionTrace, ModelRequest, ModelResponse, ModelResponseError, SerializedCriterionGap,
-    SerializedGoalEvaluation, SerializedGoalGap, StructuredCorrection, StructuredFileOperation,
-    append_goal_context_to_message_parts, apply_gap_guidance, decision_from_goal_gap,
-    model_request_from_context, parse_model_response, redact_secrets, serialize_decision,
-    structured_to_file_operation,
+    SerializedGoalEvaluation, SerializedGoalGap, SerializedRecommendedAction, StructuredCorrection,
+    StructuredFileOperation, append_goal_context_to_message_parts, apply_gap_guidance,
+    decision_from_goal_gap, model_decision_from_recommended_action, model_request_from_context,
+    parse_model_response, redact_secrets, serialize_decision, structured_to_file_operation,
 };
 #[allow(unused_imports)]
 pub use observation::AgentObservation;

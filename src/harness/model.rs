@@ -9,7 +9,10 @@ use crate::harness::context::AgentContext;
 use crate::harness::correction::{Correction, CorrectionOperation, CorrectionTarget};
 use crate::harness::criterion::CriterionKind;
 use crate::harness::evaluation::EvaluationVerdict;
-use crate::harness::goal_driven::{Goal, GoalEvaluator, GoalStatus, collect_evidence_from_context};
+use crate::harness::goal_driven::{
+    Goal, GoalEvaluator, GoalStatus, RecommendedAction, collect_evidence_from_context,
+    select_primary_recommendation,
+};
 use crate::harness::observation::AgentObservation;
 use crate::harness::tools::{APPLY_CORRECTION, COMPILE, REPAIR_DIAGNOSTIC, VALIDATE};
 
@@ -60,6 +63,17 @@ pub struct SerializedObservation {
 pub struct ArtifactFileSnapshot {
     pub path: String,
     pub source: String,
+}
+
+/// Snapshot serializado de una acción recomendada para el modelo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerializedRecommendedAction {
+    pub kind: String,
+    pub tool_name: Option<String>,
+    pub criterion_id: Option<String>,
+    pub criterion_kind: Option<String>,
+    pub priority: u8,
+    pub reason: String,
 }
 
 /// Snapshot serializado de un criterio insatisfecho (Goal Gap).
@@ -124,6 +138,8 @@ pub struct ModelRequest {
     pub goal_evaluation: Option<SerializedGoalEvaluation>,
     /// Gap de Goal: criterios insatisfechos con acciones sugeridas.
     pub goal_gap: Option<SerializedGoalGap>,
+    /// Acción recomendada primaria derivada de Goal + evaluación + gap.
+    pub recommended_action: Option<SerializedRecommendedAction>,
     /// Prompt system versionado incluido en cada petición al modelo.
     pub system_prompt: String,
 }
@@ -351,7 +367,7 @@ pub fn model_request_from_context(
         .map(|(primary, files)| (Some(primary), files))
         .unwrap_or((None, Vec::new()));
 
-    let (goal_evaluation, goal_gap) = ctx
+    let (goal_evaluation, goal_gap, recommended_action) = ctx
         .evaluation_specification
         .as_ref()
         .map(|spec| {
@@ -359,6 +375,7 @@ pub fn model_request_from_context(
                 &Goal::from_specification(spec.clone()),
                 &collect_evidence_from_context(ctx),
             );
+            let recommendation = select_primary_recommendation(&evaluation);
             (
                 Some(serialize_goal_evaluation(&evaluation)),
                 if evaluation.gap.is_empty() {
@@ -366,9 +383,10 @@ pub fn model_request_from_context(
                 } else {
                     Some(serialize_goal_gap(&evaluation.gap))
                 },
+                Some(serialize_recommended_action(&recommendation)),
             )
         })
-        .unwrap_or((None, None));
+        .unwrap_or((None, None, None));
 
     Ok(ModelRequest {
         goal: ctx.goal.clone(),
@@ -395,6 +413,7 @@ pub fn model_request_from_context(
         recent_evidence,
         goal_evaluation,
         goal_gap,
+        recommended_action,
         system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
     })
 }
@@ -488,6 +507,54 @@ fn serialize_goal_evaluation(
     }
 }
 
+fn serialize_recommended_action(action: &RecommendedAction) -> SerializedRecommendedAction {
+    match action {
+        RecommendedAction::FinishAllowed { reason } => SerializedRecommendedAction {
+            kind: "FinishAllowed".to_string(),
+            tool_name: None,
+            criterion_id: None,
+            criterion_kind: None,
+            priority: action.priority(),
+            reason: reason.clone(),
+        },
+        RecommendedAction::InvokeTool {
+            tool_name,
+            criterion_id,
+            kind,
+            priority,
+            reason,
+        } => SerializedRecommendedAction {
+            kind: "InvokeTool".to_string(),
+            tool_name: Some((*tool_name).to_string()),
+            criterion_id: Some(criterion_id.as_str().to_string()),
+            criterion_kind: Some(format!("{kind:?}")),
+            priority: *priority,
+            reason: reason.clone(),
+        },
+        RecommendedAction::RepairDiagnostic {
+            criterion_id,
+            kind,
+            priority,
+            reason,
+        } => SerializedRecommendedAction {
+            kind: "RepairDiagnostic".to_string(),
+            tool_name: Some(REPAIR_DIAGNOSTIC.to_string()),
+            criterion_id: Some(criterion_id.as_str().to_string()),
+            criterion_kind: Some(format!("{kind:?}")),
+            priority: *priority,
+            reason: reason.clone(),
+        },
+        RecommendedAction::NoDeterministicAction { reason } => SerializedRecommendedAction {
+            kind: "NoDeterministicAction".to_string(),
+            tool_name: None,
+            criterion_id: None,
+            criterion_kind: None,
+            priority: action.priority(),
+            reason: reason.clone(),
+        },
+    }
+}
+
 fn serialize_goal_gap(gap: &crate::harness::goal_driven::GoalGap) -> SerializedGoalGap {
     SerializedGoalGap {
         unsatisfied_count: gap.unsatisfied.len(),
@@ -550,6 +617,40 @@ pub fn append_goal_context_to_message_parts(parts: &mut Vec<String>, request: &M
             parts.push(format!("goal_gap_{index}_suggested_action={action}"));
         }
     }
+
+    if let Some(rec) = &request.recommended_action {
+        parts.push(format!("recommended_action_kind={}", rec.kind));
+        if let Some(tool) = &rec.tool_name {
+            parts.push(format!("recommended_action_tool={tool}"));
+        }
+        if let Some(id) = &rec.criterion_id {
+            parts.push(format!("recommended_action_criterion_id={id}"));
+        }
+        parts.push(format!("recommended_action_priority={}", rec.priority));
+        parts.push(format!("recommended_action_reason={}", rec.reason));
+    }
+}
+
+/// Convierte acción recomendada serializada en [`ModelDecision`] ejecutable.
+pub fn model_decision_from_recommended_action(
+    action: &SerializedRecommendedAction,
+    request: &ModelRequest,
+) -> Option<ModelDecision> {
+    match action.kind.as_str() {
+        "FinishAllowed" => Some(ModelDecision::Finish {
+            summary: action.reason.clone(),
+        }),
+        "InvokeTool" => {
+            let kind_label = action.criterion_kind.as_deref()?;
+            let kind = parse_criterion_kind_label(kind_label)?;
+            decision_for_criterion_kind(kind, request)
+        }
+        "RepairDiagnostic" => Some(ModelDecision::RepairDiagnostic {
+            errors: vec![action.reason.clone()],
+        }),
+        "NoDeterministicAction" => None,
+        _ => None,
+    }
 }
 
 /// Mapea el gap primario a una [`ModelDecision`] sugerida (política gap-guided).
@@ -557,6 +658,9 @@ pub fn decision_from_goal_gap(
     gap: &SerializedGoalGap,
     request: &ModelRequest,
 ) -> Option<ModelDecision> {
+    if let Some(rec) = &request.recommended_action {
+        return model_decision_from_recommended_action(rec, request);
+    }
     let primary = gap.primary()?;
     let kind = parse_criterion_kind_label(&primary.kind)?;
     decision_for_criterion_kind(kind, request)
@@ -599,7 +703,7 @@ fn decision_for_criterion_kind(
     }
 }
 
-/// Redirige Finish prematuro cuando la Goal sigue insatisfecha y hay gap accionable.
+/// Redirige Finish prematuro cuando la Goal sigue insatisfecha y hay recomendación accionable.
 pub fn apply_gap_guidance(decision: ModelDecision, request: &ModelRequest) -> ModelDecision {
     let Some(eval) = &request.goal_evaluation else {
         return decision;
@@ -608,6 +712,15 @@ pub fn apply_gap_guidance(decision: ModelDecision, request: &ModelRequest) -> Mo
         return decision;
     }
     if !matches!(decision, ModelDecision::Finish { .. }) {
+        return decision;
+    }
+    if let Some(rec) = &request.recommended_action {
+        if rec.kind == "FinishAllowed" {
+            return decision;
+        }
+        if let Some(redirected) = model_decision_from_recommended_action(rec, request) {
+            return redirected;
+        }
         return decision;
     }
     request
@@ -1357,6 +1470,13 @@ impl MockModelClient {
 
         match &request.last_observation {
             None => {
+                if let Some(rec) = &request.recommended_action
+                    && rec.kind != "FinishAllowed"
+                    && rec.kind != "NoDeterministicAction"
+                    && let Some(decision) = model_decision_from_recommended_action(rec, request)
+                {
+                    return decision;
+                }
                 if let Some(gap) = &request.goal_gap
                     && let Some(decision) = decision_from_goal_gap(gap, request)
                 {
@@ -1396,8 +1516,22 @@ impl MockModelClient {
                 if obs.kind == "criterion_evaluated"
                     && obs.evaluation_verdict.as_deref() == Some("Pass") =>
             {
-                ModelDecision::Finish {
-                    summary: "ai mock session completed after evaluation pass".to_string(),
+                if request
+                    .goal_evaluation
+                    .as_ref()
+                    .is_some_and(|eval| eval.status == "Satisfied")
+                {
+                    ModelDecision::Finish {
+                        summary: "ai mock session completed after evaluation pass".to_string(),
+                    }
+                } else if let Some(decision) =
+                    self.decision_from_recommendation_if_unsatisfied(request)
+                {
+                    decision
+                } else {
+                    ModelDecision::Finish {
+                        summary: "ai mock session completed after evaluation pass".to_string(),
+                    }
                 }
             }
             Some(obs)
@@ -1443,14 +1577,48 @@ impl MockModelClient {
                 }
             }
             Some(obs) if obs.tool_name.as_deref() == Some(COMPILE) && obs.success == Some(true) => {
-                ModelDecision::Finish {
-                    summary: "ai mock session completed".to_string(),
+                if request
+                    .goal_evaluation
+                    .as_ref()
+                    .is_some_and(|eval| eval.status == "Satisfied")
+                {
+                    ModelDecision::Finish {
+                        summary: "ai mock session completed".to_string(),
+                    }
+                } else if let Some(decision) =
+                    self.decision_from_recommendation_if_unsatisfied(request)
+                {
+                    decision
+                } else {
+                    ModelDecision::Finish {
+                        summary: "ai mock session completed".to_string(),
+                    }
                 }
             }
             Some(_) => ModelDecision::Finish {
                 summary: "ai mock stop".to_string(),
             },
         }
+    }
+
+    fn decision_from_recommendation_if_unsatisfied(
+        &self,
+        request: &ModelRequest,
+    ) -> Option<ModelDecision> {
+        let eval = request.goal_evaluation.as_ref()?;
+        if eval.status == "Satisfied" {
+            return None;
+        }
+        if let Some(rec) = &request.recommended_action
+            && rec.kind != "FinishAllowed"
+            && rec.kind != "NoDeterministicAction"
+        {
+            return model_decision_from_recommended_action(rec, request);
+        }
+        request
+            .goal_gap
+            .as_ref()
+            .and_then(|gap| decision_from_goal_gap(gap, request))
     }
 }
 
@@ -1836,6 +2004,14 @@ mod tests {
                     suggested_action: Some(COMPILE.to_string()),
                 }],
             }),
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "InvokeTool".to_string(),
+                tool_name: Some(COMPILE.to_string()),
+                criterion_id: Some("ac-compile".to_string()),
+                criterion_kind: Some("Compile".to_string()),
+                priority: 0,
+                reason: "evidencia insuficiente".to_string(),
+            }),
             system_prompt: String::new(),
         };
         let mut parts = Vec::new();
@@ -1845,6 +2021,8 @@ mod tests {
         assert!(message.contains("goal_gap_unsatisfied_count=1"));
         assert!(message.contains("goal_gap_0_criterion_id=ac-compile"));
         assert!(message.contains("goal_gap_0_suggested_action=compile"));
+        assert!(message.contains("recommended_action_kind=InvokeTool"));
+        assert!(message.contains("recommended_action_tool=compile"));
     }
 
     #[test]
@@ -1895,6 +2073,14 @@ mod tests {
                     suggested_action: Some(COMPILE.to_string()),
                 }],
             }),
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "InvokeTool".to_string(),
+                tool_name: Some(COMPILE.to_string()),
+                criterion_id: Some("ac-compile".to_string()),
+                criterion_kind: Some("Compile".to_string()),
+                priority: 0,
+                reason: "evidencia insuficiente para ac-compile".to_string(),
+            }),
             system_prompt: String::new(),
         };
         let guided = apply_gap_guidance(
@@ -1933,10 +2119,131 @@ mod tests {
                     suggested_action: Some(VALIDATE.to_string()),
                 }],
             }),
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "InvokeTool".to_string(),
+                tool_name: Some(VALIDATE.to_string()),
+                criterion_id: Some("ac-v".to_string()),
+                criterion_kind: Some("Validate".to_string()),
+                priority: 1,
+                reason: "evidencia insuficiente".to_string(),
+            }),
             system_prompt: String::new(),
         };
         let gap = request.goal_gap.as_ref().expect("gap");
         let decision = decision_from_goal_gap(gap, &request).expect("decision");
         assert!(matches!(decision, ModelDecision::Validate { .. }));
+    }
+
+    #[test]
+    fn model_request_includes_recommended_action() {
+        let session = AiSessionConfig::new("compilar".to_string(), "Generic".to_string());
+        let ctx = AgentContext::new("rec-test")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(compile_only_spec());
+
+        let request = model_request_from_context(&ctx, &session).expect("request");
+        let rec = request.recommended_action.expect("recommended_action");
+        assert_eq!(rec.kind, "InvokeTool");
+        assert_eq!(rec.tool_name.as_deref(), Some(COMPILE));
+        assert_eq!(rec.priority, 0);
+    }
+
+    #[test]
+    fn apply_gap_guidance_uses_recommended_action_not_hardcoded_kind() {
+        // E — RepairDiagnostic cuando compile falló
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 2,
+            user_request: "compilar".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some("fn main() { broken".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: None,
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Unsatisfied".to_string(),
+                criteria_total: 1,
+                criteria_pass: 0,
+                criteria_fail: 1,
+                criteria_insufficient: 0,
+                message: "compile fail".to_string(),
+            }),
+            goal_gap: Some(SerializedGoalGap {
+                unsatisfied_count: 1,
+                gaps: vec![SerializedCriterionGap {
+                    criterion_id: "ac-compile".to_string(),
+                    kind: "Compile".to_string(),
+                    verdict: "Fail".to_string(),
+                    message: "error".to_string(),
+                    suggested_action: Some(COMPILE.to_string()),
+                }],
+            }),
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "RepairDiagnostic".to_string(),
+                tool_name: Some(REPAIR_DIAGNOSTIC.to_string()),
+                criterion_id: Some("ac-compile".to_string()),
+                criterion_kind: Some("Compile".to_string()),
+                priority: 0,
+                reason: "compilación fallida".to_string(),
+            }),
+            system_prompt: String::new(),
+        };
+        let guided = apply_gap_guidance(
+            ModelDecision::Finish {
+                summary: "too early".to_string(),
+            },
+            &request,
+        );
+        assert!(matches!(guided, ModelDecision::RepairDiagnostic { .. }));
+    }
+
+    #[test]
+    fn apply_gap_guidance_allows_finish_when_goal_satisfied() {
+        // F
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 3,
+            user_request: "compilar".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some("fn main() {}".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: None,
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Satisfied".to_string(),
+                criteria_total: 1,
+                criteria_pass: 1,
+                criteria_fail: 0,
+                criteria_insufficient: 0,
+                message: "ok".to_string(),
+            }),
+            goal_gap: None,
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "FinishAllowed".to_string(),
+                tool_name: None,
+                criterion_id: None,
+                criterion_kind: None,
+                priority: 0,
+                reason: "goal satisfecha".to_string(),
+            }),
+            system_prompt: String::new(),
+        };
+        let finish = ModelDecision::Finish {
+            summary: "done".to_string(),
+        };
+        let guided = apply_gap_guidance(finish.clone(), &request);
+        assert_eq!(guided, finish);
     }
 }

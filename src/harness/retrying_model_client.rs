@@ -244,6 +244,7 @@ mod tests {
             recent_evidence: Vec::new(),
             goal_evaluation: None,
             goal_gap: None,
+            recommended_action: None,
         }
     }
 
