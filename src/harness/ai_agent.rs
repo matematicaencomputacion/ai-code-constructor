@@ -343,16 +343,40 @@ fn implementar_handlers() {
     }
 
     #[test]
-    fn ai_agent_trace_records_request_and_response() {
+    fn ai_agent_populates_goal_context_from_specification() {
+        use crate::harness::criterion::CriterionKind;
+        use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+
+        let spec = Specification::new("spec-ai-gap", "compilar")
+            .with_requirements(vec![Requirement::new("req", "compilar")])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-c", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req")]),
+            ]);
         let client = MockModelClient::new();
         let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
+            user_request: "compilar".to_string(),
+            plan_kind: "Generic".to_string(),
         };
         let mut agent = AiAgent::new(Box::new(client), session);
-        let _ = agent.propose(&AgentContext::new("trace").with_working_code("NET"));
-        assert_eq!(agent.trace.requests.len(), 1);
-        assert_eq!(agent.trace.responses.len(), 1);
-        assert_eq!(agent.trace.parsed_decisions.len(), 1);
+        let ctx = AgentContext::new("ai-gap")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(spec);
+        let _ = agent.propose(&ctx);
+        let request = agent.trace.requests.last().expect("request");
+        assert!(request.goal_evaluation.is_some());
+        assert!(request.goal_gap.is_some());
+        assert_eq!(
+            agent
+                .trace
+                .parsed_decisions
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+            &ModelDecision::Compile {
+                code: "fn main() {}".to_string(),
+            }
+        );
     }
 }

@@ -7,7 +7,9 @@ use crate::harness::artifact_file_operation::ArtifactFileOperation;
 use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::context::AgentContext;
 use crate::harness::correction::{Correction, CorrectionOperation, CorrectionTarget};
+use crate::harness::criterion::CriterionKind;
 use crate::harness::evaluation::EvaluationVerdict;
+use crate::harness::goal_driven::{Goal, GoalEvaluator, GoalStatus, collect_evidence_from_context};
 use crate::harness::observation::AgentObservation;
 use crate::harness::tools::{APPLY_CORRECTION, COMPILE, REPAIR_DIAGNOSTIC, VALIDATE};
 
@@ -43,6 +45,45 @@ pub struct ArtifactFileSnapshot {
     pub source: String,
 }
 
+/// Snapshot serializado de un criterio insatisfecho (Goal Gap).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerializedCriterionGap {
+    pub criterion_id: String,
+    pub kind: String,
+    pub verdict: String,
+    pub message: String,
+    pub suggested_action: Option<String>,
+}
+
+/// Snapshot serializado del Goal Gap (criterios pendientes).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SerializedGoalGap {
+    pub unsatisfied_count: usize,
+    pub gaps: Vec<SerializedCriterionGap>,
+}
+
+impl SerializedGoalGap {
+    pub fn primary(&self) -> Option<&SerializedCriterionGap> {
+        self.gaps.first()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.gaps.is_empty()
+    }
+}
+
+/// Resumen serializado de evaluación de Goal para el modelo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SerializedGoalEvaluation {
+    pub goal_id: String,
+    pub status: String,
+    pub criteria_total: usize,
+    pub criteria_pass: usize,
+    pub criteria_fail: usize,
+    pub criteria_insufficient: usize,
+    pub message: String,
+}
+
 /// Petición estructurada enviada al modelo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
@@ -62,6 +103,10 @@ pub struct ModelRequest {
     pub last_observation: Option<SerializedObservation>,
     pub recent_observations: Vec<SerializedObservation>,
     pub recent_evidence: Vec<(String, String)>,
+    /// Evaluación de Goal cuando hay `evaluation_specification` en el contexto.
+    pub goal_evaluation: Option<SerializedGoalEvaluation>,
+    /// Gap de Goal: criterios insatisfechos con acciones sugeridas.
+    pub goal_gap: Option<SerializedGoalGap>,
     /// Prompt system versionado incluido en cada petición al modelo.
     pub system_prompt: String,
 }
@@ -289,6 +334,25 @@ pub fn model_request_from_context(
         .map(|(primary, files)| (Some(primary), files))
         .unwrap_or((None, Vec::new()));
 
+    let (goal_evaluation, goal_gap) = ctx
+        .evaluation_specification
+        .as_ref()
+        .map(|spec| {
+            let evaluation = GoalEvaluator::new().evaluate(
+                &Goal::from_specification(spec.clone()),
+                &collect_evidence_from_context(ctx),
+            );
+            (
+                Some(serialize_goal_evaluation(&evaluation)),
+                if evaluation.gap.is_empty() {
+                    None
+                } else {
+                    Some(serialize_goal_gap(&evaluation.gap))
+                },
+            )
+        })
+        .unwrap_or((None, None));
+
     Ok(ModelRequest {
         goal: ctx.goal.clone(),
         step: ctx.step,
@@ -312,6 +376,8 @@ pub fn model_request_from_context(
         last_observation,
         recent_observations,
         recent_evidence,
+        goal_evaluation,
+        goal_gap,
         system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
     })
 }
@@ -360,6 +426,178 @@ pub fn append_artifact_files_to_message_parts(
         ));
         parts.push(format!("artifact_file_{index}_source={}", file.source));
     }
+}
+
+fn goal_status_label(status: GoalStatus) -> &'static str {
+    match status {
+        GoalStatus::Satisfied => "Satisfied",
+        GoalStatus::Unsatisfied => "Unsatisfied",
+        GoalStatus::Inconclusive => "Inconclusive",
+    }
+}
+
+fn evaluation_verdict_label(verdict: EvaluationVerdict) -> &'static str {
+    match verdict {
+        EvaluationVerdict::Pass => "Pass",
+        EvaluationVerdict::Fail => "Fail",
+        EvaluationVerdict::InsufficientEvidence => "InsufficientEvidence",
+    }
+}
+
+fn serialize_goal_evaluation(
+    evaluation: &crate::harness::goal_driven::GoalEvaluation,
+) -> SerializedGoalEvaluation {
+    let criteria = &evaluation.specification_evaluation.criteria;
+    let criteria_pass = criteria
+        .iter()
+        .filter(|item| item.verdict == EvaluationVerdict::Pass)
+        .count();
+    let criteria_fail = criteria
+        .iter()
+        .filter(|item| item.verdict == EvaluationVerdict::Fail)
+        .count();
+    let criteria_insufficient = criteria
+        .iter()
+        .filter(|item| item.verdict == EvaluationVerdict::InsufficientEvidence)
+        .count();
+    SerializedGoalEvaluation {
+        goal_id: evaluation.goal_id.as_str().to_string(),
+        status: goal_status_label(evaluation.status).to_string(),
+        criteria_total: criteria.len(),
+        criteria_pass,
+        criteria_fail,
+        criteria_insufficient,
+        message: evaluation.specification_evaluation.message.clone(),
+    }
+}
+
+fn serialize_goal_gap(gap: &crate::harness::goal_driven::GoalGap) -> SerializedGoalGap {
+    SerializedGoalGap {
+        unsatisfied_count: gap.unsatisfied.len(),
+        gaps: gap
+            .unsatisfied
+            .iter()
+            .map(|item| SerializedCriterionGap {
+                criterion_id: item.criterion_id.as_str().to_string(),
+                kind: format!("{:?}", item.kind),
+                verdict: evaluation_verdict_label(item.verdict).to_string(),
+                message: item.message.clone(),
+                suggested_action: item.suggested_action.map(str::to_string),
+            })
+            .collect(),
+    }
+}
+
+/// Añade campos goal_evaluation / goal_gap al mensaje de usuario del modelo.
+pub fn append_goal_context_to_message_parts(parts: &mut Vec<String>, request: &ModelRequest) {
+    let Some(eval) = &request.goal_evaluation else {
+        return;
+    };
+    parts.push(format!("goal_evaluation_goal_id={}", eval.goal_id));
+    parts.push(format!("goal_evaluation_status={}", eval.status));
+    parts.push(format!(
+        "goal_evaluation_criteria_total={}",
+        eval.criteria_total
+    ));
+    parts.push(format!(
+        "goal_evaluation_criteria_pass={}",
+        eval.criteria_pass
+    ));
+    parts.push(format!(
+        "goal_evaluation_criteria_fail={}",
+        eval.criteria_fail
+    ));
+    parts.push(format!(
+        "goal_evaluation_criteria_insufficient={}",
+        eval.criteria_insufficient
+    ));
+    parts.push(format!("goal_evaluation_message={}", eval.message));
+
+    let Some(gap) = &request.goal_gap else {
+        parts.push("goal_gap_unsatisfied_count=0".to_string());
+        return;
+    };
+    parts.push(format!(
+        "goal_gap_unsatisfied_count={}",
+        gap.unsatisfied_count
+    ));
+    for (index, item) in gap.gaps.iter().enumerate() {
+        parts.push(format!(
+            "goal_gap_{index}_criterion_id={}",
+            item.criterion_id
+        ));
+        parts.push(format!("goal_gap_{index}_kind={}", item.kind));
+        parts.push(format!("goal_gap_{index}_verdict={}", item.verdict));
+        parts.push(format!("goal_gap_{index}_message={}", item.message));
+        if let Some(action) = &item.suggested_action {
+            parts.push(format!("goal_gap_{index}_suggested_action={action}"));
+        }
+    }
+}
+
+/// Mapea el gap primario a una [`ModelDecision`] sugerida (política gap-guided).
+pub fn decision_from_goal_gap(
+    gap: &SerializedGoalGap,
+    request: &ModelRequest,
+) -> Option<ModelDecision> {
+    let primary = gap.primary()?;
+    let kind = parse_criterion_kind_label(&primary.kind)?;
+    decision_for_criterion_kind(kind, request)
+}
+
+fn parse_criterion_kind_label(label: &str) -> Option<CriterionKind> {
+    match label {
+        "Compile" => Some(CriterionKind::Compile),
+        "Validate" => Some(CriterionKind::Validate),
+        "RunTests" => Some(CriterionKind::RunTests),
+        "Clippy" => Some(CriterionKind::Clippy),
+        "CheckFormat" => Some(CriterionKind::CheckFormat),
+        "Unknown" => Some(CriterionKind::Unknown),
+        _ => None,
+    }
+}
+
+fn decision_for_criterion_kind(
+    kind: CriterionKind,
+    request: &ModelRequest,
+) -> Option<ModelDecision> {
+    match kind {
+        CriterionKind::Compile => Some(ModelDecision::Compile {
+            code: request.working_code.clone().unwrap_or_default(),
+        }),
+        CriterionKind::Validate => Some(ModelDecision::Validate {
+            request: request.user_request.clone(),
+            code: request.working_code.clone(),
+            plan_kind: request
+                .plan_kind
+                .clone()
+                .unwrap_or_else(|| "Generic".to_string()),
+        }),
+        CriterionKind::RunTests => Some(ModelDecision::RunTests {
+            filter: String::new(),
+        }),
+        CriterionKind::Clippy => Some(ModelDecision::RunClippy),
+        CriterionKind::CheckFormat => Some(ModelDecision::CheckFormat),
+        CriterionKind::Unknown => None,
+    }
+}
+
+/// Redirige Finish prematuro cuando la Goal sigue insatisfecha y hay gap accionable.
+pub fn apply_gap_guidance(decision: ModelDecision, request: &ModelRequest) -> ModelDecision {
+    let Some(eval) = &request.goal_evaluation else {
+        return decision;
+    };
+    if eval.status == "Satisfied" {
+        return decision;
+    }
+    if !matches!(decision, ModelDecision::Finish { .. }) {
+        return decision;
+    }
+    request
+        .goal_gap
+        .as_ref()
+        .and_then(|gap| decision_from_goal_gap(gap, request))
+        .unwrap_or(decision)
 }
 
 fn serialize_observation(observation: &AgentObservation) -> SerializedObservation {
@@ -1101,14 +1339,30 @@ impl MockModelClient {
         }
 
         match &request.last_observation {
-            None => ModelDecision::Validate {
-                request: request.user_request.clone(),
-                code: request.working_code.clone(),
-                plan_kind: request
-                    .plan_kind
-                    .clone()
-                    .unwrap_or_else(|| "Generic".to_string()),
-            },
+            None => {
+                if let Some(gap) = &request.goal_gap
+                    && let Some(decision) = decision_from_goal_gap(gap, request)
+                {
+                    return decision;
+                }
+                if request
+                    .goal_evaluation
+                    .as_ref()
+                    .is_some_and(|eval| eval.status == "Satisfied")
+                {
+                    return ModelDecision::Finish {
+                        summary: "ai mock session completed: goal satisfied".to_string(),
+                    };
+                }
+                ModelDecision::Validate {
+                    request: request.user_request.clone(),
+                    code: request.working_code.clone(),
+                    plan_kind: request
+                        .plan_kind
+                        .clone()
+                        .unwrap_or_else(|| "Generic".to_string()),
+                }
+            }
             Some(obs) if obs.kind == "action_rejected" => {
                 // Finish bloqueado por criterio en FAIL: reparar, no spamear Compile.
                 if obs.summary.contains("en FAIL") {
@@ -1482,5 +1736,211 @@ mod tests {
         let second = parse_model_response(&client.complete(&fail_req).expect("resp").raw_text)
             .expect("decision");
         assert!(matches!(second, ModelDecision::RepairDiagnostic { .. }));
+    }
+
+    fn compile_only_spec() -> crate::harness::specification::Specification {
+        use crate::harness::criterion::CriterionKind;
+        use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+
+        Specification::new("spec-model-gap", "El código debe compilar")
+            .with_requirements(vec![Requirement::new("req-c", "compilar")])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-compile", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req-c")]),
+            ])
+    }
+
+    #[test]
+    fn model_request_includes_goal_gap_when_unsatisfied() {
+        let session = AiSessionConfig {
+            user_request: "compilar".to_string(),
+            plan_kind: "Generic".to_string(),
+        };
+        let ctx = AgentContext::new("gap-test")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(compile_only_spec());
+
+        let request = model_request_from_context(&ctx, &session).expect("request");
+        let eval = request.goal_evaluation.expect("goal_evaluation");
+        assert_eq!(eval.status, "Inconclusive");
+        assert_eq!(eval.criteria_total, 1);
+        assert_eq!(eval.criteria_pass, 0);
+
+        let gap = request.goal_gap.expect("goal_gap");
+        assert_eq!(gap.unsatisfied_count, 1);
+        assert_eq!(gap.gaps[0].criterion_id, "ac-compile");
+        assert_eq!(gap.gaps[0].kind, "Compile");
+        assert_eq!(gap.gaps[0].suggested_action.as_deref(), Some(COMPILE));
+    }
+
+    #[test]
+    fn model_request_reflects_satisfied_goal() {
+        use crate::harness::tools::COMPILE;
+
+        let session = AiSessionConfig {
+            user_request: "compilar".to_string(),
+            plan_kind: "Generic".to_string(),
+        };
+        let mut ctx = AgentContext::new("gap-satisfied")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(compile_only_spec());
+        ctx.push_observation(AgentObservation::ToolOutcome {
+            tool_name: COMPILE.to_string(),
+            success: true,
+            output: "ok".to_string(),
+            evidence: vec![
+                Evidence::new("tool", COMPILE),
+                Evidence::new("compile_status", "ok"),
+            ],
+            verdict: EvaluationVerdict::Pass,
+        });
+
+        let request = model_request_from_context(&ctx, &session).expect("request");
+        let eval = request.goal_evaluation.expect("goal_evaluation");
+        assert_eq!(eval.status, "Satisfied");
+        assert_eq!(eval.criteria_pass, 1);
+        assert!(request.goal_gap.is_none());
+    }
+
+    #[test]
+    fn append_goal_context_serializes_gap_fields() {
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 1,
+            user_request: "r".to_string(),
+            plan_kind: Some("Api".to_string()),
+            working_code: Some("fn main() {}".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: None,
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec-model-gap".to_string(),
+                status: "Inconclusive".to_string(),
+                criteria_total: 1,
+                criteria_pass: 0,
+                criteria_fail: 0,
+                criteria_insufficient: 1,
+                message: "evidencia insuficiente".to_string(),
+            }),
+            goal_gap: Some(SerializedGoalGap {
+                unsatisfied_count: 1,
+                gaps: vec![SerializedCriterionGap {
+                    criterion_id: "ac-compile".to_string(),
+                    kind: "Compile".to_string(),
+                    verdict: "InsufficientEvidence".to_string(),
+                    message: "falta compile".to_string(),
+                    suggested_action: Some(COMPILE.to_string()),
+                }],
+            }),
+            system_prompt: String::new(),
+        };
+        let mut parts = Vec::new();
+        append_goal_context_to_message_parts(&mut parts, &request);
+        let message = parts.join("\n");
+        assert!(message.contains("goal_evaluation_status=Inconclusive"));
+        assert!(message.contains("goal_gap_unsatisfied_count=1"));
+        assert!(message.contains("goal_gap_0_criterion_id=ac-compile"));
+        assert!(message.contains("goal_gap_0_suggested_action=compile"));
+    }
+
+    #[test]
+    fn mock_model_client_uses_goal_gap_for_initial_action() {
+        let client = MockModelClient::new();
+        let session = AiSessionConfig {
+            user_request: "compilar".to_string(),
+            plan_kind: "Generic".to_string(),
+        };
+        let ctx = AgentContext::new("gap-mock")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(compile_only_spec());
+        let request = model_request_from_context(&ctx, &session).expect("request");
+        let decision =
+            parse_model_response(&client.complete(&request).expect("resp").raw_text).expect("dec");
+        assert!(matches!(decision, ModelDecision::Compile { .. }));
+    }
+
+    #[test]
+    fn apply_gap_guidance_redirects_premature_finish() {
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 2,
+            user_request: "compilar".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some("fn main() {}".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: None,
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Inconclusive".to_string(),
+                criteria_total: 1,
+                criteria_pass: 0,
+                criteria_fail: 0,
+                criteria_insufficient: 1,
+                message: "pending".to_string(),
+            }),
+            goal_gap: Some(SerializedGoalGap {
+                unsatisfied_count: 1,
+                gaps: vec![SerializedCriterionGap {
+                    criterion_id: "ac-compile".to_string(),
+                    kind: "Compile".to_string(),
+                    verdict: "InsufficientEvidence".to_string(),
+                    message: "falta".to_string(),
+                    suggested_action: Some(COMPILE.to_string()),
+                }],
+            }),
+            system_prompt: String::new(),
+        };
+        let guided = apply_gap_guidance(
+            ModelDecision::Finish {
+                summary: "too early".to_string(),
+            },
+            &request,
+        );
+        assert!(matches!(guided, ModelDecision::Compile { .. }));
+    }
+
+    #[test]
+    fn decision_from_goal_gap_maps_validate_kind() {
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 1,
+            user_request: "validar".to_string(),
+            plan_kind: Some("Api".to_string()),
+            working_code: Some("code".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: None,
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: None,
+            goal_gap: Some(SerializedGoalGap {
+                unsatisfied_count: 1,
+                gaps: vec![SerializedCriterionGap {
+                    criterion_id: "ac-v".to_string(),
+                    kind: "Validate".to_string(),
+                    verdict: "InsufficientEvidence".to_string(),
+                    message: "falta".to_string(),
+                    suggested_action: Some(VALIDATE.to_string()),
+                }],
+            }),
+            system_prompt: String::new(),
+        };
+        let gap = request.goal_gap.as_ref().expect("gap");
+        let decision = decision_from_goal_gap(gap, &request).expect("decision");
+        assert!(matches!(decision, ModelDecision::Validate { .. }));
     }
 }

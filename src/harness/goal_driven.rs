@@ -332,7 +332,7 @@ impl GoalDrivenLoop {
         ctx.evaluation_specification = Some(goal.specification.clone());
 
         let mut history = GoalDrivenHistory::default();
-        let initial_evidence = collect_evidence_from_observations(&ctx);
+        let initial_evidence = collect_evidence_from_context(&ctx);
         let initial = self.evaluator.evaluate(goal, &initial_evidence);
         history.evaluations.push(initial.clone());
         history.gaps.push(initial.gap.clone());
@@ -550,7 +550,7 @@ impl Agent for GapDrivenAgent {
             if let Some(spec) = ctx.evaluation_specification.as_ref() {
                 let evaluation = GoalEvaluator::new().evaluate(
                     &Goal::from_specification(spec.clone()),
-                    &collect_evidence_from_observations(ctx),
+                    &collect_evidence_from_context(ctx),
                 );
                 if evaluation.status == GoalStatus::Satisfied {
                     return AgentAction::Finish {
@@ -588,7 +588,7 @@ impl Agent for GapDrivenAgent {
         if let Some(spec) = ctx.evaluation_specification.as_ref() {
             let evaluation = GoalEvaluator::new().evaluate(
                 &Goal::from_specification(spec.clone()),
-                &collect_evidence_from_observations(ctx),
+                &collect_evidence_from_context(ctx),
             );
             if let Some(gap) = evaluation.gap.primary() {
                 return self.action_for_gap(gap, ctx);
@@ -607,7 +607,8 @@ impl Agent for GapDrivenAgent {
     }
 }
 
-fn collect_evidence_from_observations(ctx: &AgentContext) -> Vec<Evidence> {
+/// Recolecta evidencia acumulada en el historial de observaciones del contexto.
+pub fn collect_evidence_from_context(ctx: &AgentContext) -> Vec<Evidence> {
     let mut evidence = Vec::new();
     for observation in &ctx.observation_history {
         if let AgentObservation::ToolOutcome { evidence: ev, .. } = observation {
