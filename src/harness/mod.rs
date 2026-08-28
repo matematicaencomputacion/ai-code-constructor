@@ -130,7 +130,8 @@ pub use evaluation_observation::{
 pub use goal_driven::{
     CriterionGap, EvaluationPlan, EvaluationPlanEntry, GapDrivenAgent, Goal, GoalDrivenHistory,
     GoalDrivenLoop, GoalDrivenResult, GoalDrivenStatus, GoalEscalation, GoalEvaluation,
-    GoalEvaluator, GoalGap, GoalProgressTracker, GoalStatus, ProgressSignal, evaluate_after_tool,
+    GoalEvaluator, GoalGap, GoalProgressTracker, GoalStatus, ProgressSignal,
+    collect_evidence_from_context, evaluate_after_tool,
 };
 #[allow(unused_imports)]
 pub use live_session::{
@@ -144,9 +145,11 @@ pub use live_session::{
 #[allow(unused_imports)]
 pub use model::{
     AiSessionConfig, MockModelClient, ModelClient, ModelDecision, ModelError,
-    ModelInteractionTrace, ModelRequest, ModelResponse, ModelResponseError, StructuredCorrection,
-    StructuredFileOperation, model_request_from_context, parse_model_response, redact_secrets,
-    serialize_decision, structured_to_file_operation,
+    ModelInteractionTrace, ModelRequest, ModelResponse, ModelResponseError, SerializedCriterionGap,
+    SerializedGoalEvaluation, SerializedGoalGap, StructuredCorrection, StructuredFileOperation,
+    append_goal_context_to_message_parts, apply_gap_guidance, decision_from_goal_gap,
+    model_request_from_context, parse_model_response, redact_secrets, serialize_decision,
+    structured_to_file_operation,
 };
 #[allow(unused_imports)]
 pub use observation::AgentObservation;

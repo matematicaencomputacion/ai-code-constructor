@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::harness::model::{
     ModelClient, ModelError, ModelRequest, ModelResponse, append_artifact_files_to_message_parts,
-    redact_secrets,
+    append_goal_context_to_message_parts, redact_secrets,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -200,6 +200,7 @@ fn build_user_message(request: &ModelRequest) -> String {
         request.artifact_primary_path.as_deref(),
         &request.artifact_files,
     );
+    append_goal_context_to_message_parts(&mut parts, request);
     if let Some(artifact_id) = &request.artifact_id {
         parts.push(format!("artifact_id={artifact_id}"));
     }
@@ -455,6 +456,8 @@ mod tests {
             last_observation: None,
             recent_observations: Vec::new(),
             recent_evidence: Vec::new(),
+            goal_evaluation: None,
+            goal_gap: None,
             system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
         }
     }
