@@ -619,16 +619,98 @@ pub fn append_goal_context_to_message_parts(parts: &mut Vec<String>, request: &M
     }
 
     if let Some(rec) = &request.recommended_action {
-        parts.push(format!("recommended_action_kind={}", rec.kind));
-        if let Some(tool) = &rec.tool_name {
-            parts.push(format!("recommended_action_tool={tool}"));
-        }
-        if let Some(id) = &rec.criterion_id {
-            parts.push(format!("recommended_action_criterion_id={id}"));
-        }
-        parts.push(format!("recommended_action_priority={}", rec.priority));
-        parts.push(format!("recommended_action_reason={}", rec.reason));
+        append_recommended_action_to_message_parts(parts, rec);
     }
+}
+
+/// Emite la directiva operacional de RecommendedAction de forma prominente.
+pub fn append_recommended_action_to_message_parts(
+    parts: &mut Vec<String>,
+    rec: &SerializedRecommendedAction,
+) {
+    parts.push("recommended_action_directive=MUST_FOLLOW_WHEN_GOAL_UNSATISFIED".to_string());
+    parts.push(format!("recommended_action_kind={}", rec.kind));
+    if let Some(tool) = &rec.tool_name {
+        parts.push(format!("recommended_action_tool={tool}"));
+    }
+    if let Some(id) = &rec.criterion_id {
+        parts.push(format!("recommended_action_criterion_id={id}"));
+    }
+    if let Some(kind) = &rec.criterion_kind {
+        parts.push(format!("recommended_action_criterion_kind={kind}"));
+    }
+    parts.push(format!("recommended_action_priority={}", rec.priority));
+    parts.push(format!("recommended_action_reason={}", rec.reason));
+}
+
+/// Indica si una [`ModelDecision`] es compatible con la acción recomendada serializada.
+pub fn decision_is_compatible_with_recommendation(
+    decision: &ModelDecision,
+    rec: &SerializedRecommendedAction,
+) -> bool {
+    match rec.kind.as_str() {
+        "FinishAllowed" => true,
+        "NoDeterministicAction" => !matches!(decision, ModelDecision::Finish { .. }),
+        "InvokeTool" | "RepairDiagnostic" => rec
+            .tool_name
+            .as_deref()
+            .is_some_and(|tool| decision_matches_recommended_tool(decision, tool)),
+        _ => true,
+    }
+}
+
+fn decision_matches_recommended_tool(decision: &ModelDecision, tool_name: &str) -> bool {
+    use crate::harness::tools::{
+        CHECK_FORMAT, COMPILE, REPAIR_DIAGNOSTIC, RUN_CLIPPY, RUN_TESTS, VALIDATE,
+    };
+    match tool_name {
+        COMPILE => matches!(decision, ModelDecision::Compile { .. }),
+        VALIDATE => matches!(decision, ModelDecision::Validate { .. }),
+        RUN_TESTS => matches!(decision, ModelDecision::RunTests { .. }),
+        RUN_CLIPPY => matches!(decision, ModelDecision::RunClippy),
+        CHECK_FORMAT => matches!(decision, ModelDecision::CheckFormat),
+        REPAIR_DIAGNOSTIC => matches!(decision, ModelDecision::RepairDiagnostic { .. }),
+        _ => false,
+    }
+}
+
+/// Valida y corrige determinísticamente una decisión incompatible con `recommended_action`.
+///
+/// Más amplio que el redirect de Finish: también redirige acciones de tipo distinto
+/// (p. ej. Validate cuando se recomienda Compile).
+pub fn validate_model_decision_against_recommendation(
+    decision: ModelDecision,
+    request: &ModelRequest,
+) -> ModelDecision {
+    if request
+        .goal_evaluation
+        .as_ref()
+        .is_some_and(|eval| eval.status == "Satisfied")
+    {
+        return decision;
+    }
+
+    if let Some(rec) = &request.recommended_action {
+        if rec.kind == "FinishAllowed" {
+            return decision;
+        }
+        if decision_is_compatible_with_recommendation(&decision, rec) {
+            return decision;
+        }
+        if let Some(redirected) = model_decision_from_recommended_action(rec, request) {
+            return redirected;
+        }
+        return decision;
+    }
+
+    if matches!(decision, ModelDecision::Finish { .. })
+        && let Some(gap) = &request.goal_gap
+        && let Some(redirected) = decision_from_goal_gap(gap, request)
+    {
+        return redirected;
+    }
+
+    decision
 }
 
 /// Convierte acción recomendada serializada en [`ModelDecision`] ejecutable.
@@ -703,31 +785,9 @@ fn decision_for_criterion_kind(
     }
 }
 
-/// Redirige Finish prematuro cuando la Goal sigue insatisfecha y hay recomendación accionable.
+/// Redirige decisiones incompatibles con Goal/recommended_action (alias de validación amplia).
 pub fn apply_gap_guidance(decision: ModelDecision, request: &ModelRequest) -> ModelDecision {
-    let Some(eval) = &request.goal_evaluation else {
-        return decision;
-    };
-    if eval.status == "Satisfied" {
-        return decision;
-    }
-    if !matches!(decision, ModelDecision::Finish { .. }) {
-        return decision;
-    }
-    if let Some(rec) = &request.recommended_action {
-        if rec.kind == "FinishAllowed" {
-            return decision;
-        }
-        if let Some(redirected) = model_decision_from_recommended_action(rec, request) {
-            return redirected;
-        }
-        return decision;
-    }
-    request
-        .goal_gap
-        .as_ref()
-        .and_then(|gap| decision_from_goal_gap(gap, request))
-        .unwrap_or(decision)
+    validate_model_decision_against_recommendation(decision, request)
 }
 
 fn serialize_observation(observation: &AgentObservation) -> SerializedObservation {
@@ -2023,6 +2083,196 @@ mod tests {
         assert!(message.contains("goal_gap_0_suggested_action=compile"));
         assert!(message.contains("recommended_action_kind=InvokeTool"));
         assert!(message.contains("recommended_action_tool=compile"));
+        assert!(message.contains("recommended_action_directive=MUST_FOLLOW_WHEN_GOAL_UNSATISFIED"));
+        assert!(message.contains("recommended_action_criterion_kind=Compile"));
+    }
+
+    fn compile_invoke_request() -> ModelRequest {
+        ModelRequest {
+            goal: "test".to_string(),
+            step: 1,
+            user_request: "compilar".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some("fn main() {}".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: None,
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Inconclusive".to_string(),
+                criteria_total: 1,
+                criteria_pass: 0,
+                criteria_fail: 0,
+                criteria_insufficient: 1,
+                message: "pending".to_string(),
+            }),
+            goal_gap: Some(SerializedGoalGap {
+                unsatisfied_count: 1,
+                gaps: vec![SerializedCriterionGap {
+                    criterion_id: "ac-compile".to_string(),
+                    kind: "Compile".to_string(),
+                    verdict: "InsufficientEvidence".to_string(),
+                    message: "falta".to_string(),
+                    suggested_action: Some(COMPILE.to_string()),
+                }],
+            }),
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "InvokeTool".to_string(),
+                tool_name: Some(COMPILE.to_string()),
+                criterion_id: Some("ac-compile".to_string()),
+                criterion_kind: Some("Compile".to_string()),
+                priority: 0,
+                reason: "evidencia insuficiente".to_string(),
+            }),
+            system_prompt: String::new(),
+        }
+    }
+
+    #[test]
+    fn finish_allowed_accepts_finish_decision() {
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 3,
+            user_request: "compilar".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some("fn main() {}".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: None,
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Satisfied".to_string(),
+                criteria_total: 1,
+                criteria_pass: 1,
+                criteria_fail: 0,
+                criteria_insufficient: 0,
+                message: "ok".to_string(),
+            }),
+            goal_gap: None,
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "FinishAllowed".to_string(),
+                tool_name: None,
+                criterion_id: None,
+                criterion_kind: None,
+                priority: 0,
+                reason: "goal satisfecha".to_string(),
+            }),
+            system_prompt: String::new(),
+        };
+        let finish = ModelDecision::Finish {
+            summary: "done".to_string(),
+        };
+        let validated = validate_model_decision_against_recommendation(finish.clone(), &request);
+        assert_eq!(validated, finish);
+        assert!(decision_is_compatible_with_recommendation(
+            &finish,
+            request.recommended_action.as_ref().unwrap()
+        ));
+    }
+
+    #[test]
+    fn validate_redirects_incompatible_validate_when_compile_recommended() {
+        let request = compile_invoke_request();
+        let incompatible = ModelDecision::Validate {
+            request: "r".to_string(),
+            code: Some("fn main() {}".to_string()),
+            plan_kind: "Generic".to_string(),
+        };
+        assert!(!decision_is_compatible_with_recommendation(
+            &incompatible,
+            request.recommended_action.as_ref().unwrap()
+        ));
+        let validated = validate_model_decision_against_recommendation(incompatible, &request);
+        assert!(matches!(validated, ModelDecision::Compile { .. }));
+    }
+
+    #[test]
+    fn validate_keeps_compatible_repair_diagnostic() {
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 2,
+            user_request: "compilar".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some("fn main() { broken".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: None,
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Unsatisfied".to_string(),
+                criteria_total: 1,
+                criteria_pass: 0,
+                criteria_fail: 1,
+                criteria_insufficient: 0,
+                message: "compile fail".to_string(),
+            }),
+            goal_gap: None,
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "RepairDiagnostic".to_string(),
+                tool_name: Some(REPAIR_DIAGNOSTIC.to_string()),
+                criterion_id: Some("ac-compile".to_string()),
+                criterion_kind: Some("Compile".to_string()),
+                priority: 0,
+                reason: "compilación fallida".to_string(),
+            }),
+            system_prompt: String::new(),
+        };
+        let repair = ModelDecision::RepairDiagnostic {
+            errors: vec!["expected `}`".to_string()],
+        };
+        let validated = validate_model_decision_against_recommendation(repair.clone(), &request);
+        assert_eq!(validated, repair);
+    }
+
+    #[test]
+    fn validate_redirects_finish_when_compile_recommended() {
+        let request = compile_invoke_request();
+        let validated = validate_model_decision_against_recommendation(
+            ModelDecision::Finish {
+                summary: "too early".to_string(),
+            },
+            &request,
+        );
+        assert!(matches!(validated, ModelDecision::Compile { .. }));
+    }
+
+    #[test]
+    fn no_deterministic_action_marks_finish_incompatible() {
+        let rec = SerializedRecommendedAction {
+            kind: "NoDeterministicAction".to_string(),
+            tool_name: None,
+            criterion_id: None,
+            criterion_kind: None,
+            priority: u8::MAX,
+            reason: "sin acción determinista".to_string(),
+        };
+        let finish = ModelDecision::Finish {
+            summary: "blocked".to_string(),
+        };
+        assert!(!decision_is_compatible_with_recommendation(&finish, &rec));
+        assert!(decision_is_compatible_with_recommendation(
+            &ModelDecision::Validate {
+                request: "r".to_string(),
+                code: None,
+                plan_kind: "Api".to_string(),
+            },
+            &rec
+        ));
     }
 
     #[test]

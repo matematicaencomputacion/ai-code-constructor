@@ -6,8 +6,9 @@ use crate::harness::correction::Correction;
 use crate::harness::feature_flags::ai_agent_gap_guidance_enabled;
 use crate::harness::model::{
     AiSessionConfig, ModelClient, ModelDecision, ModelError, ModelInteractionTrace,
-    ModelResponseError, apply_gap_guidance, model_request_from_context, parse_model_response,
-    structured_to_correction, structured_to_file_operation, validate_apply_correction,
+    ModelResponseError, model_request_from_context, parse_model_response, structured_to_correction,
+    structured_to_file_operation, validate_apply_correction,
+    validate_model_decision_against_recommendation,
 };
 
 /// Primer Agent basado en IA: serializa contexto, consulta [`ModelClient`]
@@ -139,7 +140,7 @@ impl Agent for AiAgent {
             }
         };
         let decision = if ai_agent_gap_guidance_enabled(self.session.gap_guidance) {
-            apply_gap_guidance(decision, &request)
+            validate_model_decision_against_recommendation(decision, &request)
         } else {
             decision
         };
@@ -365,6 +366,61 @@ fn implementar_handlers() {
             &ModelDecision::Compile {
                 code: "fn main() {}".to_string(),
             }
+        );
+    }
+
+    struct AlwaysValidateModelClient;
+
+    impl ModelClient for AlwaysValidateModelClient {
+        fn complete(
+            &self,
+            _request: &crate::harness::model::ModelRequest,
+        ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+            Ok(crate::harness::model::ModelResponse {
+                raw_text: serialize_decision(&ModelDecision::Validate {
+                    request: "compilar".to_string(),
+                    code: Some("fn main() {}".to_string()),
+                    plan_kind: "Generic".to_string(),
+                }),
+            })
+        }
+    }
+
+    #[test]
+    fn ai_agent_recommended_action_redirects_incompatible_validate_to_compile() {
+        use crate::harness::criterion::CriterionKind;
+        use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+
+        let spec = Specification::new("spec-rec-guidance", "compilar")
+            .with_requirements(vec![Requirement::new("req", "compilar")])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-c", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req")]),
+            ]);
+        let session = AiSessionConfig::new("compilar", "Generic").with_gap_guidance(true);
+        let mut agent = AiAgent::new(Box::new(AlwaysValidateModelClient), session);
+        let ctx = AgentContext::new("rec-guidance")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(spec);
+        let action = agent.propose(&ctx);
+        assert!(matches!(action, AgentAction::Compile { .. }));
+        assert!(matches!(
+            agent
+                .trace
+                .parsed_decisions
+                .last()
+                .unwrap()
+                .as_ref()
+                .unwrap(),
+            ModelDecision::Compile { .. }
+        ));
+        let request = agent.trace.requests.last().expect("request");
+        assert_eq!(
+            request
+                .recommended_action
+                .as_ref()
+                .map(|rec| rec.kind.as_str()),
+            Some("InvokeTool")
         );
     }
 
