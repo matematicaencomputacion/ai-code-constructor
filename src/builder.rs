@@ -1,6 +1,80 @@
 use crate::planner::PlanKind;
 use crate::state::CodeState;
 
+/// Definición determinista de archivos iniciales para un [`PlanKind`].
+///
+/// Fuente canónica del Builder para AutonomousConstruction / [`RustArtifact`].
+/// `initial_source_for_kind` expone solo el contenido del **primary**.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InitialArtifactDefinition {
+    pub primary_path: &'static str,
+    files: Vec<(&'static str, String)>,
+}
+
+impl InitialArtifactDefinition {
+    pub fn primary_source(&self) -> &str {
+        self.files
+            .iter()
+            .find(|(path, _)| *path == self.primary_path)
+            .map(|(_, source)| source.as_str())
+            .unwrap_or("")
+    }
+
+    pub fn file_count(&self) -> usize {
+        self.files.len()
+    }
+
+    pub fn files(&self) -> impl Iterator<Item = (&'static str, &str)> {
+        self.files
+            .iter()
+            .map(|(path, source)| (*path, source.as_str()))
+    }
+}
+
+/// Archivos iniciales deterministas por [`PlanKind`] (primary + siblings).
+pub fn initial_artifact_definition_for_kind(kind: PlanKind) -> InitialArtifactDefinition {
+    match kind {
+        PlanKind::Authentication => InitialArtifactDefinition {
+            primary_path: "src/main.rs",
+            files: vec![
+                ("src/main.rs", authentication_main_module()),
+                ("src/auth.rs", authentication_auth_module()),
+            ],
+        },
+        other => {
+            let source = base_implementation_for(other);
+            InitialArtifactDefinition {
+                primary_path: "src/main.rs",
+                files: vec![("src/main.rs", source)],
+            }
+        }
+    }
+}
+
+fn authentication_main_module() -> String {
+    r#"mod auth;
+
+fn main() {
+    let usuario_valido = auth::validar_credenciales("usuario", "password");
+
+    if usuario_valido {
+        println!("Login correcto");
+    } else {
+        println!("Login incorrecto");
+    }
+}
+"#
+    .to_string()
+}
+
+fn authentication_auth_module() -> String {
+    r#"pub fn validar_credenciales(usuario: &str, password: &str) -> bool {
+    !usuario.is_empty() && !password.is_empty()
+}
+"#
+    .to_string()
+}
+
 /// Genera código a partir del estado actual.
 ///
 /// La primera iteración genera deliberadamente código
@@ -67,7 +141,7 @@ pub fn build(state: &mut CodeState) {
     // La base depende exclusivamente de `plan.kind`. El feedback solo
     // transforma esa base; nunca concatena plantillas de otros planes.
 
-    let kind = plan.kind.clone();
+    let kind = plan.kind;
     let base_implementation = base_implementation_for(kind);
 
     let implementation = apply_feedback(base_implementation, &state.feedback, &state.request);
@@ -146,6 +220,16 @@ fn implementar_funcionalidad() {
 "#
         .to_string(),
     }
+}
+
+/// Source determinista del Artifact inicial a partir de [`PlanKind`].
+///
+/// No usa AI ni [`CodeState`]. Devuelve el contenido del archivo **primary**
+/// de [`initial_artifact_definition_for_kind`].
+pub fn initial_source_for_kind(kind: PlanKind) -> String {
+    initial_artifact_definition_for_kind(kind)
+        .primary_source()
+        .to_string()
 }
 
 /// Defecto deliberado de la iteración 1: `println!("Request: …"` sin `);`.
@@ -543,5 +627,91 @@ mod tests {
         assert!(!code.contains("analizar_requisitos"));
         assert!(braces_are_balanced(&code));
         compiler::compile(&code).expect("Api + feedback de delimitadores debe compilar");
+    }
+
+    #[test]
+    fn initial_source_for_kind_is_deterministic() {
+        for kind in [
+            PlanKind::Api,
+            PlanKind::Calculator,
+            PlanKind::Authentication,
+            PlanKind::Generic,
+        ] {
+            let first = initial_source_for_kind(kind);
+            let second = initial_source_for_kind(kind);
+            assert_eq!(first, second);
+            assert!(!first.trim().is_empty());
+            assert!(first.contains("fn main()"));
+        }
+    }
+
+    #[test]
+    fn initial_source_covers_all_plan_kinds() {
+        let api = initial_source_for_kind(PlanKind::Api);
+        assert!(api.contains("crear_servidor"));
+        assert!(api.contains("Servidor HTTP"));
+
+        let calc = initial_source_for_kind(PlanKind::Calculator);
+        assert!(calc.contains("sumar"));
+
+        let auth = initial_source_for_kind(PlanKind::Authentication);
+        assert!(auth.contains("mod auth"));
+        assert!(auth.contains("auth::validar_credenciales"));
+
+        let auth_def = initial_artifact_definition_for_kind(PlanKind::Authentication);
+        assert_eq!(auth_def.file_count(), 2);
+        assert!(
+            auth_def
+                .files()
+                .any(|(path, source)| path == "src/auth.rs"
+                    && source.contains("validar_credenciales"))
+        );
+
+        let generic = initial_source_for_kind(PlanKind::Generic);
+        assert!(generic.contains("analizar_requisitos"));
+    }
+
+    #[test]
+    fn initial_artifact_definition_is_deterministic() {
+        for kind in [
+            PlanKind::Api,
+            PlanKind::Calculator,
+            PlanKind::Authentication,
+            PlanKind::Generic,
+        ] {
+            let first = initial_artifact_definition_for_kind(kind);
+            let second = initial_artifact_definition_for_kind(kind);
+            assert_eq!(first, second);
+        }
+    }
+
+    #[test]
+    fn authentication_is_multi_file_other_kinds_single_file() {
+        assert_eq!(
+            initial_artifact_definition_for_kind(PlanKind::Calculator).file_count(),
+            1
+        );
+        assert_eq!(
+            initial_artifact_definition_for_kind(PlanKind::Api).file_count(),
+            1
+        );
+        assert_eq!(
+            initial_artifact_definition_for_kind(PlanKind::Generic).file_count(),
+            1
+        );
+        assert_eq!(
+            initial_artifact_definition_for_kind(PlanKind::Authentication).file_count(),
+            2
+        );
+    }
+
+    #[test]
+    fn initial_source_matches_builder_correction_base() {
+        let mut state = state_with_plan(PlanKind::Api, "Crear una API REST", 2);
+        build(&mut state);
+        assert_eq!(
+            state.code.as_deref(),
+            Some(initial_source_for_kind(PlanKind::Api).as_str())
+        );
     }
 }
