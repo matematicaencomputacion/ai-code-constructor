@@ -46,6 +46,7 @@ User message context:
 - artifact_file_count and artifact_file_N_path / artifact_file_N_source: full Artifact tree; use path on apply_correction and apply_file_operations.
 - goal_evaluation_*: summary of Goal status (Satisfied / Unsatisfied / Inconclusive), criteria counts, and evaluation message.
 - goal_gap_*: unsatisfied AcceptanceCriteria with kind, verdict, message, and suggested_action (tool name hint).
+- recommended_action_*: primary recommended next action derived from Goal evaluation (kind, tool, criterion, priority, reason).
 
 Security rules:
 - Never request shell, arbitrary filesystem access, or direct CodeState mutation.
@@ -54,8 +55,8 @@ Security rules:
 - Use finish only when required AcceptanceCriteria are PASS, or when continuing is unsafe.
 
 Decision policy:
-- Read last_observation_summary, validator_errors, repairer_feedback, evaluation_verdict, criterion_kind, working_code, artifact_files, goal_evaluation, and goal_gap.
-- When goal_evaluation_status is not Satisfied, prefer goal_gap_0_suggested_action and criterion kind over finish.
+- Read last_observation_summary, validator_errors, repairer_feedback, evaluation_verdict, criterion_kind, working_code, artifact_files, goal_evaluation, goal_gap, and recommended_action.
+- When goal_evaluation_status is not Satisfied, prefer recommended_action_tool and recommended_action_kind over finish.
 - After validation FAIL: prefer repair_diagnostic.
 - After repair feedback: prefer apply_correction with minimal edits.
 - After apply_correction success: re-validate.

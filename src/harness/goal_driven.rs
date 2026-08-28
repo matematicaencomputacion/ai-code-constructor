@@ -111,7 +111,7 @@ pub struct GoalGap {
 
 impl GoalGap {
     pub fn from_evaluation(evaluation: &SpecificationEvaluation) -> Self {
-        let unsatisfied = evaluation
+        let mut unsatisfied = evaluation
             .criteria
             .iter()
             .filter(|item| item.verdict != EvaluationVerdict::Pass)
@@ -122,7 +122,8 @@ impl GoalGap {
                 message: item.message.clone(),
                 suggested_action: suggested_tool_for_kind(item.kind),
             })
-            .collect();
+            .collect::<Vec<_>>();
+        unsatisfied.sort_by_key(|gap| criterion_kind_priority(gap.kind));
         Self { unsatisfied }
     }
 
@@ -133,6 +134,143 @@ impl GoalGap {
     pub fn primary(&self) -> Option<&CriterionGap> {
         self.unsatisfied.first()
     }
+}
+
+/// Acción recomendada derivada de Goal + evaluación + gap (no heurística opaca).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecommendedAction {
+    /// Goal satisfecha: Finish permitido.
+    FinishAllowed { reason: String },
+    /// Ejecutar tool determinista para cerrar el gap.
+    InvokeTool {
+        tool_name: &'static str,
+        criterion_id: AcceptanceCriterionId,
+        kind: CriterionKind,
+        priority: u8,
+        reason: String,
+    },
+    /// Fallo con evidencia de error en compilación: reparar antes de re-verificar.
+    RepairDiagnostic {
+        criterion_id: AcceptanceCriterionId,
+        kind: CriterionKind,
+        priority: u8,
+        reason: String,
+    },
+    /// Sin acción determinista (p. ej. criterio Unknown).
+    NoDeterministicAction { reason: String },
+}
+
+impl RecommendedAction {
+    pub fn tool_name(&self) -> Option<&str> {
+        match self {
+            Self::InvokeTool { tool_name, .. } => Some(tool_name),
+            Self::RepairDiagnostic { .. } => Some(crate::harness::tools::REPAIR_DIAGNOSTIC),
+            Self::FinishAllowed { .. } | Self::NoDeterministicAction { .. } => None,
+        }
+    }
+
+    pub fn priority(&self) -> u8 {
+        match self {
+            Self::FinishAllowed { .. } => 0,
+            Self::InvokeTool { priority, .. } | Self::RepairDiagnostic { priority, .. } => {
+                *priority
+            }
+            Self::NoDeterministicAction { .. } => u8::MAX,
+        }
+    }
+}
+
+/// Prioridad determinista por [`CriterionKind`] (menor = más urgente).
+pub fn criterion_kind_priority(kind: CriterionKind) -> u8 {
+    match kind {
+        CriterionKind::Compile => 0,
+        CriterionKind::Validate => 1,
+        CriterionKind::RunTests => 2,
+        CriterionKind::Clippy => 3,
+        CriterionKind::CheckFormat => 4,
+        CriterionKind::Unknown => u8::MAX - 1,
+    }
+}
+
+/// Recomienda acción para un único criterio insatisfecho.
+pub fn recommend_for_criterion_gap(gap: &CriterionGap) -> RecommendedAction {
+    let priority = criterion_kind_priority(gap.kind);
+    let tool = gap.suggested_action;
+
+    if gap.kind == CriterionKind::Unknown || tool.is_none() {
+        return RecommendedAction::NoDeterministicAction {
+            reason: format!(
+                "criterio `{}` (kind={:?}) sin acción determinista",
+                gap.criterion_id.as_str(),
+                gap.kind
+            ),
+        };
+    }
+
+    let tool_name = tool.expect("tool checked above");
+
+    match gap.verdict {
+        EvaluationVerdict::Fail if gap.kind == CriterionKind::Compile => {
+            RecommendedAction::RepairDiagnostic {
+                criterion_id: gap.criterion_id.clone(),
+                kind: gap.kind,
+                priority,
+                reason: format!(
+                    "compilación fallida para `{}`: {}",
+                    gap.criterion_id.as_str(),
+                    gap.message
+                ),
+            }
+        }
+        EvaluationVerdict::Fail => RecommendedAction::InvokeTool {
+            tool_name,
+            criterion_id: gap.criterion_id.clone(),
+            kind: gap.kind,
+            priority,
+            reason: format!(
+                "criterio `{}` falló (verdict=Fail): re-ejecutar {tool_name}",
+                gap.criterion_id.as_str()
+            ),
+        },
+        EvaluationVerdict::InsufficientEvidence => RecommendedAction::InvokeTool {
+            tool_name,
+            criterion_id: gap.criterion_id.clone(),
+            kind: gap.kind,
+            priority,
+            reason: format!(
+                "evidencia insuficiente para `{}`: ejecutar {tool_name}",
+                gap.criterion_id.as_str()
+            ),
+        },
+        EvaluationVerdict::Pass => RecommendedAction::FinishAllowed {
+            reason: format!("criterio `{}` ya satisfecho", gap.criterion_id.as_str()),
+        },
+    }
+}
+
+/// Selecciona la recomendación primaria a partir de evaluación completa de Goal.
+pub fn select_primary_recommendation(evaluation: &GoalEvaluation) -> RecommendedAction {
+    if evaluation.status == GoalStatus::Satisfied {
+        return RecommendedAction::FinishAllowed {
+            reason: evaluation.specification_evaluation.message.clone(),
+        };
+    }
+
+    evaluation
+        .gap
+        .primary()
+        .map(recommend_for_criterion_gap)
+        .unwrap_or_else(|| RecommendedAction::NoDeterministicAction {
+            reason: "goal insatisfecha sin gaps identificados".to_string(),
+        })
+}
+
+/// Lista todas las recomendaciones ordenadas por prioridad (para trazabilidad/tests).
+pub fn recommend_all_from_gap(gap: &GoalGap) -> Vec<RecommendedAction> {
+    gap.unsatisfied
+        .iter()
+        .map(recommend_for_criterion_gap)
+        .collect()
 }
 
 fn suggested_tool_for_kind(kind: CriterionKind) -> Option<&'static str> {
@@ -502,31 +640,82 @@ impl GapDrivenAgent {
         }
     }
 
-    fn action_for_gap(&mut self, gap: &CriterionGap, ctx: &AgentContext) -> AgentAction {
-        let label = gap.suggested_action.unwrap_or("unknown").to_string();
-        self.attempted_actions.push(label.clone());
+    fn action_for_recommendation(
+        &mut self,
+        recommendation: &RecommendedAction,
+        ctx: &AgentContext,
+    ) -> AgentAction {
+        let label = recommendation.tool_name().unwrap_or("finish").to_string();
+        self.attempted_actions.push(label);
 
-        match gap.kind {
-            CriterionKind::Compile => AgentAction::Compile {
-                code: ctx
-                    .working_code()
-                    .map(str::to_string)
-                    .unwrap_or_else(|| "fn main() {}".to_string()),
+        match recommendation {
+            RecommendedAction::FinishAllowed { reason } => AgentAction::Finish {
+                summary: reason.clone(),
             },
-            CriterionKind::Validate => AgentAction::Validate {
-                request: self.request.clone(),
-                code: ctx.working_code().map(str::to_string),
-                plan_kind: "Api".to_string(),
-            },
-            CriterionKind::RunTests => AgentAction::RunTests {
-                filter: String::new(),
-            },
-            CriterionKind::Clippy => AgentAction::RunClippy,
-            CriterionKind::CheckFormat => AgentAction::CheckFormat,
-            CriterionKind::Unknown => AgentAction::Finish {
-                summary: format!("sin acción para criterio `{}`", gap.criterion_id.as_str()),
+            RecommendedAction::RepairDiagnostic { .. } => {
+                let errors = compile_errors_from_context(ctx);
+                AgentAction::RepairDiagnostic { errors }
+            }
+            RecommendedAction::InvokeTool { tool_name, .. } => {
+                recommended_tool_to_agent_action(tool_name, ctx, &self.request)
+            }
+            RecommendedAction::NoDeterministicAction { reason } => AgentAction::Finish {
+                summary: reason.clone(),
             },
         }
+    }
+
+    fn action_for_gap(&mut self, gap: &CriterionGap, ctx: &AgentContext) -> AgentAction {
+        self.action_for_recommendation(&recommend_for_criterion_gap(gap), ctx)
+    }
+}
+
+fn compile_errors_from_context(ctx: &AgentContext) -> Vec<String> {
+    if let Some(AgentObservation::CriterionEvaluated {
+        evidence, message, ..
+    }) = &ctx.last_observation
+    {
+        let mut errors: Vec<String> = evidence
+            .iter()
+            .filter(|item| item.label == "compiler_stderr")
+            .map(|item| item.detail.clone())
+            .collect();
+        if errors.is_empty() {
+            errors.push(message.clone());
+        }
+        if !errors.is_empty() {
+            return errors;
+        }
+    }
+    vec!["compilación fallida".to_string()]
+}
+
+fn recommended_tool_to_agent_action(
+    tool_name: &str,
+    ctx: &AgentContext,
+    request: &str,
+) -> AgentAction {
+    use crate::harness::tools::{CHECK_FORMAT, COMPILE, RUN_CLIPPY, RUN_TESTS, VALIDATE};
+    match tool_name {
+        COMPILE => AgentAction::Compile {
+            code: ctx
+                .working_code()
+                .map(str::to_string)
+                .unwrap_or_else(|| "fn main() {}".to_string()),
+        },
+        VALIDATE => AgentAction::Validate {
+            request: request.to_string(),
+            code: ctx.working_code().map(str::to_string),
+            plan_kind: "Api".to_string(),
+        },
+        RUN_TESTS => AgentAction::RunTests {
+            filter: String::new(),
+        },
+        RUN_CLIPPY => AgentAction::RunClippy,
+        CHECK_FORMAT => AgentAction::CheckFormat,
+        _ => AgentAction::Finish {
+            summary: format!("tool no mapeada: {tool_name}"),
+        },
     }
 }
 
@@ -950,5 +1139,82 @@ mod tests {
         let result = loop_.run(&harness, &mut agent, &goal, ctx);
         assert_eq!(result.status, GoalDrivenStatus::GoalSatisfied);
         assert_eq!(result.loop_result.iterations, 0);
+    }
+
+    // --- RecommendedAction selection (unit A-D) ---
+
+    #[test]
+    fn recommended_action_finish_allowed_when_goal_satisfied() {
+        // A
+        let goal = compile_only_goal();
+        let evidence = vec![
+            Evidence::new("tool", COMPILE),
+            Evidence::new("compile_status", "ok"),
+        ];
+        let evaluation = GoalEvaluator::new().evaluate(&goal, &evidence);
+        let rec = select_primary_recommendation(&evaluation);
+        assert!(matches!(rec, RecommendedAction::FinishAllowed { .. }));
+        assert!(rec.tool_name().is_none());
+    }
+
+    #[test]
+    fn recommended_action_compile_when_no_evidence() {
+        // B
+        let goal = compile_only_goal();
+        let evaluation = GoalEvaluator::new().evaluate(&goal, &[]);
+        let rec = select_primary_recommendation(&evaluation);
+        assert!(matches!(
+            rec,
+            RecommendedAction::InvokeTool {
+                tool_name,
+                kind: CriterionKind::Compile,
+                ..
+            } if tool_name == COMPILE
+        ));
+    }
+
+    #[test]
+    fn recommended_action_repair_on_compile_fail_not_finish() {
+        // C
+        let goal = compile_only_goal();
+        let evidence = vec![
+            Evidence::new("tool", COMPILE),
+            Evidence::new("compile_status", "error"),
+            Evidence::new("compiler_stderr", "expected `}`"),
+        ];
+        let evaluation = GoalEvaluator::new().evaluate(&goal, &evidence);
+        let rec = select_primary_recommendation(&evaluation);
+        assert!(matches!(
+            rec,
+            RecommendedAction::RepairDiagnostic {
+                kind: CriterionKind::Compile,
+                ..
+            }
+        ));
+        assert!(!matches!(rec, RecommendedAction::FinishAllowed { .. }));
+    }
+
+    #[test]
+    fn recommended_action_deterministic_priority_with_multiple_gaps() {
+        // D — Compile (0) antes que Validate (1)
+        let goal = compile_and_validate_goal();
+        let evaluation = GoalEvaluator::new().evaluate(&goal, &[]);
+        assert_eq!(evaluation.gap.unsatisfied.len(), 2);
+        assert_eq!(
+            evaluation.gap.primary().unwrap().kind,
+            CriterionKind::Compile
+        );
+        let rec = select_primary_recommendation(&evaluation);
+        assert!(matches!(
+            rec,
+            RecommendedAction::InvokeTool {
+                kind: CriterionKind::Compile,
+                priority: 0,
+                ..
+            }
+        ));
+        let all = recommend_all_from_gap(&evaluation.gap);
+        assert_eq!(all.len(), 2);
+        assert!(all[0].priority() <= all[1].priority());
     }
 }
