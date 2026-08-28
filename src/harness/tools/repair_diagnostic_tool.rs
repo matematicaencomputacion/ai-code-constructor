@@ -35,15 +35,14 @@ impl Tool for RepairDiagnosticTool {
         let errors = decode_repair_diagnostic_input(input);
 
         if errors.is_empty() {
-            return ToolResult {
-                success: false,
-                output: "no hay errores para diagnosticar".to_string(),
-                evidence: vec![
+            return ToolResult::failure(
+                "no hay errores para diagnosticar",
+                vec![
                     Evidence::new("tool", REPAIR_DIAGNOSTIC),
                     Evidence::new("diagnostic_status", "error"),
                     Evidence::new("feedback_count", "0"),
                 ],
-            };
+            );
         }
 
         let request = "harness-repair-diagnostic".to_string();
@@ -96,10 +95,10 @@ impl Tool for RepairDiagnosticTool {
             ));
         }
 
-        ToolResult {
-            success,
-            output,
-            evidence,
+        if success {
+            ToolResult::success(output, evidence)
+        } else {
+            ToolResult::failure(output, evidence)
         }
     }
 }

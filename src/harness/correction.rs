@@ -125,19 +125,11 @@ impl Correction {
         }
     }
 
-    /// Aplica esta corrección a un archivo existente del Artifact.
+    /// Aplica esta corrección a un archivo existente del Artifact (batch de 1).
     ///
-    /// No crea archivos. Incrementa `revision` solo si el contenido cambia.
+    /// Delega en [`apply_corrections_to_artifact`] (+1 revision si hay cambio).
     pub fn apply_to_artifact(&self, artifact: &mut RustArtifact) -> Result<(), String> {
-        if self.target != CorrectionTarget::SessionCode {
-            return Err("target de corrección no autorizado".to_string());
-        }
-        let path = self.resolved_path(artifact).clone();
-        let Some(current) = artifact.file(&path).map(str::to_string) else {
-            return Err(format!("archivo inexistente: {}", path.as_str()));
-        };
-        let next = apply_operation(&current, &self.operation)?;
-        artifact.upsert_file(path, next)
+        apply_corrections_to_artifact(artifact, std::slice::from_ref(self))
     }
 }
 
@@ -150,15 +142,56 @@ pub fn apply_corrections(code: &str, corrections: &[Correction]) -> Result<Strin
     Ok(current)
 }
 
-/// Aplica correcciones al Artifact canónico (multi-file seguro).
+/// Valida un batch de correcciones sin mutar el artifact canónico.
+pub fn validate_corrections(
+    artifact: &RustArtifact,
+    corrections: &[Correction],
+) -> Result<(), String> {
+    preview_corrections_to_artifact(artifact, corrections).map(|_| ())
+}
+
+/// Calcula el estado resultante de un batch de correcciones sin mutar el original.
+pub fn preview_corrections_to_artifact(
+    artifact: &RustArtifact,
+    corrections: &[Correction],
+) -> Result<RustArtifact, String> {
+    if corrections.is_empty() {
+        return Err("ApplyCorrection requiere al menos una corrección".to_string());
+    }
+    let mut trial = artifact.clone();
+    for correction in corrections {
+        apply_single_correction_to_trial(&mut trial, correction)?;
+    }
+    Ok(trial)
+}
+
+/// Aplica correcciones al Artifact canónico en un **batch atómico**.
 ///
-/// Cada corrección actualiza solo su archivo objetivo; el resto permanece intacto.
+/// Todas las correcciones se validan sobre un snapshot; si alguna falla, no hay cambio.
+/// Un batch exitoso con diff real incrementa `revision` exactamente una vez.
 pub fn apply_corrections_to_artifact(
     artifact: &mut RustArtifact,
     corrections: &[Correction],
 ) -> Result<(), String> {
-    for correction in corrections {
-        correction.apply_to_artifact(artifact)?;
+    let preview = preview_corrections_to_artifact(artifact, corrections)?;
+    crate::harness::artifact_mutation::commit_artifact_preview(artifact, preview)?;
+    Ok(())
+}
+
+fn apply_single_correction_to_trial(
+    trial: &mut RustArtifact,
+    correction: &Correction,
+) -> Result<(), String> {
+    if correction.target != CorrectionTarget::SessionCode {
+        return Err("target de corrección no autorizado".to_string());
+    }
+    let path = correction.resolved_path(trial).clone();
+    let Some(current) = trial.file(&path).map(str::to_string) else {
+        return Err(format!("archivo inexistente: {}", path.as_str()));
+    };
+    let next = apply_operation(&current, &correction.operation)?;
+    if next != current {
+        trial.insert_file_internal(path, next);
     }
     Ok(())
 }
@@ -234,6 +267,34 @@ mod tests {
     #[test]
     fn correction_rejects_unauthorized_target_parse() {
         assert!(CorrectionTarget::parse("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn batch_corrections_increment_revision_once() {
+        let main = ArtifactPath::parse("src/main.rs").unwrap();
+        let helper = ArtifactPath::parse("src/helper.rs").unwrap();
+        let mut artifact = RustArtifact::try_from_files(
+            ArtifactId::new("art-batch"),
+            "main.rs",
+            main.clone(),
+            [
+                (
+                    main.clone(),
+                    "mod helper;\nfn main() { helper::value(); }\n".to_string(),
+                ),
+                (helper.clone(), "pub fn value() -> i32 { 1 }\n".to_string()),
+            ],
+        )
+        .unwrap();
+        apply_corrections_to_artifact(
+            &mut artifact,
+            &[
+                Correction::replace_file_text(helper.clone(), "1", "2"),
+                Correction::replace_file_text(main, "helper::value()", "helper::value() /*x*/"),
+            ],
+        )
+        .unwrap();
+        assert_eq!(artifact.revision(), 1);
     }
 
     #[test]

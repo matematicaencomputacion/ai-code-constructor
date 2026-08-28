@@ -1,6 +1,7 @@
 use crate::harness::artifact_file_operation::{
-    ArtifactFileOperation, apply_file_operations_to_artifact,
+    ArtifactFileOperation, preview_file_operations_to_artifact,
 };
+use crate::harness::artifact_mutation::artifact_files_unchanged;
 use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::context::AgentContext;
 use crate::harness::evaluation::Evidence;
@@ -68,9 +69,9 @@ fn decode_file_operation(raw: &str) -> Result<ArtifactFileOperation, String> {
     }
 }
 
-/// Valida y reporta operaciones estructurales sobre el Artifact de sesión.
+/// Valida operaciones estructurales y produce preview + Evidence.
 ///
-/// La mutación canónica la aplica el Harness vía [`apply_file_operations_to_artifact`].
+/// El commit canónico lo realiza el Harness desde [`ToolResult::artifact_preview`].
 pub struct FileOperationsTool;
 
 impl Tool for FileOperationsTool {
@@ -82,41 +83,39 @@ impl Tool for FileOperationsTool {
         let operations = match decode_file_operations_input(input) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return ToolResult {
-                    success: false,
-                    output: error.clone(),
-                    evidence: vec![
+                return ToolResult::failure(
+                    error.clone(),
+                    vec![
                         Evidence::new("tool", APPLY_FILE_OPERATIONS),
                         Evidence::new("file_operation_status", "error"),
                         Evidence::new("parse_error", error),
                     ],
-                };
+                );
             }
         };
 
         let Some(base_artifact) = ctx.working_artifact.as_ref() else {
-            return ToolResult {
-                success: false,
-                output: "no hay Artifact de sesión autorizado".to_string(),
-                evidence: vec![
+            return ToolResult::failure(
+                "no hay Artifact de sesión autorizado",
+                vec![
                     Evidence::new("tool", APPLY_FILE_OPERATIONS),
                     Evidence::new("file_operation_status", "error"),
                     Evidence::new("security", "missing_session_artifact"),
                 ],
-            };
+            );
         };
 
-        let revision_before = base_artifact.revision();
-        let mut working = base_artifact.clone();
-        if let Err(error) = apply_file_operations_to_artifact(&mut working, &operations) {
-            return ToolResult {
-                success: false,
-                output: error.clone(),
-                evidence: file_operation_error_evidence(&operations, &error),
-            };
-        }
+        let preview = match preview_file_operations_to_artifact(base_artifact, &operations) {
+            Ok(value) => value,
+            Err(error) => {
+                return ToolResult::failure(
+                    error.clone(),
+                    file_operation_error_evidence(&operations, &error),
+                );
+            }
+        };
 
-        let changed = working.revision() != revision_before || working != *base_artifact;
+        let changed = !artifact_files_unchanged(base_artifact, &preview);
         let mut evidence = vec![
             Evidence::new("tool", APPLY_FILE_OPERATIONS),
             Evidence::new(
@@ -124,7 +123,7 @@ impl Tool for FileOperationsTool {
                 if changed { "ok" } else { "unchanged" },
             ),
             Evidence::new("operation_count", operations.len().to_string()),
-            Evidence::new("file_count", working.file_count().to_string()),
+            Evidence::new("file_count", preview.file_count().to_string()),
         ];
         ctx.append_artifact_evidence(&mut evidence);
 
@@ -154,7 +153,7 @@ impl Tool for FileOperationsTool {
             }
         }
 
-        ToolResult {
+        let mut result = ToolResult {
             success: changed,
             output: if changed {
                 format!(
@@ -165,7 +164,12 @@ impl Tool for FileOperationsTool {
                 "operaciones estructurales no modificaron el Artifact".to_string()
             },
             evidence,
+            artifact_preview: None,
+        };
+        if changed {
+            result = result.with_artifact_preview(preview);
         }
+        result
     }
 }
 

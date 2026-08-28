@@ -38,6 +38,14 @@ pub fn validate_file_operations(
     artifact: &RustArtifact,
     operations: &[ArtifactFileOperation],
 ) -> Result<(), String> {
+    preview_file_operations_to_artifact(artifact, operations).map(|_| ())
+}
+
+/// Calcula el estado resultante de un batch sin mutar el artifact canónico.
+pub fn preview_file_operations_to_artifact(
+    artifact: &RustArtifact,
+    operations: &[ArtifactFileOperation],
+) -> Result<RustArtifact, String> {
     if operations.is_empty() {
         return Err("ApplyFileOperations requiere al menos una operación".to_string());
     }
@@ -45,32 +53,18 @@ pub fn validate_file_operations(
     for operation in operations {
         apply_single_file_operation(&mut trial, operation)?;
     }
-    Ok(())
+    Ok(trial)
 }
 
 /// Aplica un batch **atómico**: valida todas las operaciones sobre un snapshot;
 /// si alguna falla, el Artifact original no cambia. Un batch exitoso incrementa
-/// `revision` exactamente una vez.
+/// `revision` exactamente una vez si hay diff real.
 pub fn apply_file_operations_to_artifact(
     artifact: &mut RustArtifact,
     operations: &[ArtifactFileOperation],
 ) -> Result<(), String> {
-    if operations.is_empty() {
-        return Err("ApplyFileOperations requiere al menos una operación".to_string());
-    }
-
-    let mut trial = artifact.clone();
-    for operation in operations {
-        apply_single_file_operation(&mut trial, operation)?;
-    }
-
-    if trial.files_snapshot() == artifact.files_snapshot()
-        && trial.primary_path() == artifact.primary_path()
-    {
-        return Ok(());
-    }
-
-    artifact.commit_files_state(trial);
+    let preview = preview_file_operations_to_artifact(artifact, operations)?;
+    crate::harness::artifact_mutation::commit_artifact_preview(artifact, preview)?;
     Ok(())
 }
 

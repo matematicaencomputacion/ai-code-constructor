@@ -1,8 +1,9 @@
+use crate::harness::artifact_mutation::artifact_files_unchanged;
 use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::context::AgentContext;
 use crate::harness::correction::{
     Correction, CorrectionOperation, CorrectionTarget, SESSION_CODE_TARGET,
-    apply_corrections_to_artifact,
+    preview_corrections_to_artifact,
 };
 use crate::harness::evaluation::Evidence;
 use crate::harness::tool::{Tool, ToolResult};
@@ -148,10 +149,10 @@ fn decode_correction(target: CorrectionTarget, raw: &str) -> Result<Correction, 
     }
 }
 
-/// Aplica correcciones estructuradas al Artifact de sesión autorizado.
+/// Valida correcciones sobre el Artifact de sesión y produce preview + Evidence.
 ///
-/// No ejecuta Validator, Compiler ni Repairer. No invoca comandos externos.
-/// La mutación canónica la aplica el Harness vía [`apply_corrections_to_artifact`].
+/// No ejecuta Validator, Compiler ni Repairer. El commit canónico lo realiza el Harness
+/// desde [`ToolResult::artifact_preview`].
 pub struct CorrectionTool;
 
 impl Tool for CorrectionTool {
@@ -163,15 +164,14 @@ impl Tool for CorrectionTool {
         let corrections = match decode_correction_input(input) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return ToolResult {
-                    success: false,
-                    output: error.clone(),
-                    evidence: vec![
+                return ToolResult::failure(
+                    error.clone(),
+                    vec![
                         Evidence::new("tool", APPLY_CORRECTION),
                         Evidence::new("correction_status", "error"),
                         Evidence::new("parse_error", error),
                     ],
-                };
+                );
             }
         };
 
@@ -179,49 +179,47 @@ impl Tool for CorrectionTool {
             .iter()
             .any(|c| c.target != CorrectionTarget::SessionCode)
         {
-            return ToolResult {
-                success: false,
-                output: "target no autorizado".to_string(),
-                evidence: vec![
+            return ToolResult::failure(
+                "target no autorizado",
+                vec![
                     Evidence::new("tool", APPLY_CORRECTION),
                     Evidence::new("correction_status", "error"),
                     Evidence::new("security", "target_rejected"),
                 ],
-            };
+            );
         }
 
         let Some(base_artifact) = ctx.working_artifact.as_ref() else {
-            return ToolResult {
-                success: false,
-                output: "no hay Artifact de sesión autorizado para corregir".to_string(),
-                evidence: vec![
+            return ToolResult::failure(
+                "no hay Artifact de sesión autorizado para corregir",
+                vec![
                     Evidence::new("tool", APPLY_CORRECTION),
                     Evidence::new("correction_status", "error"),
                     Evidence::new("security", "missing_session_code"),
                 ],
-            };
+            );
         };
 
-        let mut working = base_artifact.clone();
-        let revision_before = working.revision();
-        if let Err(error) = apply_corrections_to_artifact(&mut working, &corrections) {
-            return ToolResult {
-                success: false,
-                output: error.clone(),
-                evidence: vec![
-                    Evidence::new("tool", APPLY_CORRECTION),
-                    Evidence::new("correction_status", "error"),
-                    Evidence::new("correction_target", SESSION_CODE_TARGET),
-                    Evidence::new("apply_error", error),
-                ],
-            };
-        }
+        let preview = match preview_corrections_to_artifact(base_artifact, &corrections) {
+            Ok(value) => value,
+            Err(error) => {
+                return ToolResult::failure(
+                    error.clone(),
+                    vec![
+                        Evidence::new("tool", APPLY_CORRECTION),
+                        Evidence::new("correction_status", "error"),
+                        Evidence::new("correction_target", SESSION_CODE_TARGET),
+                        Evidence::new("apply_error", error),
+                    ],
+                );
+            }
+        };
 
-        let changed = working.revision() != revision_before || working != *base_artifact;
-        let corrected_primary = working.source().to_string();
+        let changed = !artifact_files_unchanged(base_artifact, &preview);
+        let corrected_primary = preview.source().to_string();
         let paths: Vec<String> = corrections
             .iter()
-            .map(|c| c.resolved_path(&working).as_str().to_string())
+            .map(|c| c.resolved_path(&preview).as_str().to_string())
             .collect();
 
         let mut evidence = vec![
@@ -255,7 +253,7 @@ impl Tool for CorrectionTool {
             ));
         }
 
-        ToolResult {
+        let mut result = ToolResult {
             success: changed,
             output: if changed {
                 format!(
@@ -267,7 +265,12 @@ impl Tool for CorrectionTool {
                 "corrección no modificó el código".to_string()
             },
             evidence,
+            artifact_preview: None,
+        };
+        if changed {
+            result = result.with_artifact_preview(preview);
         }
+        result
     }
 }
 
@@ -289,8 +292,8 @@ fn describe_operation(operation: &CorrectionOperation) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::harness::AgentContext;
     use crate::harness::artifact::{ArtifactId, RustArtifact};
+    use crate::harness::artifact_mutation::commit_artifact_preview;
     use crate::harness::specification::Specification;
 
     #[test]
@@ -322,11 +325,8 @@ mod tests {
             .expect("corrected_code");
         assert_eq!(corrected, "Servidor HTTP");
 
-        apply_corrections_to_artifact(
-            ctx.working_artifact.as_mut().unwrap(),
-            &[Correction::replace_session_text("NET", "HTTP")],
-        )
-        .unwrap();
+        let preview = result.artifact_preview.expect("preview");
+        commit_artifact_preview(ctx.working_artifact.as_mut().unwrap(), preview).unwrap();
         assert_eq!(ctx.working_code(), Some("Servidor HTTP"));
         assert_eq!(ctx.working_artifact.as_ref().unwrap().id(), &id_before);
     }
@@ -343,8 +343,8 @@ mod tests {
         let input = encode_correction_input(&corrections);
         let result = tool.execute(&input, &ctx);
         assert!(result.success);
-        apply_corrections_to_artifact(ctx.working_artifact.as_mut().unwrap(), &corrections)
-            .unwrap();
+        let preview = result.artifact_preview.expect("preview");
+        commit_artifact_preview(ctx.working_artifact.as_mut().unwrap(), preview).unwrap();
         assert_eq!(
             ctx.evaluation_specification.as_ref().map(|s| s.id.as_str()),
             Some(spec.id.as_str())

@@ -490,11 +490,7 @@ mod tests {
 
     #[test]
     fn tool_result_success_is_not_automatic_criterion_pass() {
-        let tool_result = ToolResult {
-            success: true,
-            output: "ok".to_string(),
-            evidence: vec![Evidence::new("tool", REPAIR_DIAGNOSTIC)],
-        };
+        let tool_result = ToolResult::success("ok", vec![Evidence::new("tool", REPAIR_DIAGNOSTIC)]);
         let engine = EvaluationEngine::new();
         let evaluation = engine.evaluate_criterion(
             &AcceptanceCriterion::new("ac-compile-001", "compila", CriterionKind::Compile),

@@ -244,11 +244,7 @@ mod tests {
                 _ctx: &AgentContext,
             ) -> crate::harness::tool::ToolResult {
                 self.calls.fetch_add(1, Ordering::SeqCst);
-                crate::harness::tool::ToolResult {
-                    success: true,
-                    output: "ok".to_string(),
-                    evidence: vec![],
-                }
+                crate::harness::tool::ToolResult::success("ok", vec![])
             }
         }
 

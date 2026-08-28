@@ -651,13 +651,22 @@ fn implementar_handlers() {
                     .copied()
                     .unwrap_or_else(|| self.exits.last().copied().unwrap_or("0"));
                 let success = exit == "0";
-                ToolResult {
-                    success,
-                    output: format!("stub {} exit={exit}", self.name),
-                    evidence: vec![
-                        Evidence::new("tool", self.name),
-                        Evidence::new("exit_status", exit),
-                    ],
+                if success {
+                    ToolResult::success(
+                        format!("stub {} exit={exit}", self.name),
+                        vec![
+                            Evidence::new("tool", self.name),
+                            Evidence::new("exit_status", exit),
+                        ],
+                    )
+                } else {
+                    ToolResult::failure(
+                        format!("stub {} exit={exit}", self.name),
+                        vec![
+                            Evidence::new("tool", self.name),
+                            Evidence::new("exit_status", exit),
+                        ],
+                    )
                 }
             }
         }

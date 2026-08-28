@@ -12,6 +12,7 @@ mod ai_agent;
 pub mod artifact;
 mod artifact_file_operation;
 mod artifact_materialization;
+mod artifact_mutation;
 mod artifact_path;
 mod autonomous_construction;
 mod bridge;
@@ -182,11 +183,7 @@ mod tests {
         }
 
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
-            ToolResult {
-                success: true,
-                output: input.to_string(),
-                evidence: vec![Evidence::new("echo_output", input)],
-            }
+            ToolResult::success(input.to_string(), vec![Evidence::new("echo_output", input)])
         }
     }
 
@@ -204,11 +201,10 @@ mod tests {
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
             self.executed.store(true, Ordering::SeqCst);
             self.calls.fetch_add(1, Ordering::SeqCst);
-            ToolResult {
-                success: true,
-                output: input.to_string(),
-                evidence: vec![Evidence::new("tracking", self.name)],
-            }
+            ToolResult::success(
+                input.to_string(),
+                vec![Evidence::new("tracking", self.name)],
+            )
         }
     }
 
