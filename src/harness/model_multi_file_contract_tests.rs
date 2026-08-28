@@ -26,10 +26,7 @@ mod tests {
 
     #[test]
     fn model_request_exposes_full_artifact_tree() {
-        let session = AiSessionConfig {
-            user_request: "Validar proyecto".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Validar proyecto".to_string(), "Api".to_string());
         let ctx = AgentContext::new("ai").with_working_artifact(two_file_artifact());
         let request = model_request_from_context(&ctx, &session).expect("request");
 
@@ -48,10 +45,7 @@ mod tests {
 
     #[test]
     fn serialized_user_message_lists_every_artifact_file() {
-        let session = AiSessionConfig {
-            user_request: "Validar proyecto".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Validar proyecto".to_string(), "Api".to_string());
         let ctx = AgentContext::new("ai").with_working_artifact(two_file_artifact());
         let request = model_request_from_context(&ctx, &session).expect("request");
 

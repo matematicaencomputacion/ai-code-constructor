@@ -667,10 +667,10 @@ mod tests {
         let client: Box<dyn ModelClient> = Box::new(OpenAICompatibleModelClient::new(test_config(
             &server.base_url,
         )));
-        let session = crate::harness::model::AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = crate::harness::model::AiSessionConfig::new(
+            "Crear una API REST".to_string(),
+            "Api".to_string(),
+        );
         let mut agent = crate::harness::AiAgent::new(client, session);
         let mut ctx = AgentContext::new("openai-client");
         ctx.step = 1;

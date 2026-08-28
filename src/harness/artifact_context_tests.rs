@@ -115,10 +115,7 @@ fn implementar_handlers() { println!("Handlers implementados"); }
         // N
         let artifact = RustArtifact::with_id(ArtifactId::new("art-ai"), "main.rs", "fn main() {}");
         let ctx = AgentContext::new("ai").with_working_artifact(artifact);
-        let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string());
         let request = model_request_from_context(&ctx, &session).expect("request");
         assert_eq!(request.artifact_id.as_deref(), Some("art-ai"));
         assert_eq!(request.artifact_language.as_deref(), Some("Rust"));
@@ -153,10 +150,7 @@ fn implementar_handlers() { println!("Handlers implementados"); }
         };
         let mut agent = AiAgent::new(
             Box::new(MockModelClient::new()),
-            AiSessionConfig {
-                user_request: "Crear una API REST".to_string(),
-                plan_kind: "Api".to_string(),
-            },
+            AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string()),
         );
         let _ = agent.propose(&AgentContext::new("o").with_working_code("fn main() {}"));
         assert!(!executed.load(Ordering::SeqCst));

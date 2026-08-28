@@ -848,10 +848,7 @@ fn implementar_handlers() {
         let mut ctx = AgentContext::new("ai-eval").with_working_code("fn main() {}");
         ctx.push_observation(observation);
 
-        let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string());
         let mut agent = AiAgent::new(Box::new(MockModelClient::new()), session);
         let _ = agent.propose(&ctx);
 
@@ -953,10 +950,7 @@ fn implementar_handlers() {
             calls: Arc::new(AtomicUsize::new(0)),
         }));
 
-        let session = AiSessionConfig {
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: "Api".to_string(),
-        };
+        let session = AiSessionConfig::new("Crear una API REST".to_string(), "Api".to_string());
         let mut agent = AiAgent::new(Box::new(MockModelClient::new()), session);
         let action = agent.propose(&AgentContext::new("no-tool").with_working_code("fn main() {}"));
         assert!(!executed.load(Ordering::SeqCst));
