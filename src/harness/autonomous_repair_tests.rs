@@ -301,4 +301,98 @@ mod tests {
         assert!(message.contains("diagnostic_compile_status=error"));
         assert!(message.contains("diagnostic_compiler_stderr_0=syntax error"));
     }
+
+    #[test]
+    fn mock_infers_compile_correction_from_artifact_files_without_stderr() {
+        use crate::harness::model::{
+            ArtifactFileSnapshot, MockModelClient, ModelClient, ModelDecision, ModelRequest,
+            SerializedCriterionGap, SerializedDiagnosticContext, SerializedGoalEvaluation,
+            SerializedGoalGap, SerializedObservation, SerializedRecommendedAction,
+        };
+
+        let helper = "pub fn value() -> i32 {\n    broken\n}\n".to_string();
+        let request = ModelRequest {
+            goal: "compilar".to_string(),
+            step: 4,
+            user_request: "compilar helper".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some(
+                "mod helper;\nfn main() { println!(\"{}\", helper::value()); }\n".to_string(),
+            ),
+            artifact_id: Some("artifact:test".to_string()),
+            artifact_language: Some("Rust".to_string()),
+            artifact_revision: Some(1),
+            artifact_primary_path: Some("src/main.rs".to_string()),
+            artifact_files: vec![
+                ArtifactFileSnapshot {
+                    path: "src/main.rs".to_string(),
+                    source: "mod helper;\nfn main() { println!(\"{}\", helper::value()); }\n"
+                        .to_string(),
+                },
+                ArtifactFileSnapshot {
+                    path: "src/helper.rs".to_string(),
+                    source: helper,
+                },
+            ],
+            last_observation: Some(SerializedObservation {
+                kind: "tool_outcome".to_string(),
+                tool_name: Some(REPAIR_DIAGNOSTIC.to_string()),
+                success: Some(true),
+                summary: "tool:repair_diagnostic:ok".to_string(),
+                validator_errors: Vec::new(),
+                repairer_feedback: vec!["revisar compile".to_string()],
+                evidence_labels: Vec::new(),
+                evidence_details: Vec::new(),
+                evaluation_verdict: None,
+                specification_id: None,
+                criterion_id: None,
+                criterion_kind: None,
+                evaluation_message: None,
+            }),
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Unsatisfied".to_string(),
+                criteria_total: 1,
+                criteria_pass: 0,
+                criteria_fail: 1,
+                criteria_insufficient: 0,
+                message: "compile fail".to_string(),
+            }),
+            goal_gap: Some(SerializedGoalGap {
+                unsatisfied_count: 1,
+                gaps: vec![SerializedCriterionGap {
+                    criterion_id: "ac-compile".to_string(),
+                    kind: "Compile".to_string(),
+                    verdict: "Fail".to_string(),
+                    message: "compilación fallida".to_string(),
+                    suggested_action: Some(COMPILE.to_string()),
+                }],
+            }),
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "RepairDiagnostic".to_string(),
+                tool_name: Some(REPAIR_DIAGNOSTIC.to_string()),
+                criterion_id: Some("ac-compile".to_string()),
+                criterion_kind: Some("Compile".to_string()),
+                priority: 0,
+                reason: "compilación fallida".to_string(),
+            }),
+            diagnostic_context: SerializedDiagnosticContext {
+                compile_status: Some("error".to_string()),
+                ..SerializedDiagnosticContext::default()
+            },
+            system_prompt: String::new(),
+        };
+
+        let decision = MockModelClient::new()
+            .complete(&request)
+            .expect("mock response");
+        let parsed =
+            crate::harness::model::parse_model_response(&decision.raw_text).expect("parse");
+        assert!(
+            matches!(parsed, ModelDecision::ApplyCorrection { .. }),
+            "sin stderr explícito debe inferir corrección desde artifact_files: {parsed:?}"
+        );
+    }
 }
