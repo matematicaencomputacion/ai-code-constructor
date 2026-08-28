@@ -998,9 +998,7 @@ pub fn model_decision_from_recommended_action(
             let kind = parse_criterion_kind_label(kind_label)?;
             decision_for_criterion_kind(kind, request)
         }
-        "RepairDiagnostic" => Some(ModelDecision::RepairDiagnostic {
-            errors: diagnostic_errors_from_request(request),
-        }),
+        "RepairDiagnostic" => Some(repair_diagnostic_decision(request)),
         "NoDeterministicAction" => None,
         _ => None,
     }
@@ -1854,9 +1852,7 @@ impl MockModelClient {
                 if obs.summary.contains("en FAIL")
                     || request.diagnostic_context.compile_status.as_deref() == Some("error")
                 {
-                    ModelDecision::RepairDiagnostic {
-                        errors: diagnostic_errors_from_request(request),
-                    }
+                    repair_diagnostic_decision(request)
                 } else if let Some(decision) =
                     self.decision_from_recommendation_if_unsatisfied(request)
                 {
@@ -1893,9 +1889,7 @@ impl MockModelClient {
                 if obs.kind == "criterion_evaluated"
                     && obs.evaluation_verdict.as_deref() == Some("Fail") =>
             {
-                ModelDecision::RepairDiagnostic {
-                    errors: mock_repair_errors(request, obs),
-                }
+                repair_diagnostic_decision(request)
             }
             Some(obs)
                 if obs.tool_name.as_deref() == Some(VALIDATE) && obs.success == Some(false) =>
@@ -2082,7 +2076,7 @@ fn infer_compile_corrections_from_diagnostics(
 ) -> Option<Vec<StructuredCorrection>> {
     let stderr = compile_stderr_from_request(request);
     if stderr.trim().is_empty() {
-        if compile_failed_in_request(request) {
+        if has_unsatisfied_compile_gap(request) {
             return infer_compile_corrections_from_artifact_files(request);
         }
         return None;
@@ -2091,8 +2085,53 @@ fn infer_compile_corrections_from_diagnostics(
     infer_compile_corrections_from_stderr(request, &stderr)
 }
 
+fn compile_tool_ran_in_request(request: &ModelRequest) -> bool {
+    if request.diagnostic_context.compile_status.is_some() {
+        return true;
+    }
+    if request
+        .diagnostic_context
+        .evidence_pairs
+        .iter()
+        .any(|(label, detail)| label == "tool" && detail == COMPILE)
+    {
+        return true;
+    }
+    request
+        .recent_observations
+        .iter()
+        .any(|obs| obs.tool_name.as_deref() == Some(COMPILE))
+}
+
+fn has_unsatisfied_compile_gap(request: &ModelRequest) -> bool {
+    request
+        .goal_gap
+        .as_ref()
+        .and_then(|gap| gap.primary())
+        .is_some_and(|primary| primary.kind == "Compile")
+        || request.recommended_action.as_ref().is_some_and(|rec| {
+            rec.criterion_kind.as_deref() == Some("Compile") && rec.kind != "FinishAllowed"
+        })
+}
+
+fn repair_diagnostic_decision(request: &ModelRequest) -> ModelDecision {
+    let errors = diagnostic_errors_from_request(request);
+    if errors.iter().all(|error| error == "diagnóstico requerido")
+        && !compile_tool_ran_in_request(request)
+        && has_unsatisfied_compile_gap(request)
+    {
+        return ModelDecision::Compile {
+            code: request.working_code.clone().unwrap_or_default(),
+        };
+    }
+    ModelDecision::RepairDiagnostic { errors }
+}
+
 fn compile_failed_in_request(request: &ModelRequest) -> bool {
     if request.diagnostic_context.compile_status.as_deref() == Some("error") {
+        return true;
+    }
+    if compile_tool_ran_in_request(request) && has_unsatisfied_compile_gap(request) {
         return true;
     }
     if request.recommended_action.as_ref().is_some_and(|rec| {
@@ -3054,7 +3093,11 @@ mod tests {
                 priority: 0,
                 reason: "compilación fallida".to_string(),
             }),
-            diagnostic_context: SerializedDiagnosticContext::default(),
+            diagnostic_context: SerializedDiagnosticContext {
+                compile_status: Some("error".to_string()),
+                compiler_stderr: vec!["error: cannot find value `broken`".to_string()],
+                ..SerializedDiagnosticContext::default()
+            },
             system_prompt: String::new(),
         };
         let guided = apply_gap_guidance(
