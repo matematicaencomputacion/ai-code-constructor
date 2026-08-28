@@ -149,9 +149,11 @@ pub use model::{
     AiSessionConfig, MockModelClient, ModelClient, ModelDecision, ModelError,
     ModelInteractionTrace, ModelRequest, ModelResponse, ModelResponseError, SerializedCriterionGap,
     SerializedGoalEvaluation, SerializedGoalGap, SerializedRecommendedAction, StructuredCorrection,
-    StructuredFileOperation, append_goal_context_to_message_parts, apply_gap_guidance,
-    decision_from_goal_gap, model_decision_from_recommended_action, model_request_from_context,
-    parse_model_response, redact_secrets, serialize_decision, structured_to_file_operation,
+    StructuredFileOperation, append_goal_context_to_message_parts,
+    append_recommended_action_to_message_parts, apply_gap_guidance, decision_from_goal_gap,
+    decision_is_compatible_with_recommendation, model_decision_from_recommended_action,
+    model_request_from_context, parse_model_response, redact_secrets, serialize_decision,
+    structured_to_file_operation, validate_model_decision_against_recommendation,
 };
 #[allow(unused_imports)]
 pub use observation::AgentObservation;

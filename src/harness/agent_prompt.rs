@@ -46,7 +46,13 @@ User message context:
 - artifact_file_count and artifact_file_N_path / artifact_file_N_source: full Artifact tree; use path on apply_correction and apply_file_operations.
 - goal_evaluation_*: summary of Goal status (Satisfied / Unsatisfied / Inconclusive), criteria counts, and evaluation message.
 - goal_gap_*: unsatisfied AcceptanceCriteria with kind, verdict, message, and suggested_action (tool name hint).
-- recommended_action_*: primary recommended next action derived from Goal evaluation (kind, tool, criterion, priority, reason).
+- recommended_action_*: operational directive from the deterministic Goal layer (kind, tool, criterion, priority, reason). When present and goal_evaluation_status is not Satisfied, you MUST follow it.
+
+RecommendedAction contract (system decides WHAT; you decide HOW within the action class):
+- FinishAllowed: goal satisfied; you MAY respond with finish.
+- InvokeTool(tool): you MUST propose the matching action type (validate, compile, run_tests, run_clippy, check_format). Choose code, filter, paths, and correction details within that class only.
+- RepairDiagnostic: you MUST respond with repair_diagnostic (populate errors from Observations).
+- NoDeterministicAction: you have freedom to propose any allowed action EXCEPT finish; Finish will be rejected while the goal stays unsatisfied.
 
 Security rules:
 - Never request shell, arbitrary filesystem access, or direct CodeState mutation.
@@ -56,7 +62,8 @@ Security rules:
 
 Decision policy:
 - Read last_observation_summary, validator_errors, repairer_feedback, evaluation_verdict, criterion_kind, working_code, artifact_files, goal_evaluation, goal_gap, and recommended_action.
-- When goal_evaluation_status is not Satisfied, prefer recommended_action_tool and recommended_action_kind over finish.
+- When recommended_action_kind is present and goal_evaluation_status is not Satisfied, follow recommended_action_kind and recommended_action_tool; incompatible decisions are corrected deterministically by the Harness.
+- Finish ONLY when recommended_action_kind is FinishAllowed or goal_evaluation_status is Satisfied.
 - After validation FAIL: prefer repair_diagnostic.
 - After repair feedback: prefer apply_correction with minimal edits.
 - After apply_correction success: re-validate.
@@ -92,6 +99,10 @@ mod tests {
         assert!(SYSTEM_PROMPT_V1.contains("artifact_files"));
         assert!(SYSTEM_PROMPT_V1.contains("goal_evaluation"));
         assert!(SYSTEM_PROMPT_V1.contains("goal_gap"));
+        assert!(SYSTEM_PROMPT_V1.contains("RecommendedAction contract"));
+        assert!(SYSTEM_PROMPT_V1.contains("FinishAllowed"));
+        assert!(SYSTEM_PROMPT_V1.contains("NoDeterministicAction"));
+        assert!(SYSTEM_PROMPT_V1.contains("MUST follow"));
         assert!(SYSTEM_PROMPT_V1.contains("apply_file_operations"));
         assert!(SYSTEM_PROMPT_V1.contains("create_file"));
         assert!(SYSTEM_PROMPT_V1.contains("compile"));

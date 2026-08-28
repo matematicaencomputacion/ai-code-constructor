@@ -534,6 +534,41 @@ mod tests {
     }
 
     #[test]
+    fn http_request_includes_recommended_action_from_goal_context() {
+        use crate::harness::criterion::CriterionKind;
+        use crate::harness::model::{AiSessionConfig, model_request_from_context};
+        use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
+
+        let spec = Specification::new("spec-openai-rec", "compilar")
+            .with_requirements(vec![Requirement::new("req", "compilar")])
+            .with_acceptance_criteria(vec![
+                AcceptanceCriterion::new("ac-c", "compila", CriterionKind::Compile)
+                    .satisfying([crate::harness::RequirementId::new("req")]),
+            ]);
+        let session = AiSessionConfig::new("compilar", "Generic");
+        let ctx = AgentContext::new("openai-rec")
+            .with_working_code("fn main() {}")
+            .with_evaluation_specification(spec);
+        let request = model_request_from_context(&ctx, &session).expect("request");
+        assert!(request.recommended_action.is_some());
+
+        let server = MockHttpServer::spawn(
+            "200 OK",
+            &success_response(r#"{"action":"finish","summary":"ok"}"#),
+        );
+        let client = OpenAICompatibleModelClient::new(test_config(&server.base_url));
+        client.complete(&request).expect("complete");
+
+        let bodies = server.captured_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("recommended_action_kind=InvokeTool"));
+        assert!(bodies[0].contains("recommended_action_tool=compile"));
+        assert!(
+            bodies[0].contains("recommended_action_directive=MUST_FOLLOW_WHEN_GOAL_UNSATISFIED")
+        );
+    }
+
+    #[test]
     fn http_request_is_well_formed() {
         let server = MockHttpServer::spawn(
             "200 OK",
