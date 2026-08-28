@@ -5,7 +5,10 @@
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::harness::model::{ModelClient, ModelError, ModelRequest, ModelResponse, redact_secrets};
+use crate::harness::model::{
+    ModelClient, ModelError, ModelRequest, ModelResponse, append_artifact_files_to_message_parts,
+    redact_secrets,
+};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const ENV_BASE_URL: &str = "MODEL_BASE_URL";
@@ -192,6 +195,11 @@ fn build_user_message(request: &ModelRequest) -> String {
         parts.push(format!("working_code_bytes={}", code.len()));
         parts.push(format!("working_code={code}"));
     }
+    append_artifact_files_to_message_parts(
+        &mut parts,
+        request.artifact_primary_path.as_deref(),
+        &request.artifact_files,
+    );
     if let Some(artifact_id) = &request.artifact_id {
         parts.push(format!("artifact_id={artifact_id}"));
     }
@@ -439,6 +447,11 @@ mod tests {
             artifact_id: Some("artifact:main.rs".to_string()),
             artifact_language: Some("Rust".to_string()),
             artifact_revision: Some(0),
+            artifact_primary_path: Some("main.rs".to_string()),
+            artifact_files: vec![crate::harness::model::ArtifactFileSnapshot {
+                path: "main.rs".to_string(),
+                source: "fn main() {}".to_string(),
+            }],
             last_observation: None,
             recent_observations: Vec::new(),
             recent_evidence: Vec::new(),
@@ -485,6 +498,35 @@ mod tests {
         ));
         let err = client.complete(&sample_request()).unwrap_err();
         assert!(matches!(err, ModelError::Configuration(_)));
+    }
+
+    #[test]
+    fn http_request_includes_multi_file_artifact_context() {
+        let server = MockHttpServer::spawn(
+            "200 OK",
+            &success_response(r#"{"action":"finish","summary":"ok"}"#),
+        );
+        let mut request = sample_request();
+        request.artifact_primary_path = Some("src/main.rs".to_string());
+        request.artifact_files = vec![
+            crate::harness::model::ArtifactFileSnapshot {
+                path: "src/main.rs".to_string(),
+                source: "fn main() {}".to_string(),
+            },
+            crate::harness::model::ArtifactFileSnapshot {
+                path: "src/helper.rs".to_string(),
+                source: "pub fn ok() {}".to_string(),
+            },
+        ];
+        let client = OpenAICompatibleModelClient::new(test_config(&server.base_url));
+        client.complete(&request).expect("complete");
+
+        let bodies = server.captured_bodies();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("artifact_primary_path=src/main.rs"));
+        assert!(bodies[0].contains("artifact_file_count=2"));
+        assert!(bodies[0].contains("artifact_file_1_path=src/helper.rs"));
+        assert!(bodies[0].contains("artifact_file_1_source=pub fn ok() {}"));
     }
 
     #[test]
