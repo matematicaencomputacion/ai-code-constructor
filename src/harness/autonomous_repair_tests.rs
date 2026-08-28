@@ -16,7 +16,7 @@ mod tests {
         Goal, GoalDrivenLoop, GoalDrivenStatus, GoalEvaluator, RecommendedAction,
         select_primary_recommendation,
     };
-    use crate::harness::live_session::build_validate_compile_harness_with_policy;
+    use crate::harness::live_session::build_diagnostic_compile_harness_with_policy;
     use crate::harness::model::{
         AiSessionConfig, DiagnosticContextModelClient, MockModelClient, ModelDecision,
         append_diagnostic_context_to_message_parts, append_recent_evidence_to_message_parts,
@@ -165,7 +165,7 @@ mod tests {
         let mut agent = AiAgent::new(Box::new(DiagnosticContextModelClient::new()), session);
         let mut loop_ = GoalDrivenLoop::with_defaults(12);
         let harness =
-            build_validate_compile_harness_with_policy(ActionPolicy::default_session_policy());
+            build_diagnostic_compile_harness_with_policy(ActionPolicy::default_session_policy());
 
         let run_ctx = AgentContext::new("autonomous-repair-e2e")
             .with_working_artifact(initial_artifact)

@@ -370,6 +370,24 @@ pub fn build_validate_compile_harness_with_policy(policy: ActionPolicy) -> Harne
     harness
 }
 
+/// Harness E2E goal-driven: CompileTool determinista (sin `cargo check` real).
+#[cfg(test)]
+pub fn build_diagnostic_compile_harness_with_policy(policy: ActionPolicy) -> Harness {
+    use crate::harness::test_support::diagnostic_compile_tool::DiagnosticCompileTool;
+
+    let mut harness = Harness::new(LIVE_AGENT_MAX_ITERATIONS);
+    harness.register_tool(Box::new(ValidationTool));
+    harness.register_tool(Box::new(RepairDiagnosticTool));
+    harness.register_tool(Box::new(CorrectionTool));
+    harness.register_tool(Box::new(FileOperationsTool));
+    harness.register_tool(Box::new(DiagnosticCompileTool));
+    harness.register_tool(Box::new(crate::harness::tools::TestTool));
+    harness.register_tool(Box::new(crate::harness::tools::ClippyTool));
+    harness.register_tool(Box::new(crate::harness::tools::FmtTool));
+    harness.register_constraint(Box::new(policy));
+    harness
+}
+
 /// Ejecuta sesión live leyendo configuración del ModelClient desde entorno.
 pub fn run_live_agent_session(
     config: LiveSessionConfig,

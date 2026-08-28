@@ -270,7 +270,7 @@ fn implementar_handlers() {
     fn goal_driven_autonomous_construction_multi_file_repair_e2e() {
         use crate::harness::action_policy::ActionPolicy;
         use crate::harness::goal_driven::GoalDrivenLoop;
-        use crate::harness::live_session::build_validate_compile_harness_with_policy;
+        use crate::harness::live_session::build_diagnostic_compile_harness_with_policy;
 
         let spec = compile_only_spec("spec-gd-helper-e2e");
         let goal = Goal::from_specification(spec.clone());
@@ -297,7 +297,7 @@ fn implementar_handlers() {
         let mut agent = AiAgent::new(Box::new(DiagnosticContextModelClient::new()), session);
         let mut loop_ = GoalDrivenLoop::with_defaults(10);
         let harness =
-            build_validate_compile_harness_with_policy(ActionPolicy::default_session_policy());
+            build_diagnostic_compile_harness_with_policy(ActionPolicy::default_session_policy());
 
         let run_ctx = AgentContext::new("gd-helper-e2e")
             .with_working_artifact(initial_artifact)

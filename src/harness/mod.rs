@@ -39,6 +39,9 @@ mod tool_permission;
 pub mod tools;
 
 #[cfg(test)]
+pub mod test_support;
+
+#[cfg(test)]
 mod action_policy_tests;
 #[cfg(test)]
 mod ai_agent_quality_actions_tests;
