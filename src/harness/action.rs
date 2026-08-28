@@ -1,3 +1,4 @@
+use crate::harness::artifact_file_operation::ArtifactFileOperation;
 use crate::harness::correction::Correction;
 
 /// Acción explícita y verificable que un agente puede proponer.
@@ -25,6 +26,10 @@ pub enum AgentAction {
     ///
     /// No reemplaza el código completo; cada [`Correction`] es una operación atómica.
     ApplyCorrection { corrections: Vec<Correction> },
+    /// Modifica la estructura del Artifact (create/delete/rename files).
+    ApplyFileOperations {
+        operations: Vec<ArtifactFileOperation>,
+    },
     /// Invoca una herramienta registrada por nombre (superficie controlada).
     InvokeTool { tool_name: String, input: String },
     /// Solicita terminar la ejecución con un resumen.
@@ -44,6 +49,9 @@ impl AgentAction {
             AgentAction::Validate { .. } => Some(crate::harness::tools::VALIDATE),
             AgentAction::RepairDiagnostic { .. } => Some(crate::harness::tools::REPAIR_DIAGNOSTIC),
             AgentAction::ApplyCorrection { .. } => Some(crate::harness::tools::APPLY_CORRECTION),
+            AgentAction::ApplyFileOperations { .. } => {
+                Some(crate::harness::tools::APPLY_FILE_OPERATIONS)
+            }
             AgentAction::InvokeTool { tool_name, .. } => Some(tool_name.as_str()),
             AgentAction::Finish { .. } | AgentAction::NoOp => None,
         }

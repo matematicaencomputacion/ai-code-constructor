@@ -1,5 +1,6 @@
 use crate::harness::action::AgentAction;
 use crate::harness::agent::Agent;
+use crate::harness::artifact_mutation::commit_artifact_preview;
 use crate::harness::constraint::{Constraint, ConstraintDecision};
 use crate::harness::context::AgentContext;
 use crate::harness::evaluation::{Evaluation, EvaluationVerdict, Evidence};
@@ -159,25 +160,18 @@ impl Harness {
                 let input = tools::encode_repair_diagnostic_input(&errors);
                 self.dispatch_named_tool(action, tools::REPAIR_DIAGNOSTIC, &input, ctx)
             }
-            AgentAction::ApplyCorrection { corrections } => {
-                let input = tools::encode_correction_input(&corrections);
-                let outcome =
-                    self.dispatch_named_tool(action, tools::APPLY_CORRECTION, &input, ctx);
-                if outcome.tool_executed
-                    && outcome
-                        .tool_result
-                        .as_ref()
-                        .is_some_and(|result| result.success)
-                {
-                    // Mutación canónica multi-file: no usar corrected_code (solo primary).
-                    if let Some(artifact) = ctx.working_artifact.as_mut() {
-                        let _ = crate::harness::correction::apply_corrections_to_artifact(
-                            artifact,
-                            &corrections,
-                        );
+            AgentAction::ApplyCorrection { .. } | AgentAction::ApplyFileOperations { .. } => {
+                match action.clone() {
+                    AgentAction::ApplyCorrection { corrections } => {
+                        let input = tools::encode_correction_input(&corrections);
+                        self.commit_mutation_tool(action, tools::APPLY_CORRECTION, &input, ctx)
                     }
+                    AgentAction::ApplyFileOperations { operations } => {
+                        let input = tools::encode_file_operations_input(&operations);
+                        self.commit_mutation_tool(action, tools::APPLY_FILE_OPERATIONS, &input, ctx)
+                    }
+                    _ => unreachable!("mutation actions only"),
                 }
-                outcome
             }
             AgentAction::InvokeTool { tool_name, input } => {
                 self.dispatch_named_tool(action, &tool_name, &input, ctx)
@@ -315,6 +309,33 @@ impl Harness {
             .find(|tool| tool.name() == name)
             .map(|tool| tool.as_ref())
     }
+
+    /// Ejecuta una Tool de mutación: preview en la Tool, commit canónico único en el Harness.
+    fn commit_mutation_tool(
+        &self,
+        action: AgentAction,
+        tool_name: &str,
+        input: &str,
+        ctx: &mut AgentContext,
+    ) -> StepOutcome {
+        let outcome = self.dispatch_named_tool(action, tool_name, input, ctx);
+        let Some(tool_result) = outcome.tool_result.as_ref() else {
+            return outcome;
+        };
+        if !tool_result.success {
+            return outcome;
+        }
+        let Some(preview) = tool_result.artifact_preview.clone() else {
+            return outcome;
+        };
+        let Some(artifact) = ctx.working_artifact.as_mut() else {
+            return mutation_commit_failed(outcome, "working_artifact ausente para commit");
+        };
+        match commit_artifact_preview(artifact, preview) {
+            Ok(_) => outcome,
+            Err(error) => mutation_commit_failed(outcome, &error),
+        }
+    }
 }
 
 fn split_policy_reason(reason: &str) -> (String, String) {
@@ -322,6 +343,37 @@ fn split_policy_reason(reason: &str) -> (String, String) {
         Some((constraint, detail)) => (constraint.to_string(), detail.to_string()),
         None => ("action_policy".to_string(), reason.to_string()),
     }
+}
+
+fn mutation_commit_failed(mut outcome: StepOutcome, error: &str) -> StepOutcome {
+    let evidence = vec![
+        Evidence::new("mutation_commit", "error"),
+        Evidence::new("mutation_commit_error", error),
+    ];
+    let evaluation = Evaluation::fail(
+        format!("commit canónico de mutación falló: {error}"),
+        evidence.clone(),
+    );
+    let observation = AgentObservation::ToolOutcome {
+        tool_name: outcome
+            .tool_name
+            .clone()
+            .unwrap_or_else(|| "mutation".to_string()),
+        success: false,
+        output: error.to_string(),
+        evidence: evidence.clone(),
+        verdict: evaluation.verdict,
+    };
+    outcome.tool_executed = true;
+    outcome.evaluation = evaluation;
+    outcome.observation = observation.clone();
+    outcome.evidence = evidence;
+    if let Some(tool_result) = outcome.tool_result.as_mut() {
+        tool_result.success = false;
+        tool_result.output = error.to_string();
+        tool_result.artifact_preview = None;
+    }
+    outcome
 }
 
 impl HarnessResult {

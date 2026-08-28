@@ -26,29 +26,27 @@ impl Tool for CompileTool {
 
     fn execute(&self, _input: &str, ctx: &AgentContext) -> ToolResult {
         let Some(artifact) = ctx.working_artifact.as_ref() else {
-            return ToolResult {
-                success: false,
-                output: format!("working_artifact ausente para tool `{COMPILE}`"),
-                evidence: vec![
+            return ToolResult::failure(
+                format!("working_artifact ausente para tool `{COMPILE}`"),
+                vec![
                     Evidence::new("tool", COMPILE),
                     Evidence::new("compile_status", "error"),
                     Evidence::new("missing_artifact", "working_artifact required"),
                 ],
-            };
+            );
         };
 
         let materialization = match ArtifactMaterialization::from_artifact(artifact) {
             Ok(value) => value,
             Err(error) => {
-                return ToolResult {
-                    success: false,
-                    output: error.clone(),
-                    evidence: vec![
+                return ToolResult::failure(
+                    error.clone(),
+                    vec![
                         Evidence::new("tool", COMPILE),
                         Evidence::new("compile_status", "error"),
                         Evidence::new("materialization_error", error),
                     ],
-                };
+                );
             }
         };
 
@@ -64,43 +62,40 @@ impl Tool for CompileTool {
                 let stdout = String::from_utf8_lossy(&output.stdout);
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 if output.status.success() {
-                    ToolResult {
-                        success: true,
-                        output: format!(
+                    ToolResult::success(
+                        format!(
                             "compilación exitosa (cargo check)\n--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}"
                         ),
-                        evidence: vec![
+                        vec![
                             Evidence::new("tool", COMPILE),
                             Evidence::new("compile_status", "ok"),
                             Evidence::new("code_bytes", artifact.source().len().to_string()),
                         ],
-                    }
+                    )
                 } else {
                     let error = if stderr.trim().is_empty() {
                         stdout.to_string()
                     } else {
                         stderr.to_string()
                     };
-                    ToolResult {
-                        success: false,
-                        output: error.clone(),
-                        evidence: vec![
+                    ToolResult::failure(
+                        error.clone(),
+                        vec![
                             Evidence::new("tool", COMPILE),
                             Evidence::new("compile_status", "error"),
                             Evidence::new("compiler_stderr", truncate(&error, 4_000)),
                         ],
-                    }
+                    )
                 }
             }
-            Err(error) => ToolResult {
-                success: false,
-                output: format!("No se pudo ejecutar cargo check ({COMPILE}): {error}"),
-                evidence: vec![
+            Err(error) => ToolResult::failure(
+                format!("No se pudo ejecutar cargo check ({COMPILE}): {error}"),
+                vec![
                     Evidence::new("tool", COMPILE),
                     Evidence::new("compile_status", "error"),
                     Evidence::new("spawn_error", error.to_string()),
                 ],
-            },
+            ),
         };
 
         ctx.append_artifact_evidence(&mut result.evidence);

@@ -1,6 +1,7 @@
 mod clippy_tool;
 mod compile_tool;
 mod correction_tool;
+mod file_operations_tool;
 mod fmt_tool;
 mod repair_diagnostic_tool;
 mod test_tool;
@@ -9,6 +10,7 @@ mod validation_tool;
 pub use clippy_tool::ClippyTool;
 pub use compile_tool::CompileTool;
 pub use correction_tool::{CorrectionTool, encode_correction_input};
+pub use file_operations_tool::{FileOperationsTool, encode_file_operations_input};
 pub use fmt_tool::FmtTool;
 pub use repair_diagnostic_tool::{RepairDiagnosticTool, encode_repair_diagnostic_input};
 pub use test_tool::TestTool;
@@ -21,6 +23,7 @@ pub const CHECK_FORMAT: &str = "check_format";
 pub const VALIDATE: &str = "validate";
 pub const REPAIR_DIAGNOSTIC: &str = "repair_diagnostic";
 pub const APPLY_CORRECTION: &str = "apply_correction";
+pub const APPLY_FILE_OPERATIONS: &str = "apply_file_operations";
 
 use crate::harness::artifact_materialization::ArtifactMaterialization;
 use crate::harness::context::AgentContext;
@@ -36,27 +39,25 @@ pub(crate) fn run_cargo_on_artifact(
     configure: impl FnOnce(&mut Command, &Path),
 ) -> ToolResult {
     let Some(artifact) = ctx.working_artifact.as_ref() else {
-        return ToolResult {
-            success: false,
-            output: format!("working_artifact ausente para tool `{tool_name}`"),
-            evidence: vec![
+        return ToolResult::failure(
+            format!("working_artifact ausente para tool `{tool_name}`"),
+            vec![
                 Evidence::new("tool", tool_name),
                 Evidence::new("missing_artifact", "working_artifact required"),
             ],
-        };
+        );
     };
 
     let materialization = match ArtifactMaterialization::from_artifact(artifact) {
         Ok(value) => value,
         Err(error) => {
-            return ToolResult {
-                success: false,
-                output: error.clone(),
-                evidence: vec![
+            return ToolResult::failure(
+                error.clone(),
+                vec![
                     Evidence::new("tool", tool_name),
                     Evidence::new("materialization_error", error),
                 ],
-            };
+            );
         }
     };
 
@@ -67,14 +68,13 @@ pub(crate) fn run_cargo_on_artifact(
 
     let mut result = match command.output() {
         Ok(output) => tool_result_from_output(tool_name, output),
-        Err(error) => ToolResult {
-            success: false,
-            output: format!("No se pudo ejecutar cargo ({tool_name}): {error}"),
-            evidence: vec![
+        Err(error) => ToolResult::failure(
+            format!("No se pudo ejecutar cargo ({tool_name}): {error}"),
+            vec![
                 Evidence::new("tool", tool_name),
                 Evidence::new("spawn_error", error.to_string()),
             ],
-        },
+        ),
     };
     ctx.append_artifact_evidence(&mut result.evidence);
     // `materialization` se dropea aquí → cleanup del dir temporal.
@@ -104,6 +104,7 @@ pub(crate) fn tool_result_from_output(tool_name: &str, output: Output) -> ToolRe
             Evidence::new("stdout", truncate(&stdout, 4_000)),
             Evidence::new("stderr", truncate(&stderr, 4_000)),
         ],
+        artifact_preview: None,
     }
 }
 

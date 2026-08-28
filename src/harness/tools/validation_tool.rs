@@ -58,14 +58,13 @@ impl Tool for ValidationTool {
         let (plan_kind, request, code) = match decode_validate_input(input) {
             Ok(parsed) => parsed,
             Err(error) => {
-                return ToolResult {
-                    success: false,
-                    output: error.clone(),
-                    evidence: vec![
+                return ToolResult::failure(
+                    error.clone(),
+                    vec![
                         Evidence::new("tool", VALIDATE),
                         Evidence::new("parse_error", error),
                     ],
-                };
+                );
             }
         };
 
@@ -106,10 +105,10 @@ impl Tool for ValidationTool {
         }
         ctx.append_artifact_evidence(&mut evidence);
 
-        ToolResult {
-            success,
-            output,
-            evidence,
+        if success {
+            ToolResult::success(output, evidence)
+        } else {
+            ToolResult::failure(output, evidence)
         }
     }
 }

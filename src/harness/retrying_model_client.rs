@@ -233,6 +233,11 @@ mod tests {
             artifact_id: Some("artifact:main.rs".to_string()),
             artifact_language: Some("Rust".to_string()),
             artifact_revision: Some(0),
+            artifact_primary_path: Some("main.rs".to_string()),
+            artifact_files: vec![crate::harness::model::ArtifactFileSnapshot {
+                path: "main.rs".to_string(),
+                source: "fn main() {}".to_string(),
+            }],
             system_prompt: system_prompt_v1().to_string(),
             last_observation: None,
             recent_observations: Vec::new(),

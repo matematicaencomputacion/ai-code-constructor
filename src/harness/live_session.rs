@@ -20,7 +20,9 @@ use crate::harness::retrying_model_client::{ModelRetryObservability, RetryingMod
 use crate::harness::runtime::Harness;
 use crate::harness::specification::Specification;
 use crate::harness::specification_planner::{SpecificationPlannerError, plan_specification};
-use crate::harness::tools::{CompileTool, CorrectionTool, RepairDiagnosticTool, ValidationTool};
+use crate::harness::tools::{
+    CompileTool, CorrectionTool, FileOperationsTool, RepairDiagnosticTool, ValidationTool,
+};
 
 /// Límite estricto de iteraciones para sesiones live.
 pub const LIVE_AGENT_MAX_ITERATIONS: u32 = 12;
@@ -349,6 +351,7 @@ pub fn build_validate_compile_harness_with_policy(policy: ActionPolicy) -> Harne
     harness.register_tool(Box::new(ValidationTool));
     harness.register_tool(Box::new(RepairDiagnosticTool));
     harness.register_tool(Box::new(CorrectionTool));
+    harness.register_tool(Box::new(FileOperationsTool));
     harness.register_tool(Box::new(CompileTool));
     harness.register_tool(Box::new(crate::harness::tools::TestTool));
     harness.register_tool(Box::new(crate::harness::tools::ClippyTool));
@@ -545,6 +548,9 @@ fn action_label(action: &crate::harness::AgentAction) -> String {
         crate::harness::AgentAction::Validate { .. } => "validate".to_string(),
         crate::harness::AgentAction::RepairDiagnostic { .. } => "repair_diagnostic".to_string(),
         crate::harness::AgentAction::ApplyCorrection { .. } => "apply_correction".to_string(),
+        crate::harness::AgentAction::ApplyFileOperations { .. } => {
+            "apply_file_operations".to_string()
+        }
         crate::harness::AgentAction::Compile { .. } => "compile".to_string(),
         crate::harness::AgentAction::Finish { .. } => "finish".to_string(),
         crate::harness::AgentAction::RunTests { .. } => "run_tests".to_string(),

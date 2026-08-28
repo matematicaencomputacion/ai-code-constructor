@@ -21,6 +21,7 @@ impl ToolPermissionConstraint {
             crate::harness::tools::VALIDATE,
             crate::harness::tools::REPAIR_DIAGNOSTIC,
             crate::harness::tools::APPLY_CORRECTION,
+            crate::harness::tools::APPLY_FILE_OPERATIONS,
             crate::harness::tools::RUN_TESTS,
             crate::harness::tools::RUN_CLIPPY,
             crate::harness::tools::CHECK_FORMAT,

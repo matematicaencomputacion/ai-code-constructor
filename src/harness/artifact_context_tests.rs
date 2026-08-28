@@ -145,11 +145,7 @@ fn implementar_handlers() { println!("Handlers implementados"); }
             }
             fn execute(&self, _input: &str, _ctx: &AgentContext) -> crate::harness::ToolResult {
                 self.flag.store(true, Ordering::SeqCst);
-                crate::harness::ToolResult {
-                    success: true,
-                    output: "ok".to_string(),
-                    evidence: vec![],
-                }
+                crate::harness::ToolResult::success("ok", vec![])
             }
         }
         let _tool = TrackingCompile {

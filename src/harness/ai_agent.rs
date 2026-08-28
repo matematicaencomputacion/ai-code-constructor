@@ -1,11 +1,12 @@
 use crate::harness::action::AgentAction;
 use crate::harness::agent::Agent;
+use crate::harness::artifact_file_operation::ArtifactFileOperation;
 use crate::harness::context::AgentContext;
 use crate::harness::correction::Correction;
 use crate::harness::model::{
     AiSessionConfig, ModelClient, ModelDecision, ModelError, ModelInteractionTrace,
     ModelResponseError, model_request_from_context, parse_model_response, structured_to_correction,
-    validate_apply_correction,
+    structured_to_file_operation, validate_apply_correction,
 };
 
 /// Primer Agent basado en IA: serializa contexto, consulta [`ModelClient`]
@@ -36,6 +37,7 @@ impl AiAgent {
             AgentAction::Validate { .. } => "validate".to_string(),
             AgentAction::RepairDiagnostic { .. } => "repair_diagnostic".to_string(),
             AgentAction::ApplyCorrection { .. } => "apply_correction".to_string(),
+            AgentAction::ApplyFileOperations { .. } => "apply_file_operations".to_string(),
             AgentAction::Compile { .. } => "compile".to_string(),
             AgentAction::Finish { .. } => "finish".to_string(),
             AgentAction::RunTests { .. } => "run_tests".to_string(),
@@ -75,6 +77,13 @@ impl AiAgent {
                 Ok(AgentAction::ApplyCorrection {
                     corrections: mapped,
                 })
+            }
+            ModelDecision::ApplyFileOperations { operations } => {
+                let mapped = operations
+                    .iter()
+                    .map(structured_to_file_operation)
+                    .collect::<Result<Vec<ArtifactFileOperation>, ModelResponseError>>()?;
+                Ok(AgentAction::ApplyFileOperations { operations: mapped })
             }
             ModelDecision::Compile { code } => Ok(AgentAction::Compile { code }),
             ModelDecision::RunTests { filter } => Ok(AgentAction::RunTests { filter }),

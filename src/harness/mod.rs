@@ -10,7 +10,9 @@ mod agent_loop;
 mod agent_prompt;
 mod ai_agent;
 pub mod artifact;
+mod artifact_file_operation;
 mod artifact_materialization;
+mod artifact_mutation;
 mod artifact_path;
 mod autonomous_construction;
 mod bridge;
@@ -41,6 +43,8 @@ mod ai_agent_quality_actions_tests;
 #[cfg(test)]
 mod artifact_context_tests;
 #[cfg(test)]
+mod artifact_file_operations_tests;
+#[cfg(test)]
 mod artifact_scoped_quality_tests;
 #[cfg(test)]
 mod autonomous_construction_tests;
@@ -49,6 +53,8 @@ mod live_session_builder_initial_artifact_tests;
 #[cfg(test)]
 mod model_decision_multi_file_correction_tests;
 #[cfg(test)]
+mod model_multi_file_contract_tests;
+#[cfg(test)]
 mod multi_file_correction_tests;
 
 // API pública del harness; aún no consumida por el ciclo Constructor.
@@ -56,8 +62,8 @@ mod multi_file_correction_tests;
 pub use action::AgentAction;
 #[allow(unused_imports)]
 pub use action_policy::{
-    ActionConstraint, ActionPolicy, ApplyCorrectionConstraint, ArtifactStateConstraint,
-    FinishConstraint, PolicyVerdict, RepairDiagnosticConstraint,
+    ActionConstraint, ActionPolicy, ApplyCorrectionConstraint, ApplyFileOperationsConstraint,
+    ArtifactStateConstraint, FinishConstraint, PolicyVerdict, RepairDiagnosticConstraint,
 };
 #[allow(unused_imports)]
 pub use agent::{
@@ -130,7 +136,8 @@ pub use live_session::{
 pub use model::{
     AiSessionConfig, MockModelClient, ModelClient, ModelDecision, ModelError,
     ModelInteractionTrace, ModelRequest, ModelResponse, ModelResponseError, StructuredCorrection,
-    model_request_from_context, parse_model_response, redact_secrets, serialize_decision,
+    StructuredFileOperation, model_request_from_context, parse_model_response, redact_secrets,
+    serialize_decision, structured_to_file_operation,
 };
 #[allow(unused_imports)]
 pub use observation::AgentObservation;
@@ -158,9 +165,10 @@ pub use tool::{Tool, ToolResult};
 pub use tool_permission::ToolPermissionConstraint;
 #[allow(unused_imports)]
 pub use tools::{
-    APPLY_CORRECTION, CHECK_FORMAT, COMPILE, ClippyTool, CompileTool, CorrectionTool, FmtTool,
-    REPAIR_DIAGNOSTIC, RUN_CLIPPY, RUN_TESTS, RepairDiagnosticTool, TestTool, VALIDATE,
-    ValidationTool, encode_correction_input, encode_repair_diagnostic_input, encode_validate_input,
+    APPLY_CORRECTION, APPLY_FILE_OPERATIONS, CHECK_FORMAT, COMPILE, ClippyTool, CompileTool,
+    CorrectionTool, FileOperationsTool, FmtTool, REPAIR_DIAGNOSTIC, RUN_CLIPPY, RUN_TESTS,
+    RepairDiagnosticTool, TestTool, VALIDATE, ValidationTool, encode_correction_input,
+    encode_file_operations_input, encode_repair_diagnostic_input, encode_validate_input,
 };
 
 #[cfg(test)]
@@ -177,11 +185,7 @@ mod tests {
         }
 
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
-            ToolResult {
-                success: true,
-                output: input.to_string(),
-                evidence: vec![Evidence::new("echo_output", input)],
-            }
+            ToolResult::success(input.to_string(), vec![Evidence::new("echo_output", input)])
         }
     }
 
@@ -199,11 +203,10 @@ mod tests {
         fn execute(&self, input: &str, _ctx: &AgentContext) -> ToolResult {
             self.executed.store(true, Ordering::SeqCst);
             self.calls.fetch_add(1, Ordering::SeqCst);
-            ToolResult {
-                success: true,
-                output: input.to_string(),
-                evidence: vec![Evidence::new("tracking", self.name)],
-            }
+            ToolResult::success(
+                input.to_string(),
+                vec![Evidence::new("tracking", self.name)],
+            )
         }
     }
 
@@ -226,6 +229,7 @@ mod tests {
                 | AgentAction::Validate { .. }
                 | AgentAction::RepairDiagnostic { .. }
                 | AgentAction::ApplyCorrection { .. }
+                | AgentAction::ApplyFileOperations { .. }
                 | AgentAction::InvokeTool { .. }
                 | AgentAction::NoOp => ConstraintDecision::Allow,
             }

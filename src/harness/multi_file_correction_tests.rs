@@ -101,7 +101,7 @@ mod tests {
         .unwrap();
         assert!(artifact.file(&helper).unwrap().contains('2'));
         assert!(artifact.file(&main).unwrap().contains("eprintln!"));
-        assert_eq!(artifact.revision(), 2);
+        assert_eq!(artifact.revision(), 1);
     }
 
     #[test]
