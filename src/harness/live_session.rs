@@ -44,6 +44,8 @@ pub struct LiveSessionConfig {
     pub evaluation_specification: Option<Specification>,
     pub max_iterations: u32,
     pub debug_log_prompt: bool,
+    /// Activa redirección de Finish prematuro vía gap guidance (opt-in; default false).
+    pub gap_guidance: bool,
 }
 
 impl LiveSessionConfig {
@@ -62,7 +64,13 @@ impl LiveSessionConfig {
             evaluation_specification: None,
             max_iterations: LIVE_AGENT_MAX_ITERATIONS,
             debug_log_prompt: false,
+            gap_guidance: false,
         }
+    }
+
+    pub fn with_gap_guidance(mut self, enabled: bool) -> Self {
+        self.gap_guidance = enabled;
+        self
     }
 
     pub fn with_artifact(mut self, artifact: RustArtifact) -> Self {
@@ -95,6 +103,7 @@ impl LiveSessionConfig {
             evaluation_specification: Some(live_quality_specification()),
             max_iterations: LIVE_AGENT_MAX_ITERATIONS,
             debug_log_prompt: false,
+            gap_guidance: false,
         }
     }
 
@@ -142,6 +151,7 @@ impl LiveSessionConfig {
             },
             max_iterations: options.max_iterations.unwrap_or(LIVE_AGENT_MAX_ITERATIONS),
             debug_log_prompt: options.debug_log_prompt,
+            gap_guidance: false,
         })
     }
 }
@@ -430,7 +440,8 @@ pub fn run_live_agent_session_with_client_policy_and_retry_observability(
     }
 
     let max_iterations = config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS);
-    let session = AiSessionConfig::new(config.user_request.clone(), config.plan_kind.clone());
+    let session = AiSessionConfig::new(config.user_request.clone(), config.plan_kind.clone())
+        .with_gap_guidance(config.gap_guidance);
     let mut ctx = match config.working_artifact.clone() {
         Some(artifact) => AgentContext::new(&config.goal).with_working_artifact(artifact),
         None => AgentContext::new(&config.goal).with_working_code(config.working_code.clone()),
@@ -661,6 +672,63 @@ fn implementar_handlers() {
     }
 
     #[test]
+    fn live_session_config_gap_guidance_defaults_off() {
+        let config = LiveSessionConfig::validate_and_compile_artifact(
+            "Crear una API REST",
+            "Api",
+            "fn main() {}",
+        );
+        assert!(!config.gap_guidance);
+    }
+
+    #[test]
+    fn live_session_gap_guidance_propagates_to_ai_session() {
+        struct AlwaysFinishClient;
+        impl ModelClient for AlwaysFinishClient {
+            fn complete(
+                &self,
+                _request: &ModelRequest,
+            ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+                Ok(crate::harness::model::ModelResponse {
+                    raw_text: serialize_decision(&ModelDecision::Finish {
+                        summary: "premature from model".to_string(),
+                    }),
+                })
+            }
+        }
+
+        unsafe {
+            std::env::remove_var("AI_AGENT_GAP_GUIDANCE");
+        }
+
+        let config = LiveSessionConfig::validate_and_compile_artifact(
+            "Crear una API REST",
+            "Api",
+            "fn main() {}",
+        )
+        .with_specification(compile_spec())
+        .with_gap_guidance(true);
+
+        let result = run_live_agent_session_with_client(
+            Box::new(AlwaysFinishClient),
+            config,
+            Some("gap-guidance-live".to_string()),
+        )
+        .expect("session");
+
+        assert!(
+            result
+                .loop_result
+                .history
+                .proposed_actions
+                .first()
+                .map(|action| matches!(action, AgentAction::Compile { .. }))
+                .unwrap_or(false),
+            "gap_guidance=true debe redirigir Finish prematuro a Compile"
+        );
+    }
+
+    #[test]
     fn live_session_config_has_iteration_limit() {
         let config = LiveSessionConfig::validate_and_compile_artifact(
             "Crear una API REST",
@@ -811,6 +879,7 @@ fn implementar_handlers() {
             evaluation_specification: Some(compile_spec()),
             max_iterations: 100,
             debug_log_prompt: false,
+            gap_guidance: false,
         };
         assert_eq!(config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS), 12);
 
