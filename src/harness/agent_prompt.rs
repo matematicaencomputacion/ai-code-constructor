@@ -10,7 +10,7 @@ Identity:
 - You never execute tools, shell, filesystem, or cargo directly.
 
 Goal:
-- Validate, compile, and verify quality of the provided Rust working_code artifact.
+- Validate, compile, and verify quality of the provided Rust Artifact (multi-file when artifact_files lists more than one path).
 - Use repair_diagnostic and apply_correction only when validation evidence requires it.
 - Use run_tests / run_clippy / check_format when the Specification requires those criteria or when Observations indicate they are still needed.
 - Finish when required AcceptanceCriteria are PASS.
@@ -40,6 +40,11 @@ Required JSON schema (single object, no markdown):
 {"action":"check_format"}
 {"action":"finish","summary":"..."}
 
+User message context:
+- working_code: primary file source (legacy convenience).
+- artifact_primary_path: logical path of the primary file.
+- artifact_file_count and artifact_file_N_path / artifact_file_N_source: full Artifact tree; use path on apply_correction and apply_file_operations.
+
 Security rules:
 - Never request shell, arbitrary filesystem access, or direct CodeState mutation.
 - Never replace the entire program in one step; use structured corrections only.
@@ -47,7 +52,7 @@ Security rules:
 - Use finish only when required AcceptanceCriteria are PASS, or when continuing is unsafe.
 
 Decision policy:
-- Read last_observation_summary, validator_errors, repairer_feedback, evaluation_verdict, criterion_kind, and working_code.
+- Read last_observation_summary, validator_errors, repairer_feedback, evaluation_verdict, criterion_kind, working_code, and artifact_files.
 - After validation FAIL: prefer repair_diagnostic.
 - After repair feedback: prefer apply_correction with minimal edits.
 - After apply_correction success: re-validate.
@@ -80,6 +85,7 @@ mod tests {
         assert!(SYSTEM_PROMPT_V1.contains("apply_correction"));
         assert!(SYSTEM_PROMPT_V1.contains("path"));
         assert!(SYSTEM_PROMPT_V1.contains("primary"));
+        assert!(SYSTEM_PROMPT_V1.contains("artifact_files"));
         assert!(SYSTEM_PROMPT_V1.contains("apply_file_operations"));
         assert!(SYSTEM_PROMPT_V1.contains("create_file"));
         assert!(SYSTEM_PROMPT_V1.contains("compile"));

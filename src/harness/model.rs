@@ -36,6 +36,13 @@ pub struct SerializedObservation {
     pub evaluation_message: Option<String>,
 }
 
+/// Snapshot de un archivo del Artifact para serialización al modelo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactFileSnapshot {
+    pub path: String,
+    pub source: String,
+}
+
 /// Petición estructurada enviada al modelo.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRequest {
@@ -43,10 +50,15 @@ pub struct ModelRequest {
     pub step: u32,
     pub user_request: String,
     pub plan_kind: Option<String>,
+    /// Contenido del archivo primary (compat single-file).
     pub working_code: Option<String>,
     pub artifact_id: Option<String>,
     pub artifact_language: Option<String>,
     pub artifact_revision: Option<u64>,
+    /// Ruta lógica del archivo primary dentro del Artifact.
+    pub artifact_primary_path: Option<String>,
+    /// Árbol completo del Artifact (incluye primary y archivos secundarios).
+    pub artifact_files: Vec<ArtifactFileSnapshot>,
     pub last_observation: Option<SerializedObservation>,
     pub recent_observations: Vec<SerializedObservation>,
     pub recent_evidence: Vec<(String, String)>,
@@ -270,6 +282,13 @@ pub fn model_request_from_context(
 
     let recent_evidence = collect_recent_evidence(ctx);
 
+    let (artifact_primary_path, artifact_files) = ctx
+        .working_artifact
+        .as_ref()
+        .map(artifact_file_snapshots_from_artifact)
+        .map(|(primary, files)| (Some(primary), files))
+        .unwrap_or((None, Vec::new()));
+
     Ok(ModelRequest {
         goal: ctx.goal.clone(),
         step: ctx.step,
@@ -288,11 +307,59 @@ pub fn model_request_from_context(
             .working_artifact
             .as_ref()
             .map(|artifact| artifact.revision()),
+        artifact_primary_path,
+        artifact_files,
         last_observation,
         recent_observations,
         recent_evidence,
         system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
     })
+}
+
+fn artifact_file_snapshots_from_artifact(
+    artifact: &RustArtifact,
+) -> (String, Vec<ArtifactFileSnapshot>) {
+    let primary = artifact.primary_path().as_str().to_string();
+    let mut files = artifact
+        .files()
+        .map(|(path, source)| ArtifactFileSnapshot {
+            path: path.as_str().to_string(),
+            source: source.to_string(),
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|left, right| {
+        let left_is_primary = left.path == primary;
+        let right_is_primary = right.path == primary;
+        match (left_is_primary, right_is_primary) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => left.path.cmp(&right.path),
+        }
+    });
+    (primary, files)
+}
+
+/// Añade campos multi-file del Artifact al mensaje de usuario del modelo.
+pub fn append_artifact_files_to_message_parts(
+    parts: &mut Vec<String>,
+    primary_path: Option<&str>,
+    files: &[ArtifactFileSnapshot],
+) {
+    if let Some(primary) = primary_path {
+        parts.push(format!("artifact_primary_path={primary}"));
+    }
+    if files.is_empty() {
+        return;
+    }
+    parts.push(format!("artifact_file_count={}", files.len()));
+    for (index, file) in files.iter().enumerate() {
+        parts.push(format!("artifact_file_{index}_path={}", file.path));
+        parts.push(format!(
+            "artifact_file_{index}_source_bytes={}",
+            file.source.len()
+        ));
+        parts.push(format!("artifact_file_{index}_source={}", file.source));
+    }
 }
 
 fn serialize_observation(observation: &AgentObservation) -> SerializedObservation {
@@ -1224,6 +1291,66 @@ mod tests {
         assert!(!request.recent_observations.is_empty());
         assert!(request.system_prompt.contains("validate"));
         assert!(request.system_prompt.contains("repair_diagnostic"));
+        assert!(request.system_prompt.contains("artifact_files"));
+    }
+
+    #[test]
+    fn model_request_from_context_includes_multi_file_artifact_tree() {
+        use crate::harness::artifact::{ArtifactId, RustArtifact};
+        use crate::harness::artifact_path::ArtifactPath;
+
+        let main = ArtifactPath::parse("src/main.rs").unwrap();
+        let helper = ArtifactPath::parse("src/helper.rs").unwrap();
+        let artifact = RustArtifact::try_from_files(
+            ArtifactId::new("art-model-contract"),
+            "main.rs",
+            main.clone(),
+            [
+                (main, "mod helper;\nfn main() {}\n".to_string()),
+                (helper, "pub fn value() -> i32 { 1 }\n".to_string()),
+            ],
+        )
+        .unwrap();
+        let session = AiSessionConfig {
+            user_request: "Corregir helper".to_string(),
+            plan_kind: "Api".to_string(),
+        };
+        let ctx = AgentContext::new("ai").with_working_artifact(artifact);
+
+        let request = model_request_from_context(&ctx, &session).expect("request");
+        assert_eq!(
+            request.artifact_primary_path.as_deref(),
+            Some("src/main.rs")
+        );
+        assert_eq!(request.artifact_files.len(), 2);
+        assert_eq!(request.artifact_files[0].path, "src/main.rs");
+        assert_eq!(request.artifact_files[1].path, "src/helper.rs");
+        assert_eq!(
+            request.working_code.as_deref(),
+            Some("mod helper;\nfn main() {}\n")
+        );
+    }
+
+    #[test]
+    fn append_artifact_files_to_message_parts_serializes_tree() {
+        let files = vec![
+            ArtifactFileSnapshot {
+                path: "src/main.rs".to_string(),
+                source: "fn main() {}".to_string(),
+            },
+            ArtifactFileSnapshot {
+                path: "src/lib.rs".to_string(),
+                source: "pub fn ok() {}".to_string(),
+            },
+        ];
+        let mut parts = Vec::new();
+        append_artifact_files_to_message_parts(&mut parts, Some("src/main.rs"), &files);
+        let message = parts.join("\n");
+        assert!(message.contains("artifact_primary_path=src/main.rs"));
+        assert!(message.contains("artifact_file_count=2"));
+        assert!(message.contains("artifact_file_0_path=src/main.rs"));
+        assert!(message.contains("artifact_file_1_path=src/lib.rs"));
+        assert!(message.contains("artifact_file_1_source=pub fn ok() {}"));
     }
 
     #[test]

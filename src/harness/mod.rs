@@ -53,6 +53,8 @@ mod live_session_builder_initial_artifact_tests;
 #[cfg(test)]
 mod model_decision_multi_file_correction_tests;
 #[cfg(test)]
+mod model_multi_file_contract_tests;
+#[cfg(test)]
 mod multi_file_correction_tests;
 
 // API pública del harness; aún no consumida por el ciclo Constructor.
