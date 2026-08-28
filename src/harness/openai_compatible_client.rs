@@ -6,8 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::harness::model::{
-    ModelClient, ModelError, ModelRequest, ModelResponse, append_artifact_files_to_message_parts, append_diagnostic_context_to_message_parts,
-    append_goal_context_to_message_parts, append_recent_evidence_to_message_parts, redact_secrets,
+    ModelClient, ModelError, ModelRequest, ModelResponse, append_artifact_files_to_message_parts,
+    append_diagnostic_context_to_message_parts, append_goal_context_to_message_parts,
+    append_recent_evidence_to_message_parts, redact_secrets,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
