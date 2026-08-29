@@ -4,6 +4,10 @@ use crate::harness::context::AgentContext;
 use crate::harness::evaluation::{Evaluation, Evidence};
 use crate::harness::evaluation_engine::CriterionEvaluation;
 use crate::harness::evaluation_observation::evaluate_tool_evidence;
+use crate::harness::goal_driven::{
+    Goal, GoalEvaluator, GoalProgressTracker, GoalStatus, ProgressAssessment,
+    collect_evidence_from_context,
+};
 use crate::harness::observation::AgentObservation;
 use crate::harness::runtime::{Harness, StepOutcome};
 use crate::harness::tool::ToolResult;
@@ -15,6 +19,8 @@ pub enum LoopStatus {
     Completed,
     Failed,
     MaxIterations,
+    /// Ventana de no-progreso agotada (convergencia bloqueada).
+    NonProgress,
 }
 
 /// Historial observable de una ejecución del loop.
@@ -30,6 +36,8 @@ pub struct LoopHistory {
     pub criterion_evaluations: Vec<CriterionEvaluation>,
     pub observations: Vec<AgentObservation>,
     pub steps: Vec<StepOutcome>,
+    /// Assessments de progreso goal-driven (vacío si no hay specification / stale tracking).
+    pub progress_assessments: Vec<ProgressAssessment>,
 }
 
 /// Resultado estructurado del Agent Loop.
@@ -60,6 +68,8 @@ impl LoopResult {
 /// EvaluationEngine se invoca solo como coordinación opcional tras Tools.
 pub struct AgentLoop {
     max_iterations: u32,
+    /// Si `Some`, evalúa progreso de Goal tras cada paso con specification.
+    max_stale_iterations: Option<u32>,
 }
 
 impl AgentLoop {
@@ -68,7 +78,16 @@ impl AgentLoop {
             max_iterations > 0,
             "max_iterations del AgentLoop debe ser >= 1"
         );
-        Self { max_iterations }
+        Self {
+            max_iterations,
+            max_stale_iterations: None,
+        }
+    }
+
+    /// Activa detección de no-progreso (default productivo: 3).
+    pub fn with_max_stale_iterations(mut self, max_stale_iterations: u32) -> Self {
+        self.max_stale_iterations = Some(max_stale_iterations.max(1));
+        self
     }
 
     pub fn max_iterations(&self) -> u32 {
@@ -85,6 +104,7 @@ impl AgentLoop {
         let mut status = LoopStatus::Running;
         let mut iterations = 0;
         let mut termination_reason = String::new();
+        let mut progress = GoalProgressTracker::new();
 
         while iterations < self.max_iterations {
             iterations += 1;
@@ -137,6 +157,50 @@ impl AgentLoop {
                 history.criterion_evaluations.push(step.evaluation.clone());
                 history.observations.push(step.observation.clone());
                 ctx.push_observation(step.observation);
+            }
+
+            if let Some(max_stale) = self.max_stale_iterations
+                && let Some(specification) = ctx.evaluation_specification.as_ref()
+            {
+                let goal = Goal::from_specification(specification.clone());
+                let evaluation =
+                    GoalEvaluator::new().evaluate(&goal, &collect_evidence_from_context(&ctx));
+                if evaluation.status == GoalStatus::Satisfied {
+                    continue;
+                }
+                let action_label = outcome.action.tool_name().map(str::to_string).or_else(|| {
+                    if matches!(outcome.action, AgentAction::Finish { .. }) {
+                        Some("finish".to_string())
+                    } else {
+                        Some("noop".to_string())
+                    }
+                });
+                let artifact_revision = ctx
+                    .working_artifact
+                    .as_ref()
+                    .map(|artifact| artifact.revision());
+                let assessment = progress.record_iteration(
+                    &evaluation,
+                    action_label.as_deref(),
+                    artifact_revision,
+                );
+                history.progress_assessments.push(assessment.clone());
+
+                let stagnating = progress.stale_iterations() >= max_stale
+                    || (assessment.repeated_action && progress.stale_iterations() >= max_stale);
+                if stagnating {
+                    status = LoopStatus::NonProgress;
+                    termination_reason = format!(
+                        "non_progress: {} (stale_iterations={}, signal={:?})",
+                        assessment.reason,
+                        progress.stale_iterations(),
+                        assessment.signal
+                    );
+                    history
+                        .evidence
+                        .push(Evidence::new("non_progress", termination_reason.clone()));
+                    break;
+                }
             }
         }
 

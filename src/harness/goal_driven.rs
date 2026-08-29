@@ -156,6 +156,13 @@ pub enum RecommendedAction {
         priority: u8,
         reason: String,
     },
+    /// Diagnóstico ya producido: mutar artifact con correcciones estructuradas.
+    ApplyCorrection {
+        criterion_id: AcceptanceCriterionId,
+        kind: CriterionKind,
+        priority: u8,
+        reason: String,
+    },
     /// Sin acción determinista (p. ej. criterio Unknown).
     NoDeterministicAction { reason: String },
 }
@@ -165,16 +172,27 @@ impl RecommendedAction {
         match self {
             Self::InvokeTool { tool_name, .. } => Some(tool_name),
             Self::RepairDiagnostic { .. } => Some(crate::harness::tools::REPAIR_DIAGNOSTIC),
+            Self::ApplyCorrection { .. } => Some(crate::harness::tools::APPLY_CORRECTION),
             Self::FinishAllowed { .. } | Self::NoDeterministicAction { .. } => None,
+        }
+    }
+
+    pub fn kind_label(&self) -> &'static str {
+        match self {
+            Self::FinishAllowed { .. } => "FinishAllowed",
+            Self::InvokeTool { .. } => "InvokeTool",
+            Self::RepairDiagnostic { .. } => "RepairDiagnostic",
+            Self::ApplyCorrection { .. } => "ApplyCorrection",
+            Self::NoDeterministicAction { .. } => "NoDeterministicAction",
         }
     }
 
     pub fn priority(&self) -> u8 {
         match self {
             Self::FinishAllowed { .. } => 0,
-            Self::InvokeTool { priority, .. } | Self::RepairDiagnostic { priority, .. } => {
-                *priority
-            }
+            Self::InvokeTool { priority, .. }
+            | Self::RepairDiagnostic { priority, .. }
+            | Self::ApplyCorrection { priority, .. } => *priority,
             Self::NoDeterministicAction { .. } => u8::MAX,
         }
     }
@@ -265,6 +283,72 @@ pub fn select_primary_recommendation(evaluation: &GoalEvaluation) -> Recommended
         })
 }
 
+/// Último ToolOutcome del historial (éxito o fallo), si existe.
+pub fn last_tool_outcome(ctx: &AgentContext) -> Option<(&str, bool)> {
+    for observation in ctx.observation_history.iter().rev() {
+        if let AgentObservation::ToolOutcome {
+            tool_name, success, ..
+        } = observation
+        {
+            return Some((tool_name.as_str(), *success));
+        }
+    }
+    None
+}
+
+/// Recomendación primaria aware de transiciones de acción ya completadas.
+///
+/// Evita perder el contrato:
+/// `RepairDiagnostic` exitoso → `ApplyCorrection` requerido;
+/// `ApplyCorrection` exitoso → `Compile` de re-verificación.
+pub fn select_primary_recommendation_with_context(
+    evaluation: &GoalEvaluation,
+    ctx: &AgentContext,
+) -> RecommendedAction {
+    if evaluation.status == GoalStatus::Satisfied {
+        return RecommendedAction::FinishAllowed {
+            reason: evaluation.specification_evaluation.message.clone(),
+        };
+    }
+
+    let primary = evaluation.gap.primary();
+    if let Some((tool_name, true)) = last_tool_outcome(ctx) {
+        use crate::harness::tools::{APPLY_CORRECTION, COMPILE, REPAIR_DIAGNOSTIC};
+        if tool_name == REPAIR_DIAGNOSTIC
+            && let Some(gap) = primary
+            && gap.kind == CriterionKind::Compile
+            && gap.verdict == EvaluationVerdict::Fail
+        {
+            return RecommendedAction::ApplyCorrection {
+                criterion_id: gap.criterion_id.clone(),
+                kind: gap.kind,
+                priority: criterion_kind_priority(gap.kind),
+                reason: format!(
+                    "RepairDiagnostic completado para `{}`: ApplyCorrection requerido",
+                    gap.criterion_id.as_str()
+                ),
+            };
+        }
+        if tool_name == APPLY_CORRECTION
+            && let Some(gap) = primary
+            && gap.kind == CriterionKind::Compile
+        {
+            return RecommendedAction::InvokeTool {
+                tool_name: COMPILE,
+                criterion_id: gap.criterion_id.clone(),
+                kind: gap.kind,
+                priority: criterion_kind_priority(gap.kind),
+                reason: format!(
+                    "ApplyCorrection exitoso para `{}`: re-verificar con Compile",
+                    gap.criterion_id.as_str()
+                ),
+            };
+        }
+    }
+
+    select_primary_recommendation(evaluation)
+}
+
 /// Lista todas las recomendaciones ordenadas por prioridad (para trazabilidad/tests).
 pub fn recommend_all_from_gap(gap: &GoalGap) -> Vec<RecommendedAction> {
     gap.unsatisfied
@@ -325,14 +409,54 @@ pub enum ProgressSignal {
     Improved,
     Unchanged,
     Regressed,
+    /// Fingerprint de criterios ya visto en una evaluación anterior (ciclo de estado).
+    RepeatedState,
 }
 
-/// Rastrea progreso medible y detecta ausencia de avance / regresiones.
+/// Snapshot mínimo para identidad de estado autónomo (sin secretos / sin logs).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutonomousStateSnapshot {
+    pub goal_status: GoalStatus,
+    pub criteria_fingerprint: String,
+    pub recommendation_kind: String,
+    pub last_action: Option<String>,
+    pub artifact_revision: Option<u64>,
+    pub pass_count: usize,
+    pub gap_count: usize,
+}
+
+/// Evaluación de progreso de una iteración (actividad ≠ progreso).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgressAssessment {
+    pub signal: ProgressSignal,
+    pub reason: String,
+    pub repeated_action: bool,
+    pub artifact_changed_without_progress: bool,
+    pub snapshot: AutonomousStateSnapshot,
+}
+
+impl ProgressAssessment {
+    pub fn is_meaningful_progress(&self) -> bool {
+        matches!(self.signal, ProgressSignal::Improved)
+    }
+
+    pub fn is_non_progress(&self) -> bool {
+        matches!(
+            self.signal,
+            ProgressSignal::Unchanged | ProgressSignal::RepeatedState | ProgressSignal::Regressed
+        )
+    }
+}
+
+/// Rastrea progreso medible y detecta ausencia de avance / regresiones / ciclos.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GoalProgressTracker {
     pass_counts: Vec<usize>,
     fingerprints: Vec<String>,
+    actions: Vec<Option<String>>,
+    artifact_revisions: Vec<Option<u64>>,
     stale_iterations: u32,
+    assessments: Vec<ProgressAssessment>,
 }
 
 impl GoalProgressTracker {
@@ -341,6 +465,17 @@ impl GoalProgressTracker {
     }
 
     pub fn record(&mut self, evaluation: &GoalEvaluation) -> ProgressSignal {
+        self.record_iteration(evaluation, None, None).signal
+    }
+
+    /// Registra una iteración con acción y revisión de artifact opcionales.
+    pub fn record_iteration(
+        &mut self,
+        evaluation: &GoalEvaluation,
+        action: Option<&str>,
+        artifact_revision: Option<u64>,
+    ) -> ProgressAssessment {
+        let recommendation = select_primary_recommendation(evaluation);
         let pass_count = evaluation
             .specification_evaluation
             .criteria
@@ -348,29 +483,115 @@ impl GoalProgressTracker {
             .filter(|item| item.verdict == EvaluationVerdict::Pass)
             .count();
         let fingerprint = progress_fingerprint(evaluation);
+        let gap_count = evaluation.gap.unsatisfied.len();
 
         let signal = match self.pass_counts.last() {
             None => ProgressSignal::Unchanged,
             Some(prev) if pass_count > *prev => ProgressSignal::Improved,
-            Some(prev) if pass_count < *prev => ProgressSignal::Regressed,
-            Some(_) => {
+            Some(prev) => {
                 if self.fingerprints.last() == Some(&fingerprint) {
                     ProgressSignal::Unchanged
+                } else if self.fingerprints.iter().any(|seen| seen == &fingerprint) {
+                    ProgressSignal::RepeatedState
+                } else if pass_count < *prev {
+                    ProgressSignal::Regressed
                 } else {
+                    // Fingerprint nuevo con pass_count estable: evidencia/gap distinta.
                     ProgressSignal::Improved
                 }
             }
         };
 
-        if signal == ProgressSignal::Unchanged && !self.pass_counts.is_empty() {
-            self.stale_iterations += 1;
-        } else if signal == ProgressSignal::Improved {
+        let repeated_action = action.is_some()
+            && self.actions.last().and_then(|item| item.as_deref()) == action
+            && matches!(
+                signal,
+                ProgressSignal::Unchanged | ProgressSignal::RepeatedState
+            );
+
+        let artifact_changed_without_progress = artifact_revision.is_some()
+            && self.artifact_revisions.last().copied().flatten() != artifact_revision
+            && matches!(
+                signal,
+                ProgressSignal::Unchanged | ProgressSignal::RepeatedState
+            );
+
+        let action_advanced =
+            action.is_some() && self.actions.last().and_then(|item| item.as_deref()) != action;
+
+        let reason = match signal {
+            ProgressSignal::Improved => {
+                if gap_count
+                    < self
+                        .assessments
+                        .last()
+                        .map(|item| item.snapshot.gap_count)
+                        .unwrap_or(usize::MAX)
+                {
+                    "gap reducido o criterio hacia Pass".to_string()
+                } else {
+                    "estado de criterios distinto con progreso medible".to_string()
+                }
+            }
+            ProgressSignal::Unchanged => {
+                if repeated_action {
+                    format!(
+                        "acción repetida sin cambio de estado: {}",
+                        action.unwrap_or("?")
+                    )
+                } else if artifact_changed_without_progress {
+                    "artifact mutó sin mejora de criterios/gap".to_string()
+                } else {
+                    "sin cambio en fingerprint de criterios".to_string()
+                }
+            }
+            ProgressSignal::Regressed => {
+                "menos criterios en Pass que la evaluación previa".to_string()
+            }
+            ProgressSignal::RepeatedState => {
+                "fingerprint de criterios ya observado (ciclo de estado)".to_string()
+            }
+        };
+
+        // Estancamiento: repetición de acción/estado, no pasos intermedios de un pipeline
+        // (p. ej. RepairDiagnostic → ApplyCorrection → re-verify aún Unchanged).
+        if signal == ProgressSignal::Improved {
             self.stale_iterations = 0;
+        } else if signal == ProgressSignal::RepeatedState
+            || repeated_action
+            || (matches!(
+                signal,
+                ProgressSignal::Unchanged | ProgressSignal::Regressed
+            ) && !action_advanced
+                && !self.pass_counts.is_empty())
+        {
+            self.stale_iterations += 1;
         }
+
+        let snapshot = AutonomousStateSnapshot {
+            goal_status: evaluation.status,
+            criteria_fingerprint: fingerprint.clone(),
+            recommendation_kind: recommendation.kind_label().to_string(),
+            last_action: action.map(str::to_string),
+            artifact_revision,
+            pass_count,
+            gap_count,
+        };
+
+        let assessment = ProgressAssessment {
+            signal,
+            reason,
+            repeated_action,
+            artifact_changed_without_progress,
+            snapshot,
+        };
 
         self.pass_counts.push(pass_count);
         self.fingerprints.push(fingerprint);
-        signal
+        self.actions.push(action.map(str::to_string));
+        self.artifact_revisions.push(artifact_revision);
+        self.assessments.push(assessment.clone());
+        assessment
     }
 
     pub fn stale_iterations(&self) -> u32 {
@@ -379,6 +600,14 @@ impl GoalProgressTracker {
 
     pub fn pass_count(&self) -> usize {
         self.pass_counts.last().copied().unwrap_or(0)
+    }
+
+    pub fn last_assessment(&self) -> Option<&ProgressAssessment> {
+        self.assessments.last()
+    }
+
+    pub fn assessments(&self) -> &[ProgressAssessment] {
+        &self.assessments
     }
 }
 
@@ -410,6 +639,8 @@ pub enum GoalDrivenStatus {
     Failed,
     MaxIterations,
     Escalated,
+    /// Sin progreso medible durante la ventana configurada.
+    NonProgress,
 }
 
 /// Historial de evaluaciones de Goal durante el loop.
@@ -418,6 +649,7 @@ pub struct GoalDrivenHistory {
     pub evaluations: Vec<GoalEvaluation>,
     pub gaps: Vec<GoalGap>,
     pub progress_signals: Vec<ProgressSignal>,
+    pub progress_assessments: Vec<ProgressAssessment>,
 }
 
 /// Resultado del loop goal-driven.
@@ -447,11 +679,12 @@ pub struct GoalDrivenLoop {
 
 impl GoalDrivenLoop {
     pub fn new(max_iterations: u32, max_stale_iterations: u32) -> Self {
+        let max_stale_iterations = max_stale_iterations.max(1);
         Self {
-            inner: AgentLoop::new(max_iterations),
+            inner: AgentLoop::new(max_iterations).with_max_stale_iterations(max_stale_iterations),
             evaluator: GoalEvaluator::new(),
             progress: GoalProgressTracker::new(),
-            max_stale_iterations: max_stale_iterations.max(1),
+            max_stale_iterations,
         }
     }
 
@@ -474,9 +707,9 @@ impl GoalDrivenLoop {
         let initial = self.evaluator.evaluate(goal, &initial_evidence);
         history.evaluations.push(initial.clone());
         history.gaps.push(initial.gap.clone());
-        history
-            .progress_signals
-            .push(self.progress.record(&initial));
+        let initial_assessment = self.progress.record_iteration(&initial, None, None);
+        history.progress_signals.push(initial_assessment.signal);
+        history.progress_assessments.push(initial_assessment);
 
         if initial.status == GoalStatus::Satisfied {
             let loop_result = empty_satisfied_loop_result(ctx.clone());
@@ -499,11 +732,39 @@ impl GoalDrivenLoop {
         let mut final_evaluation = self.evaluator.evaluate(goal, evidence);
         history.evaluations.push(final_evaluation.clone());
         history.gaps.push(final_evaluation.gap.clone());
-        let progress = self.progress.record(&final_evaluation);
+        let artifact_revision = loop_result
+            .final_context
+            .working_artifact
+            .as_ref()
+            .map(|artifact| artifact.revision());
+        let last_action = loop_result
+            .history
+            .executed_actions
+            .last()
+            .and_then(AgentAction::tool_name);
+        let assessment =
+            self.progress
+                .record_iteration(&final_evaluation, last_action, artifact_revision);
+        let progress = assessment.signal;
         history.progress_signals.push(progress);
+        history.progress_assessments.push(assessment);
 
         if progress == ProgressSignal::Regressed {
             final_evaluation.status = GoalStatus::Unsatisfied;
+        }
+
+        // Prefer assessments collected mid-loop by AgentLoop when present.
+        if !loop_result.history.progress_assessments.is_empty() {
+            history
+                .progress_assessments
+                .extend(loop_result.history.progress_assessments.clone());
+            history.progress_signals.extend(
+                loop_result
+                    .history
+                    .progress_assessments
+                    .iter()
+                    .map(|item| item.signal),
+            );
         }
 
         let escalation = check_escalation(
@@ -521,10 +782,10 @@ impl GoalDrivenLoop {
                 goal.id().as_str(),
                 final_evaluation.specification_evaluation.message
             ),
-            GoalDrivenStatus::Escalated => escalation
+            GoalDrivenStatus::Escalated | GoalDrivenStatus::NonProgress => escalation
                 .as_ref()
                 .map(|item| item.reason.clone())
-                .unwrap_or_else(|| "escalación sin detalle".to_string()),
+                .unwrap_or_else(|| loop_result.termination_reason.clone()),
             GoalDrivenStatus::MaxIterations => loop_result.termination_reason.clone(),
             GoalDrivenStatus::Failed => format!(
                 "goal no alcanzada: {} ({})",
@@ -573,7 +834,8 @@ fn check_escalation(
         return None;
     }
 
-    let stale = progress.stale_iterations() >= max_stale;
+    let non_progress = loop_result.status == LoopStatus::NonProgress;
+    let stale = progress.stale_iterations() >= max_stale || non_progress;
     let exhausted = loop_result.status == LoopStatus::MaxIterations;
     let no_hypothesis = evaluation
         .gap
@@ -585,7 +847,9 @@ fn check_escalation(
         return None;
     }
 
-    let reason = if stale {
+    let reason = if non_progress {
+        loop_result.termination_reason.clone()
+    } else if stale {
         format!(
             "sin progreso durante {} evaluaciones consecutivas",
             progress.stale_iterations()
@@ -611,6 +875,9 @@ fn resolve_goal_status(
     evaluation: &GoalEvaluation,
     escalated: bool,
 ) -> GoalDrivenStatus {
+    if loop_result.status == LoopStatus::NonProgress {
+        return GoalDrivenStatus::NonProgress;
+    }
     if escalated {
         return GoalDrivenStatus::Escalated;
     }
@@ -621,6 +888,7 @@ fn resolve_goal_status(
         LoopStatus::MaxIterations => GoalDrivenStatus::MaxIterations,
         LoopStatus::Failed | LoopStatus::Running => GoalDrivenStatus::Failed,
         LoopStatus::Completed => GoalDrivenStatus::Failed,
+        LoopStatus::NonProgress => GoalDrivenStatus::NonProgress,
     }
 }
 
@@ -655,6 +923,14 @@ impl GapDrivenAgent {
             RecommendedAction::RepairDiagnostic { .. } => {
                 let errors = compile_errors_from_context(ctx);
                 AgentAction::RepairDiagnostic { errors }
+            }
+            RecommendedAction::ApplyCorrection { reason, .. } => {
+                // Agente determinista sin LLM: no inventa correcciones.
+                AgentAction::Finish {
+                    summary: format!(
+                        "error: apply_correction_required without model synthesizer ({reason})"
+                    ),
+                }
             }
             RecommendedAction::InvokeTool { tool_name, .. } => {
                 recommended_tool_to_agent_action(tool_name, ctx, &self.request)
@@ -746,9 +1022,8 @@ impl Agent for GapDrivenAgent {
                         summary: "goal satisfied".to_string(),
                     };
                 }
-                if let Some(gap) = evaluation.gap.primary() {
-                    return self.action_for_gap(gap, ctx);
-                }
+                let recommendation = select_primary_recommendation_with_context(&evaluation, ctx);
+                return self.action_for_recommendation(&recommendation, ctx);
             }
             return AgentAction::Finish {
                 summary: "criterio pass pero goal incompleta".to_string(),
@@ -779,9 +1054,13 @@ impl Agent for GapDrivenAgent {
                 &Goal::from_specification(spec.clone()),
                 &collect_evidence_from_context(ctx),
             );
-            if let Some(gap) = evaluation.gap.primary() {
-                return self.action_for_gap(gap, ctx);
+            if evaluation.status == GoalStatus::Satisfied {
+                return AgentAction::Finish {
+                    summary: "goal satisfied".to_string(),
+                };
             }
+            let recommendation = select_primary_recommendation_with_context(&evaluation, ctx);
+            return self.action_for_recommendation(&recommendation, ctx);
         }
 
         if let Some(code) = ctx.working_code() {
@@ -838,7 +1117,6 @@ mod tests {
     use crate::harness::specification::{AcceptanceCriterion, Requirement};
     use crate::harness::tool::Tool;
     use crate::harness::tool::ToolResult;
-    use crate::harness::tool_permission::ToolPermissionConstraint;
     use crate::harness::tools::{COMPILE, CompileTool, RepairDiagnosticTool, VALIDATE};
 
     fn compile_only_goal() -> Goal {
@@ -1016,9 +1294,11 @@ mod tests {
         assert!(
             matches!(
                 result.status,
-                GoalDrivenStatus::Escalated | GoalDrivenStatus::MaxIterations
+                GoalDrivenStatus::Escalated
+                    | GoalDrivenStatus::MaxIterations
+                    | GoalDrivenStatus::NonProgress
             ),
-            "debe escalar o agotar iteraciones: {:?}",
+            "debe escalar, agotar iteraciones o detectar non-progress: {:?}",
             result.status
         );
         if let Some(escalation) = &result.escalation {

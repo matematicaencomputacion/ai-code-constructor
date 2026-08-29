@@ -11,7 +11,7 @@ use crate::harness::criterion::CriterionKind;
 use crate::harness::evaluation::EvaluationVerdict;
 use crate::harness::goal_driven::{
     Goal, GoalEvaluator, GoalStatus, RecommendedAction, collect_evidence_from_context,
-    select_primary_recommendation,
+    select_primary_recommendation_with_context,
 };
 use crate::harness::observation::AgentObservation;
 use crate::harness::tools::{APPLY_CORRECTION, COMPILE, REPAIR_DIAGNOSTIC, VALIDATE};
@@ -391,7 +391,7 @@ pub fn model_request_from_context(
                 &Goal::from_specification(spec.clone()),
                 &collect_evidence_from_context(ctx),
             );
-            let recommendation = select_primary_recommendation(&evaluation);
+            let recommendation = select_primary_recommendation_with_context(&evaluation, ctx);
             (
                 Some(serialize_goal_evaluation(&evaluation)),
                 if evaluation.gap.is_empty() {
@@ -783,6 +783,19 @@ fn serialize_recommended_action(action: &RecommendedAction) -> SerializedRecomme
             priority: *priority,
             reason: reason.clone(),
         },
+        RecommendedAction::ApplyCorrection {
+            criterion_id,
+            kind,
+            priority,
+            reason,
+        } => SerializedRecommendedAction {
+            kind: "ApplyCorrection".to_string(),
+            tool_name: Some(APPLY_CORRECTION.to_string()),
+            criterion_id: Some(criterion_id.as_str().to_string()),
+            criterion_kind: Some(format!("{kind:?}")),
+            priority: *priority,
+            reason: reason.clone(),
+        },
         RecommendedAction::NoDeterministicAction { reason } => SerializedRecommendedAction {
             kind: "NoDeterministicAction".to_string(),
             tool_name: None,
@@ -894,13 +907,14 @@ pub fn decision_is_compatible_with_recommendation(
             .tool_name
             .as_deref()
             .is_some_and(|tool| decision_matches_recommended_tool(decision, tool)),
+        "ApplyCorrection" => matches!(decision, ModelDecision::ApplyCorrection { .. }),
         _ => true,
     }
 }
 
 fn decision_matches_recommended_tool(decision: &ModelDecision, tool_name: &str) -> bool {
     use crate::harness::tools::{
-        CHECK_FORMAT, COMPILE, REPAIR_DIAGNOSTIC, RUN_CLIPPY, RUN_TESTS, VALIDATE,
+        APPLY_CORRECTION, CHECK_FORMAT, COMPILE, REPAIR_DIAGNOSTIC, RUN_CLIPPY, RUN_TESTS, VALIDATE,
     };
     match tool_name {
         COMPILE => matches!(decision, ModelDecision::Compile { .. }),
@@ -909,8 +923,47 @@ fn decision_matches_recommended_tool(decision: &ModelDecision, tool_name: &str) 
         RUN_CLIPPY => matches!(decision, ModelDecision::RunClippy),
         CHECK_FORMAT => matches!(decision, ModelDecision::CheckFormat),
         REPAIR_DIAGNOSTIC => matches!(decision, ModelDecision::RepairDiagnostic { .. }),
+        APPLY_CORRECTION => matches!(decision, ModelDecision::ApplyCorrection { .. }),
         _ => false,
     }
+}
+
+/// True cuando el último ToolOutcome relevante es ApplyCorrection exitoso
+/// pendiente de re-compile (compile aún en error), ignorando ActionRejected intermedios.
+fn apply_correction_pending_recompile(request: &ModelRequest) -> bool {
+    let compile_still_failed = request.diagnostic_context.compile_status.as_deref()
+        == Some("error")
+        || request.goal_gap.as_ref().is_some_and(|gap| {
+            gap.gaps
+                .iter()
+                .any(|item| item.kind == "Compile" && item.verdict == "Fail")
+        });
+    if !compile_still_failed {
+        return false;
+    }
+
+    for obs in request
+        .last_observation
+        .iter()
+        .chain(request.recent_observations.iter())
+    {
+        if obs.kind == "action_rejected" || obs.kind == "criterion_evaluated" {
+            continue;
+        }
+        if obs.kind != "tool_outcome" {
+            continue;
+        }
+        let Some(tool) = obs.tool_name.as_deref() else {
+            continue;
+        };
+        if tool == APPLY_CORRECTION && obs.success == Some(true) {
+            return true;
+        }
+        if tool == COMPILE || tool == VALIDATE || tool == REPAIR_DIAGNOSTIC {
+            return false;
+        }
+    }
+    false
 }
 
 /// Valida y corrige determinísticamente una decisión incompatible con `recommended_action`.
@@ -941,13 +994,10 @@ pub fn validate_model_decision_against_recommendation(
         return decision;
     }
 
-    // Tras ApplyCorrection exitoso, FORZAR re-compile: el gap aún puede recomendar
-    // RepairDiagnostic con evidencia de compile stale, lo que bloquearía la re-verificación.
-    if request.last_observation.as_ref().is_some_and(|obs| {
-        obs.kind == "tool_outcome"
-            && obs.tool_name.as_deref() == Some(APPLY_CORRECTION)
-            && obs.success == Some(true)
-    }) {
+    // Tras ApplyCorrection exitoso sin re-verificación Compile posterior, FORZAR Compile.
+    // Usa el último ToolOutcome (no solo last_observation): un Finish rechazado no debe
+    // borrar la obligación de re-compilar tras mutar el artifact.
+    if apply_correction_pending_recompile(request) {
         return ModelDecision::Compile {
             code: request.working_code.clone().unwrap_or_default(),
         };
@@ -1000,6 +1050,10 @@ pub fn model_decision_from_recommended_action(
             decision_for_criterion_kind(kind, request)
         }
         "RepairDiagnostic" => Some(repair_diagnostic_decision(request)),
+        "ApplyCorrection" => {
+            let corrections = infer_corrections_from_diagnostic_context(request);
+            Some(ModelDecision::ApplyCorrection { corrections })
+        }
         "NoDeterministicAction" => None,
         _ => None,
     }
@@ -3229,6 +3283,99 @@ mod tests {
         assert!(
             matches!(guided, ModelDecision::Compile { .. }),
             "tras apply_correction exitoso debe forzar Compile, got {guided:?}"
+        );
+    }
+
+    #[test]
+    fn apply_gap_guidance_forces_compile_even_after_finish_rejected() {
+        let apply_obs = SerializedObservation {
+            kind: "tool_outcome".to_string(),
+            tool_name: Some(APPLY_CORRECTION.to_string()),
+            success: Some(true),
+            summary: "corrección aplicada".to_string(),
+            validator_errors: Vec::new(),
+            repairer_feedback: Vec::new(),
+            evidence_labels: Vec::new(),
+            evidence_details: Vec::new(),
+            evaluation_verdict: None,
+            specification_id: None,
+            criterion_id: None,
+            criterion_kind: None,
+            evaluation_message: None,
+        };
+        let rejected = SerializedObservation {
+            kind: "action_rejected".to_string(),
+            tool_name: None,
+            success: Some(false),
+            summary: "Finish bloqueado".to_string(),
+            validator_errors: Vec::new(),
+            repairer_feedback: Vec::new(),
+            evidence_labels: Vec::new(),
+            evidence_details: Vec::new(),
+            evaluation_verdict: None,
+            specification_id: None,
+            criterion_id: None,
+            criterion_kind: None,
+            evaluation_message: None,
+        };
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 4,
+            user_request: "compilar".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some("fn main() {}\n".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: Some(1),
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: Some(rejected.clone()),
+            recent_observations: vec![rejected, apply_obs],
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Unsatisfied".to_string(),
+                criteria_total: 1,
+                criteria_pass: 0,
+                criteria_fail: 1,
+                criteria_insufficient: 0,
+                message: "compile still failing".to_string(),
+            }),
+            goal_gap: Some(SerializedGoalGap {
+                unsatisfied_count: 1,
+                gaps: vec![SerializedCriterionGap {
+                    criterion_id: "ac-compile".to_string(),
+                    kind: "Compile".to_string(),
+                    verdict: "Fail".to_string(),
+                    message: "error".to_string(),
+                    suggested_action: Some(COMPILE.to_string()),
+                }],
+            }),
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "InvokeTool".to_string(),
+                tool_name: Some(COMPILE.to_string()),
+                criterion_id: Some("ac-compile".to_string()),
+                criterion_kind: Some("Compile".to_string()),
+                priority: 0,
+                reason: "re-verify".to_string(),
+            }),
+            diagnostic_context: SerializedDiagnosticContext {
+                compile_status: Some("error".to_string()),
+                compiler_stderr: vec!["error: broken".to_string()],
+                ..SerializedDiagnosticContext::default()
+            },
+            system_prompt: String::new(),
+        };
+
+        let guided = apply_gap_guidance(
+            ModelDecision::Finish {
+                summary: "premature".to_string(),
+            },
+            &request,
+        );
+        assert!(
+            matches!(guided, ModelDecision::Compile { .. }),
+            "Finish tras ApplyCorrection (aunque last=rejected) debe forzar Compile: {guided:?}"
         );
     }
 }
