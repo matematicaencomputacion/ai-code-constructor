@@ -24,6 +24,7 @@ mod criterion;
 mod evaluation;
 mod evaluation_engine;
 mod evaluation_observation;
+mod failure_classification;
 mod feature_flags;
 mod goal_driven;
 mod live_session;
@@ -57,6 +58,8 @@ mod autonomous_construction_tests;
 mod autonomous_repair_tests;
 #[cfg(test)]
 mod convergence_tests;
+#[cfg(test)]
+mod failure_classification_tests;
 #[cfg(test)]
 mod goal_driven_autonomous_construction_e2e_tests;
 #[cfg(test)]
@@ -135,6 +138,12 @@ pub use evaluation_engine::{
 pub use evaluation_observation::{
     EvaluationAwareAgent, ToolEvaluationStep, criterion_kind_for_tool, evaluate_tool_evidence,
     observation_from_criterion_evaluation, observation_from_specification_evaluation,
+};
+#[allow(unused_imports)]
+pub use failure_classification::{
+    FailureClass, FailureEvidence, FailureReport, FailureSource, RecoveryBudget, RecoveryStrategy,
+    build_failure_report, classify_model_error, classify_progress_stall, classify_response_error,
+    classify_system_failure, select_recovery_strategy,
 };
 #[allow(unused_imports)]
 pub use goal_driven::{

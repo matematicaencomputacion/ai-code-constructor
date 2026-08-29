@@ -3,6 +3,9 @@ use crate::harness::agent::Agent;
 use crate::harness::artifact_file_operation::ArtifactFileOperation;
 use crate::harness::context::AgentContext;
 use crate::harness::correction::Correction;
+use crate::harness::failure_classification::{
+    FailureEvidence, classify_model_error, classify_response_error,
+};
 use crate::harness::feature_flags::ai_agent_gap_guidance_enabled;
 use crate::harness::model::{
     AiSessionConfig, ModelClient, ModelDecision, ModelError, ModelInteractionTrace,
@@ -103,6 +106,15 @@ impl AiAgent {
 }
 
 impl Agent for AiAgent {
+    fn last_failure_evidence(&self) -> Option<FailureEvidence> {
+        if let Some(error) = &self.last_model_error {
+            return Some(classify_model_error(error));
+        }
+        self.last_response_error
+            .as_ref()
+            .map(classify_response_error)
+    }
+
     fn propose(&mut self, ctx: &AgentContext) -> AgentAction {
         self.last_model_error = None;
         self.last_response_error = None;

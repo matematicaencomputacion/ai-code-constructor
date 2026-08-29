@@ -525,6 +525,10 @@ impl AutonomousConstructionSession {
             GoalDrivenStatus::MaxIterations => ConstructionStatus::MaxIterations,
             GoalDrivenStatus::Escalated
             | GoalDrivenStatus::NonProgress
+            | GoalDrivenStatus::ExternalServiceBlocked
+            | GoalDrivenStatus::ExternalConfigurationBlocked
+            | GoalDrivenStatus::ModelCapabilityFailure
+            | GoalDrivenStatus::SystemFailure
             | GoalDrivenStatus::Failed => ConstructionStatus::Failed,
         };
 
@@ -734,9 +738,13 @@ fn resolve_status(
 ) -> ConstructionStatus {
     match loop_result.status {
         LoopStatus::MaxIterations => ConstructionStatus::MaxIterations,
-        LoopStatus::Failed | LoopStatus::Running | LoopStatus::NonProgress => {
-            ConstructionStatus::Failed
-        }
+        LoopStatus::Failed
+        | LoopStatus::Running
+        | LoopStatus::NonProgress
+        | LoopStatus::ExternalServiceBlocked
+        | LoopStatus::ExternalConfigurationBlocked
+        | LoopStatus::ModelCapabilityFailure
+        | LoopStatus::SystemFailure => ConstructionStatus::Failed,
         LoopStatus::Completed => match evaluation.status {
             SpecificationEvaluationStatus::Pass => ConstructionStatus::Completed,
             SpecificationEvaluationStatus::Fail => ConstructionStatus::Failed,
