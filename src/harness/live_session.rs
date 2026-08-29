@@ -2063,18 +2063,101 @@ fn implementar_handlers() {
         }
     }
 
-    #[test]
-    fn live_repair_smoke_wiring_repairs_with_diagnostic_client() {
-        use crate::harness::model::DiagnosticContextModelClient;
+    /// ModelClient observation-driven para wiring live de reparación autónoma (sin API real).
+    struct LiveRepairWiringClient;
 
-        // gap_guidance=false: Finish prematuro → action_rejected → repair determinista
-        // (con gap_guidance=true el mock puede quedar en compile↔finish sin repair en AgentLoop).
+    impl ModelClient for LiveRepairWiringClient {
+        fn complete(
+            &self,
+            request: &ModelRequest,
+        ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+            use crate::harness::model::DiagnosticContextModelClient;
+
+            if request.last_observation.as_ref().is_some_and(|obs| {
+                obs.tool_name.as_deref() == Some(REPAIR_DIAGNOSTIC) && obs.success == Some(true)
+            }) {
+                return DiagnosticContextModelClient::new().complete(request);
+            }
+
+            let decision = match &request.last_observation {
+                None => ModelDecision::Compile {
+                    code: request.working_code.clone().unwrap_or_default(),
+                },
+                Some(obs)
+                    if obs.kind == "criterion_evaluated"
+                        && obs.criterion_kind.as_deref() == Some("Compile")
+                        && obs.evaluation_verdict.as_deref() == Some("Fail") =>
+                {
+                    ModelDecision::RepairDiagnostic {
+                        errors: if request.diagnostic_context.compiler_stderr.is_empty() {
+                            vec!["compile fail".to_string()]
+                        } else {
+                            request.diagnostic_context.compiler_stderr.clone()
+                        },
+                    }
+                }
+                Some(obs) if obs.kind == "action_rejected" => ModelDecision::RepairDiagnostic {
+                    errors: request
+                        .diagnostic_context
+                        .compiler_stderr
+                        .first()
+                        .cloned()
+                        .into_iter()
+                        .collect(),
+                },
+                Some(obs)
+                    if obs.tool_name.as_deref() == Some(APPLY_CORRECTION)
+                        && obs.success == Some(true) =>
+                {
+                    ModelDecision::Compile {
+                        code: request.working_code.clone().unwrap_or_default(),
+                    }
+                }
+                Some(obs)
+                    if obs.kind == "criterion_evaluated"
+                        && obs.criterion_kind.as_deref() == Some("Compile")
+                        && obs.evaluation_verdict.as_deref() == Some("Pass") =>
+                {
+                    ModelDecision::Finish {
+                        summary: "live repair wiring completed".to_string(),
+                    }
+                }
+                Some(obs)
+                    if obs.tool_name.as_deref() == Some(COMPILE) && obs.success == Some(true) =>
+                {
+                    ModelDecision::Finish {
+                        summary: "live repair wiring completed".to_string(),
+                    }
+                }
+                Some(obs)
+                    if obs.tool_name.as_deref() == Some(COMPILE) && obs.success == Some(false) =>
+                {
+                    ModelDecision::RepairDiagnostic {
+                        errors: request.diagnostic_context.compiler_stderr.clone(),
+                    }
+                }
+                _ => ModelDecision::Compile {
+                    code: request.working_code.clone().unwrap_or_default(),
+                },
+            };
+            Ok(crate::harness::model::ModelResponse {
+                raw_text: serialize_decision(&decision),
+            })
+        }
+    }
+
+    #[test]
+    fn live_repair_smoke_wiring_repairs_broken_helper() {
+        unsafe {
+            std::env::remove_var("AI_AGENT_GAP_GUIDANCE");
+        }
+
         let config =
             LiveSessionConfig::autonomous_compile_repair_artifact().with_gap_guidance(false);
         let result = run_live_agent_session_with_client(
-            Box::new(DiagnosticContextModelClient::new()),
+            Box::new(LiveRepairWiringClient),
             config,
-            Some("diagnostic-context".to_string()),
+            Some("live-repair-wiring".to_string()),
         )
         .expect("wiring session");
 
@@ -2117,12 +2200,12 @@ fn implementar_handlers() {
             .requests
             .iter()
             .find(|req| {
-                req.last_observation.as_ref().is_some_and(|obs| {
-                    obs.kind == "criterion_evaluated"
-                        && obs.evaluation_verdict.as_deref() == Some("Fail")
-                })
+                req.diagnostic_context
+                    .compile_status
+                    .as_deref()
+                    .is_some_and(|s| s == "error")
             })
-            .expect("ModelRequest tras compile FAIL");
+            .expect("ModelRequest con diagnostic_context de compile FAIL");
         assert!(
             !compile_fail_request
                 .diagnostic_context
