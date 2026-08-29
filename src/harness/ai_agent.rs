@@ -13,14 +13,28 @@ use crate::harness::model::{
     structured_to_file_operation, validate_apply_correction,
     validate_model_decision_against_recommendation,
 };
+use crate::harness::model_routing::{
+    EscalationBudget, ModelCandidate, RoutingDecision, RoutingPlanInput, apply_routing_decision,
+    plan_routing,
+};
+
+/// Estado de routing multi-modelo opcional (catálogo + presupuesto + historial).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelRoutingState {
+    pub candidates: Vec<ModelCandidate>,
+    pub active_index: usize,
+    pub budget: EscalationBudget,
+    pub decisions: Vec<RoutingDecision>,
+}
 
 /// Primer Agent basado en IA: serializa contexto, consulta [`ModelClient`]
 /// y convierte la respuesta validada en [`AgentAction`].
 ///
 /// No ejecuta Tools ni conoce Harness directamente.
 pub struct AiAgent {
-    client: Box<dyn ModelClient>,
+    clients: Vec<Box<dyn ModelClient>>,
     session: AiSessionConfig,
+    routing: Option<ModelRoutingState>,
     pub trace: ModelInteractionTrace,
     pub last_model_error: Option<ModelError>,
     pub last_response_error: Option<ModelResponseError>,
@@ -29,12 +43,67 @@ pub struct AiAgent {
 impl AiAgent {
     pub fn new(client: Box<dyn ModelClient>, session: AiSessionConfig) -> Self {
         Self {
-            client,
+            clients: vec![client],
             session,
+            routing: None,
             trace: ModelInteractionTrace::default(),
             last_model_error: None,
             last_response_error: None,
         }
+    }
+
+    /// Construye un agente con catálogo de candidatos y presupuesto de escalación.
+    ///
+    /// El primer elemento es el modelo activo inicial. Los ids/providers vienen de
+    /// configuración inyectada (tests/orquestador), no de política hardcodeada.
+    pub fn with_model_routing(
+        catalog: Vec<(ModelCandidate, Box<dyn ModelClient>)>,
+        session: AiSessionConfig,
+        budget: EscalationBudget,
+    ) -> Self {
+        assert!(
+            !catalog.is_empty(),
+            "with_model_routing requiere al menos un candidato"
+        );
+        let mut candidates = Vec::with_capacity(catalog.len());
+        let mut clients = Vec::with_capacity(catalog.len());
+        for (candidate, client) in catalog {
+            candidates.push(candidate);
+            clients.push(client);
+        }
+        let mut budget = budget;
+        budget.mark_visited(candidates[0].identity());
+        Self {
+            clients,
+            session,
+            routing: Some(ModelRoutingState {
+                candidates,
+                active_index: 0,
+                budget,
+                decisions: Vec::new(),
+            }),
+            trace: ModelInteractionTrace::default(),
+            last_model_error: None,
+            last_response_error: None,
+        }
+    }
+
+    pub fn routing_state(&self) -> Option<&ModelRoutingState> {
+        self.routing.as_ref()
+    }
+
+    pub fn active_model_candidate(&self) -> Option<&ModelCandidate> {
+        let state = self.routing.as_ref()?;
+        state.candidates.get(state.active_index)
+    }
+
+    fn active_client(&self) -> &dyn ModelClient {
+        let index = self
+            .routing
+            .as_ref()
+            .map(|state| state.active_index)
+            .unwrap_or(0);
+        self.clients[index].as_ref()
     }
 
     fn action_label(action: &AgentAction) -> String {
@@ -115,6 +184,51 @@ impl Agent for AiAgent {
             .map(classify_response_error)
     }
 
+    fn try_route_after_failure(
+        &mut self,
+        evidence: &FailureEvidence,
+        meaningful_progress_observed: bool,
+    ) -> Option<RoutingDecision> {
+        let state = self.routing.as_mut()?;
+        let active = state.candidates.get(state.active_index)?.clone();
+        let planned = plan_routing(
+            evidence,
+            RoutingPlanInput {
+                active: &active,
+                candidates: &state.candidates,
+                budget: &state.budget,
+                meaningful_progress_observed,
+            },
+        );
+        if planned.action.changes_model() {
+            let applied = apply_routing_decision(
+                &planned,
+                &mut state.active_index,
+                &state.candidates,
+                &mut state.budget,
+            );
+            if !applied {
+                let stopped = RoutingDecision {
+                    action: crate::harness::model_routing::RoutingAction::Stop,
+                    reason: crate::harness::model_routing::RoutingReason::NoRouteableCandidates,
+                    from: planned.from.clone(),
+                    to: planned.to.clone(),
+                    failure_class: planned.failure_class,
+                    escalation_used: state.budget.switches_used,
+                    escalation_remaining: state.budget.remaining_count(),
+                };
+                state.decisions.push(stopped.clone());
+                return Some(stopped);
+            }
+        }
+        // Refrescar contadores post-apply para observabilidad exacta.
+        let mut recorded = planned;
+        recorded.escalation_used = state.budget.switches_used;
+        recorded.escalation_remaining = state.budget.remaining_count();
+        state.decisions.push(recorded.clone());
+        Some(recorded)
+    }
+
     fn propose(&mut self, ctx: &AgentContext) -> AgentAction {
         self.last_model_error = None;
         self.last_response_error = None;
@@ -129,7 +243,7 @@ impl Agent for AiAgent {
         };
         self.trace.record_request(request.clone());
 
-        let response = match self.client.complete(&request) {
+        let response = match self.active_client().complete(&request) {
             Ok(value) => value,
             Err(error) => {
                 self.last_model_error = Some(error.clone());

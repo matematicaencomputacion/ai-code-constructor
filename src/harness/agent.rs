@@ -5,6 +5,7 @@ use crate::harness::correction_policy::{
     CorrectionPolicy, CorrectionPolicyInput, DeterministicCorrectionPolicy,
 };
 use crate::harness::failure_classification::FailureEvidence;
+use crate::harness::model_routing::RoutingDecision;
 use crate::harness::observation::AgentObservation;
 
 /// Productor de acciones. Permite reemplazar mocks por un AiAgent
@@ -17,6 +18,19 @@ pub trait Agent: Send + Sync {
     /// Default: `None`. [`crate::harness::AiAgent`] expone [`ModelError`] /
     /// errores de respuesta sin acoplar el loop al proveedor.
     fn last_failure_evidence(&self) -> Option<FailureEvidence> {
+        None
+    }
+
+    /// Planifica (y aplica si corresponde) routing multi-modelo tras un fallo clasificado.
+    ///
+    /// Default: `None` (agentes sin catálogo de candidatos). Un `Some` con
+    /// `action.changes_model()` indica que el loop puede continuar con el nuevo modelo.
+    fn try_route_after_failure(
+        &mut self,
+        evidence: &FailureEvidence,
+        meaningful_progress_observed: bool,
+    ) -> Option<RoutingDecision> {
+        let _ = (evidence, meaningful_progress_observed);
         None
     }
 }
