@@ -144,12 +144,15 @@ pub use goal_driven::{
 };
 #[allow(unused_imports)]
 pub use live_session::{
-    LIVE_AGENT_MAX_ITERATIONS, LiveSessionConfig, LiveSessionError,
+    LIVE_AGENT_MAX_ITERATIONS, LiveRepairSmokeOutcome, LiveSessionConfig, LiveSessionError,
     LiveSessionFromSpecificationOptions, LiveSessionResult, LiveSessionStepRecord,
     LiveSessionTrace, build_validate_compile_harness, build_validate_compile_harness_with_policy,
-    live_quality_artifact_source, live_quality_specification, run_live_agent_session,
+    live_quality_artifact_source, live_quality_specification, live_repair_broken_helper_artifact,
+    live_repair_compile_specification, live_repair_smoke_env_ready,
+    print_live_repair_smoke_instructions, run_live_agent_session,
     run_live_agent_session_with_client, run_live_agent_session_with_client_and_policy,
     run_live_agent_session_with_client_policy_and_retry_observability,
+    run_live_repair_smoke_harness,
 };
 #[allow(unused_imports)]
 pub use model::{

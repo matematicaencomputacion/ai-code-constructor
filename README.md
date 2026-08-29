@@ -412,6 +412,19 @@ export MODEL_NAME=...
 cargo test manual_live_agent_session -- --ignored --nocapture
 ```
 
+Autonomous compile repair (broken multi-file helper → real model repair):
+
+```bash
+export MODEL_BASE_URL=...
+export MODEL_API_KEY=...
+export MODEL_NAME=...
+cargo run -- live-repair-smoke
+# or:
+cargo test manual_live_autonomous_repair_session -- --ignored --nocapture
+```
+
+Without `MODEL_*` credentials, `cargo run -- live-repair-smoke` prints setup instructions (CI-safe).
+
 ---
 
 ## Security (what is actually implemented)
