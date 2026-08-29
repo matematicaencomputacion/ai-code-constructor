@@ -56,6 +56,8 @@ mod autonomous_construction_tests;
 #[cfg(test)]
 mod autonomous_repair_tests;
 #[cfg(test)]
+mod convergence_tests;
+#[cfg(test)]
 mod goal_driven_autonomous_construction_e2e_tests;
 #[cfg(test)]
 mod goal_driven_integration_tests;
@@ -136,11 +138,12 @@ pub use evaluation_observation::{
 };
 #[allow(unused_imports)]
 pub use goal_driven::{
-    CriterionGap, EvaluationPlan, EvaluationPlanEntry, GapDrivenAgent, Goal, GoalDrivenHistory,
-    GoalDrivenLoop, GoalDrivenResult, GoalDrivenStatus, GoalEscalation, GoalEvaluation,
-    GoalEvaluator, GoalGap, GoalProgressTracker, GoalStatus, ProgressSignal, RecommendedAction,
-    collect_evidence_from_context, criterion_kind_priority, evaluate_after_tool,
-    recommend_all_from_gap, recommend_for_criterion_gap, select_primary_recommendation,
+    AutonomousStateSnapshot, CriterionGap, EvaluationPlan, EvaluationPlanEntry, GapDrivenAgent,
+    Goal, GoalDrivenHistory, GoalDrivenLoop, GoalDrivenResult, GoalDrivenStatus, GoalEscalation,
+    GoalEvaluation, GoalEvaluator, GoalGap, GoalProgressTracker, GoalStatus, ProgressAssessment,
+    ProgressSignal, RecommendedAction, collect_evidence_from_context, criterion_kind_priority,
+    evaluate_after_tool, last_tool_outcome, recommend_all_from_gap, recommend_for_criterion_gap,
+    select_primary_recommendation, select_primary_recommendation_with_context,
 };
 #[allow(unused_imports)]
 pub use live_session::{

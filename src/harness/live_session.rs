@@ -596,7 +596,9 @@ pub fn run_live_agent_session_with_client_policy_and_retry_observability(
     let policy_name = policy.name().to_string();
     let mut agent = AiAgent::new(client, session);
     let harness = build_validate_compile_harness_with_policy(policy);
-    let loop_result = AgentLoop::new(max_iterations).run(&harness, &mut agent, ctx);
+    let loop_result = AgentLoop::new(max_iterations)
+        .with_max_stale_iterations(3)
+        .run(&harness, &mut agent, ctx);
 
     let session_trace = build_session_trace(
         &loop_result,
@@ -1035,8 +1037,18 @@ fn implementar_handlers() {
 
         let result = run_live_agent_session_with_client(Box::new(AlwaysFinishClient), config, None)
             .expect("session");
-        assert_eq!(result.loop_result.status, LoopStatus::MaxIterations);
-        assert_eq!(result.loop_result.iterations, LIVE_AGENT_MAX_ITERATIONS);
+        assert!(
+            matches!(
+                result.loop_result.status,
+                LoopStatus::MaxIterations | LoopStatus::NonProgress
+            ),
+            "terminación acotada esperada, got {:?}",
+            result.loop_result.status
+        );
+        assert!(
+            result.loop_result.iterations <= LIVE_AGENT_MAX_ITERATIONS,
+            "no debe exceder el cap"
+        );
         assert!(
             result
                 .session_trace
@@ -1624,6 +1636,7 @@ fn implementar_handlers() {
         assert!(
             result.loop_result.status == LoopStatus::Completed
                 || result.loop_result.status == LoopStatus::MaxIterations
+                || result.loop_result.status == LoopStatus::NonProgress
         );
         assert!(!result.session_trace.records.is_empty());
         assert_eq!(result.session_trace.action_policy, "action_policy");
@@ -2011,6 +2024,7 @@ fn implementar_handlers() {
             result.loop_result.status == LoopStatus::Completed
                 || result.loop_result.status == LoopStatus::Failed
                 || result.loop_result.status == LoopStatus::MaxIterations
+                || result.loop_result.status == LoopStatus::NonProgress
         );
         assert!(
             result
@@ -2165,6 +2179,7 @@ fn implementar_handlers() {
             result.loop_result.status == LoopStatus::Completed
                 || result.loop_result.status == LoopStatus::Failed
                 || result.loop_result.status == LoopStatus::MaxIterations
+                || result.loop_result.status == LoopStatus::NonProgress
         );
     }
 }

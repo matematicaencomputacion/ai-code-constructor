@@ -523,7 +523,9 @@ impl AutonomousConstructionSession {
         let status = match goal_result.status {
             GoalDrivenStatus::GoalSatisfied => ConstructionStatus::Completed,
             GoalDrivenStatus::MaxIterations => ConstructionStatus::MaxIterations,
-            GoalDrivenStatus::Escalated | GoalDrivenStatus::Failed => ConstructionStatus::Failed,
+            GoalDrivenStatus::Escalated
+            | GoalDrivenStatus::NonProgress
+            | GoalDrivenStatus::Failed => ConstructionStatus::Failed,
         };
 
         let termination_reason = goal_result.termination_reason.clone();
@@ -732,8 +734,9 @@ fn resolve_status(
 ) -> ConstructionStatus {
     match loop_result.status {
         LoopStatus::MaxIterations => ConstructionStatus::MaxIterations,
-        LoopStatus::Failed => ConstructionStatus::Failed,
-        LoopStatus::Running => ConstructionStatus::Failed,
+        LoopStatus::Failed | LoopStatus::Running | LoopStatus::NonProgress => {
+            ConstructionStatus::Failed
+        }
         LoopStatus::Completed => match evaluation.status {
             SpecificationEvaluationStatus::Pass => ConstructionStatus::Completed,
             SpecificationEvaluationStatus::Fail => ConstructionStatus::Failed,
