@@ -941,15 +941,16 @@ pub fn validate_model_decision_against_recommendation(
         return decision;
     }
 
-    // Tras ApplyCorrection exitoso, re-compilar antes de re-evaluar el gap de Compile.
-    if matches!(decision, ModelDecision::Compile { .. })
-        && request.last_observation.as_ref().is_some_and(|obs| {
-            obs.kind == "tool_outcome"
-                && obs.tool_name.as_deref() == Some(APPLY_CORRECTION)
-                && obs.success == Some(true)
-        })
-    {
-        return decision;
+    // Tras ApplyCorrection exitoso, FORZAR re-compile: el gap aún puede recomendar
+    // RepairDiagnostic con evidencia de compile stale, lo que bloquearía la re-verificación.
+    if request.last_observation.as_ref().is_some_and(|obs| {
+        obs.kind == "tool_outcome"
+            && obs.tool_name.as_deref() == Some(APPLY_CORRECTION)
+            && obs.success == Some(true)
+    }) {
+        return ModelDecision::Compile {
+            code: request.working_code.clone().unwrap_or_default(),
+        };
     }
 
     // Tras FAIL de un criterio, RepairDiagnostic precede a re-ejecutar la Tool.
@@ -3152,5 +3153,82 @@ mod tests {
         };
         let guided = apply_gap_guidance(finish.clone(), &request);
         assert_eq!(guided, finish);
+    }
+
+    #[test]
+    fn apply_gap_guidance_forces_compile_after_successful_apply_correction() {
+        // Evidencia live Gemini: tras apply_correction el gap seguía recomendando
+        // RepairDiagnostic (compile FAIL stale) y el modelo volvía a repair sin re-verificar.
+        let request = ModelRequest {
+            goal: "test".to_string(),
+            step: 3,
+            user_request: "compilar".to_string(),
+            plan_kind: Some("Generic".to_string()),
+            working_code: Some("fn main() {}\n".to_string()),
+            artifact_id: None,
+            artifact_language: None,
+            artifact_revision: None,
+            artifact_primary_path: None,
+            artifact_files: Vec::new(),
+            last_observation: Some(SerializedObservation {
+                kind: "tool_outcome".to_string(),
+                tool_name: Some(APPLY_CORRECTION.to_string()),
+                success: Some(true),
+                summary: "corrección aplicada".to_string(),
+                validator_errors: Vec::new(),
+                repairer_feedback: Vec::new(),
+                evidence_labels: Vec::new(),
+                evidence_details: Vec::new(),
+                evaluation_verdict: None,
+                specification_id: None,
+                criterion_id: None,
+                criterion_kind: None,
+                evaluation_message: None,
+            }),
+            recent_observations: Vec::new(),
+            recent_evidence: Vec::new(),
+            goal_evaluation: Some(SerializedGoalEvaluation {
+                goal_id: "spec".to_string(),
+                status: "Unsatisfied".to_string(),
+                criteria_total: 1,
+                criteria_pass: 0,
+                criteria_fail: 1,
+                criteria_insufficient: 0,
+                message: "compile fail stale".to_string(),
+            }),
+            goal_gap: Some(SerializedGoalGap {
+                unsatisfied_count: 1,
+                gaps: vec![SerializedCriterionGap {
+                    criterion_id: "ac-compile".to_string(),
+                    kind: "Compile".to_string(),
+                    verdict: "Fail".to_string(),
+                    message: "error".to_string(),
+                    suggested_action: Some(COMPILE.to_string()),
+                }],
+            }),
+            recommended_action: Some(SerializedRecommendedAction {
+                kind: "RepairDiagnostic".to_string(),
+                tool_name: Some(REPAIR_DIAGNOSTIC.to_string()),
+                criterion_id: Some("ac-compile".to_string()),
+                criterion_kind: Some("Compile".to_string()),
+                priority: 0,
+                reason: "compilación fallida (stale)".to_string(),
+            }),
+            diagnostic_context: SerializedDiagnosticContext {
+                compile_status: Some("error".to_string()),
+                compiler_stderr: vec!["error: cannot find value `broken`".to_string()],
+                ..SerializedDiagnosticContext::default()
+            },
+            system_prompt: String::new(),
+        };
+
+        let repair_again = ModelDecision::RepairDiagnostic {
+            errors: vec!["stale".to_string()],
+        };
+        let guided = apply_gap_guidance(repair_again, &request);
+        assert!(
+            matches!(guided, ModelDecision::Compile { .. }),
+            "tras apply_correction exitoso debe forzar Compile, got {guided:?}"
+        );
     }
 }
