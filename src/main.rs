@@ -15,7 +15,20 @@ use state::CodeState;
 const MAX_ITERATIONS: u32 = 3;
 
 fn main() {
-    let request = std::env::args().skip(1).collect::<Vec<String>>().join(" ");
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("live-repair-smoke") {
+        match harness::run_live_repair_smoke_harness() {
+            Ok(harness::LiveRepairSmokeOutcome::BlockedWithInstructions) => {}
+            Ok(harness::LiveRepairSmokeOutcome::LiveSessionCompleted(_)) => {}
+            Err(error) => {
+                eprintln!("live-repair-smoke: {error}");
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
+    let request = args.join(" ");
     let _state = run_constructor(&request);
 }
 

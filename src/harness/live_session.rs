@@ -6,7 +6,8 @@ use crate::harness::action_policy::ActionPolicy;
 use crate::harness::agent_loop::{AgentLoop, LoopResult};
 use crate::harness::agent_prompt::{SYSTEM_PROMPT_VERSION, system_prompt_v1};
 use crate::harness::ai_agent::AiAgent;
-use crate::harness::artifact::RustArtifact;
+use crate::harness::artifact::{ArtifactId, RustArtifact};
+use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::autonomous_construction::{initial_artifact_from_plan, plan_kind_label};
 use crate::harness::constraint::Constraint;
 use crate::harness::context::AgentContext;
@@ -82,6 +83,27 @@ impl LiveSessionConfig {
     pub fn with_specification(mut self, specification: Specification) -> Self {
         self.evaluation_specification = Some(specification);
         self
+    }
+
+    /// Sesión live controlada: artifact multi-file con defecto de compilación +
+    /// Specification compile-only (escenario `broken_helper`).
+    ///
+    /// Pensada para validar reparación autónoma con `diagnostic_context` y
+    /// `gap_guidance` contra un modelo real o [`DiagnosticContextModelClient`] en CI.
+    pub fn autonomous_compile_repair_artifact() -> Self {
+        let artifact = live_repair_broken_helper_artifact();
+        let working_code = artifact.source().to_string();
+        Self {
+            goal: "live:autonomous-compile-repair".to_string(),
+            user_request: "compilar helper".to_string(),
+            plan_kind: "Generic".to_string(),
+            working_artifact: Some(artifact),
+            working_code,
+            evaluation_specification: Some(live_repair_compile_specification()),
+            max_iterations: LIVE_AGENT_MAX_ITERATIONS,
+            debug_log_prompt: false,
+            gap_guidance: true,
+        }
     }
 
     /// Sesión live experimental: Artifact + Specification con criterios de calidad.
@@ -217,6 +239,41 @@ pub fn live_quality_specification() -> Specification {
         ])
 }
 
+/// Specification mínima compile-only para demo live de reparación autónoma.
+pub fn live_repair_compile_specification() -> Specification {
+    use crate::harness::criterion::CriterionKind;
+    use crate::harness::specification::{AcceptanceCriterion, Requirement};
+
+    Specification::new("spec-live-repair", "El código debe compilar")
+        .with_requirements(vec![Requirement::new("req-c", "compilar")])
+        .with_acceptance_criteria(vec![
+            AcceptanceCriterion::new("ac-compile", "compila", CriterionKind::Compile)
+                .satisfying([crate::harness::RequirementId::new("req-c")]),
+        ])
+}
+
+/// Artifact multi-file con `broken` indefinido en helper (fallo de compilación controlado).
+pub fn live_repair_broken_helper_artifact() -> RustArtifact {
+    let main = ArtifactPath::parse("src/main.rs").expect("main path");
+    let helper = ArtifactPath::parse("src/helper.rs").expect("helper path");
+    RustArtifact::try_from_files(
+        ArtifactId::new("artifact:live-repair-smoke"),
+        "main.rs",
+        main.clone(),
+        [
+            (
+                main,
+                "mod helper;\nfn main() {\n    println!(\"{}\", helper::value());\n}\n".to_string(),
+            ),
+            (
+                helper,
+                "pub fn value() -> i32 {\n    broken\n}\n".to_string(),
+            ),
+        ],
+    )
+    .expect("broken helper artifact")
+}
+
 /// Source rustfmt/clippy-friendly con un test real (Artifact-scoped quality).
 pub fn live_quality_artifact_source() -> String {
     "\
@@ -348,6 +405,64 @@ pub struct LiveSessionResult {
     pub loop_result: LoopResult,
     pub model_trace: ModelInteractionTrace,
     pub session_trace: LiveSessionTrace,
+}
+
+/// Resultado del harness smoke de reparación live.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveRepairSmokeOutcome {
+    /// Variables `MODEL_*` ausentes; se imprimieron instrucciones de ejecución manual.
+    BlockedWithInstructions,
+    /// Sesión live ejecutada contra endpoint real.
+    LiveSessionCompleted(Box<LiveSessionResult>),
+}
+
+/// Indica si las variables de entorno mínimas para una sesión live están presentes.
+pub fn live_repair_smoke_env_ready() -> bool {
+    std::env::var("MODEL_BASE_URL").is_ok()
+        && std::env::var("MODEL_NAME").is_ok()
+        && std::env::var("MODEL_API_KEY")
+            .map(|key| !key.trim().is_empty())
+            .unwrap_or(false)
+}
+
+/// Imprime instrucciones para ejecutar validación live de reparación autónoma.
+pub fn print_live_repair_smoke_instructions() {
+    println!("=== LIVE REPAIR SMOKE HARNESS (BLOCKED: sin MODEL_* ) ===");
+    println!(
+        "Escenario: artifact multi-file con helper roto → compile FAIL → repair → correct → compile PASS."
+    );
+    println!();
+    println!("Requisitos de entorno:");
+    println!("  export MODEL_BASE_URL=https://api.openai.com/v1   # o compatible OpenAI");
+    println!("  export MODEL_API_KEY=sk-...");
+    println!("  export MODEL_NAME=gpt-4o-mini                     # o modelo disponible");
+    println!("  export MODEL_TIMEOUT_MS=60000                     # opcional");
+    println!(
+        "  export AI_AGENT_GAP_GUIDANCE=1                    # opcional (default: gap_guidance en config)"
+    );
+    println!();
+    println!("Ejecución:");
+    println!("  cargo run -- live-repair-smoke");
+    println!("  # o vía test manual (NO CI):");
+    println!("  cargo test manual_live_autonomous_repair_session -- --ignored --nocapture");
+    println!();
+    println!(
+        "Evidencia esperada: traza LIVE SESSION con compile/repair_diagnostic/apply_correction,"
+    );
+    println!("helper sin 'broken', y diagnostic_context con compiler_stderr en ModelRequest.");
+}
+
+/// Punto de entrada del smoke harness: ejecuta live si hay credenciales, si no imprime instrucciones.
+pub fn run_live_repair_smoke_harness() -> Result<LiveRepairSmokeOutcome, LiveSessionError> {
+    if !live_repair_smoke_env_ready() {
+        print_live_repair_smoke_instructions();
+        return Ok(LiveRepairSmokeOutcome::BlockedWithInstructions);
+    }
+
+    let mut config = LiveSessionConfig::autonomous_compile_repair_artifact();
+    config.debug_log_prompt = true;
+    let result = run_live_agent_session(config)?;
+    Ok(LiveRepairSmokeOutcome::LiveSessionCompleted(Box::new(result)))
 }
 
 /// Construye Harness con Tools + [`ActionPolicy::default_session_policy`].
@@ -595,6 +710,7 @@ mod tests {
     use crate::harness::agent::Agent;
     use crate::harness::agent_loop::LoopStatus;
     use crate::harness::artifact::ArtifactId;
+    use crate::harness::artifact_path::ArtifactPath;
     use crate::harness::bridge::introduce_validation_defect;
     use crate::harness::criterion::CriterionKind;
     use crate::harness::evaluation::EvaluationVerdict;
@@ -1902,5 +2018,151 @@ fn implementar_handlers() {
                 .is_some()
         );
         assert!(result.loop_result.final_context.working_artifact.is_some());
+    }
+
+    #[test]
+    fn live_repair_smoke_config_builds_broken_helper_artifact() {
+        let config = LiveSessionConfig::autonomous_compile_repair_artifact();
+        assert!(config.gap_guidance);
+        assert!(config.evaluation_specification.is_some());
+        let artifact = config.working_artifact.expect("artifact");
+        let helper = artifact
+            .file(&ArtifactPath::parse("src/helper.rs").unwrap())
+            .expect("helper");
+        assert!(helper.contains("broken"));
+        assert!(!helper.contains("0"));
+    }
+
+    #[test]
+    fn live_repair_smoke_harness_blocked_without_env() {
+        let saved_base = std::env::var("MODEL_BASE_URL").ok();
+        let saved_key = std::env::var("MODEL_API_KEY").ok();
+        let saved_name = std::env::var("MODEL_NAME").ok();
+        unsafe {
+            std::env::remove_var("MODEL_BASE_URL");
+            std::env::remove_var("MODEL_API_KEY");
+            std::env::remove_var("MODEL_NAME");
+        }
+
+        let outcome = run_live_repair_smoke_harness().expect("harness");
+        assert_eq!(outcome, LiveRepairSmokeOutcome::BlockedWithInstructions);
+
+        restore_env("MODEL_BASE_URL", saved_base);
+        restore_env("MODEL_API_KEY", saved_key);
+        restore_env("MODEL_NAME", saved_name);
+    }
+
+    fn restore_env(key: &str, value: Option<String>) {
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(key, v),
+                None => std::env::remove_var(key),
+            }
+        }
+    }
+
+    #[test]
+    fn live_repair_smoke_wiring_repairs_with_diagnostic_client() {
+        use crate::harness::model::DiagnosticContextModelClient;
+
+        let config = LiveSessionConfig::autonomous_compile_repair_artifact();
+        let result = run_live_agent_session_with_client(
+            Box::new(DiagnosticContextModelClient::new()),
+            config,
+            Some("diagnostic-context".to_string()),
+        )
+        .expect("wiring session");
+
+        assert_eq!(result.loop_result.status, LoopStatus::Completed);
+        assert!(
+            result
+                .loop_result
+                .tools_executed()
+                .iter()
+                .any(|t| t == COMPILE)
+        );
+        assert!(
+            result
+                .loop_result
+                .tools_executed()
+                .iter()
+                .any(|t| t == REPAIR_DIAGNOSTIC)
+        );
+        assert!(
+            result
+                .loop_result
+                .tools_executed()
+                .iter()
+                .any(|t| t == APPLY_CORRECTION)
+        );
+
+        let helper_path = ArtifactPath::parse("src/helper.rs").unwrap();
+        let final_helper = result
+            .loop_result
+            .final_context
+            .working_artifact
+            .as_ref()
+            .and_then(|a| a.file(&helper_path))
+            .expect("helper final");
+        assert!(!final_helper.contains("broken"));
+        assert!(final_helper.contains('0'));
+
+        let compile_fail_request = result
+            .model_trace
+            .requests
+            .iter()
+            .find(|req| {
+                req.last_observation.as_ref().is_some_and(|obs| {
+                    obs.kind == "criterion_evaluated"
+                        && obs.evaluation_verdict.as_deref() == Some("Fail")
+                })
+            })
+            .expect("ModelRequest tras compile FAIL");
+        assert!(
+            !compile_fail_request
+                .diagnostic_context
+                .compiler_stderr
+                .is_empty()
+                || compile_fail_request
+                    .diagnostic_context
+                    .evidence_pairs
+                    .iter()
+                    .any(|(label, _)| label == "compiler_stderr"),
+            "diagnóstico debe fluir al ModelRequest"
+        );
+        assert!(!result.session_trace.contains_secrets());
+    }
+
+    /// Validación live con modelo real + reparación autónoma (NO CI).
+    ///
+    /// Requiere MODEL_BASE_URL, MODEL_API_KEY, MODEL_NAME.
+    #[test]
+    #[ignore = "requiere endpoint real y variables MODEL_* configuradas por el operador"]
+    fn manual_live_autonomous_repair_session() {
+        let outcome = run_live_repair_smoke_harness().expect("harness");
+        let LiveRepairSmokeOutcome::LiveSessionCompleted(result) = outcome else {
+            panic!("con MODEL_* configuradas debe ejecutar sesión live, no bloquearse");
+        };
+        let result = result.as_ref();
+
+        println!("=== LIVE AUTONOMOUS REPAIR DEMO ===");
+        println!("status={:?}", result.loop_result.status);
+        println!("tools={:?}", result.loop_result.tools_executed());
+        for req in &result.model_trace.requests {
+            if !req.diagnostic_context.compiler_stderr.is_empty() {
+                println!(
+                    "diagnostic_stderr_samples={:?}",
+                    req.diagnostic_context.compiler_stderr
+                );
+            }
+        }
+
+        assert!(!result.session_trace.records.is_empty());
+        assert!(!result.session_trace.contains_secrets());
+        assert!(
+            result.loop_result.status == LoopStatus::Completed
+                || result.loop_result.status == LoopStatus::Failed
+                || result.loop_result.status == LoopStatus::MaxIterations
+        );
     }
 }
