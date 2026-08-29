@@ -4,12 +4,21 @@ use crate::harness::correction::Correction;
 use crate::harness::correction_policy::{
     CorrectionPolicy, CorrectionPolicyInput, DeterministicCorrectionPolicy,
 };
+use crate::harness::failure_classification::FailureEvidence;
 use crate::harness::observation::AgentObservation;
 
 /// Productor de acciones. Permite reemplazar mocks por un AiAgent
 /// sin modificar el [`crate::harness::Harness`] ni el [`crate::harness::AgentLoop`].
 pub trait Agent: Send + Sync {
     fn propose(&mut self, ctx: &AgentContext) -> AgentAction;
+
+    /// Evidencia estructurada del último fallo de servicio/modelo, si existe.
+    ///
+    /// Default: `None`. [`crate::harness::AiAgent`] expone [`ModelError`] /
+    /// errores de respuesta sin acoplar el loop al proveedor.
+    fn last_failure_evidence(&self) -> Option<FailureEvidence> {
+        None
+    }
 }
 
 /// Agente determinista con secuencia prefijada (útil para smoke tests).

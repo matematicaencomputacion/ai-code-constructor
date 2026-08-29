@@ -11,6 +11,7 @@ mod tests {
     use crate::harness::context::AgentContext;
     use crate::harness::criterion::CriterionKind;
     use crate::harness::evaluation::EvaluationVerdict;
+    use crate::harness::failure_classification::FailureClass;
     use crate::harness::goal_driven::{
         Goal, GoalDrivenLoop, GoalDrivenStatus, GoalEvaluator, GoalProgressTracker, GoalStatus,
         ProgressSignal, RecommendedAction, collect_evidence_from_context,
@@ -108,7 +109,7 @@ mod tests {
         assert!(assessment.snapshot.gap_count < both_open.gap.unsatisfied.len());
     }
 
-    /// TEST C — repeated action without state change → NonProgress
+    /// TEST C — repeated action without state change → ModelCapabilityFailure
     #[test]
     fn test_c_repeated_action_non_progress() {
         struct RepeatRepairAgent;
@@ -131,12 +132,9 @@ mod tests {
             .with_max_stale_iterations(3)
             .run(&harness, &mut agent, ctx);
 
-        assert_eq!(result.status, LoopStatus::NonProgress);
-        assert!(
-            result.termination_reason.contains("non_progress"),
-            "{}",
-            result.termination_reason
-        );
+        assert_eq!(result.status, LoopStatus::ModelCapabilityFailure);
+        let report = result.failure_report.expect("failure report");
+        assert_eq!(report.classification, FailureClass::ModelCapability);
         assert!(
             result
                 .history
@@ -253,9 +251,10 @@ mod tests {
             .with_max_stale_iterations(3)
             .run(&harness, &mut agent, ctx);
 
-        assert_eq!(result.status, LoopStatus::NonProgress);
+        assert_eq!(result.status, LoopStatus::ModelCapabilityFailure);
         assert!(result.iterations <= 10, "iterations={}", result.iterations);
-        assert!(result.termination_reason.contains("non_progress"));
+        let report = result.failure_report.expect("failure report");
+        assert_eq!(report.classification, FailureClass::ModelCapability);
     }
 
     /// TEST H — premature Finish redirected / rejected
@@ -327,6 +326,10 @@ mod tests {
                     | GoalDrivenStatus::Failed
                     | GoalDrivenStatus::Escalated
                     | GoalDrivenStatus::NonProgress
+                    | GoalDrivenStatus::ExternalServiceBlocked
+                    | GoalDrivenStatus::ExternalConfigurationBlocked
+                    | GoalDrivenStatus::ModelCapabilityFailure
+                    | GoalDrivenStatus::SystemFailure
             ),
             "status inesperado: {:?}",
             result.status

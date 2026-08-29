@@ -1,11 +1,17 @@
+use std::thread;
+
 use crate::harness::action::AgentAction;
 use crate::harness::agent::Agent;
 use crate::harness::context::AgentContext;
 use crate::harness::evaluation::{Evaluation, Evidence};
 use crate::harness::evaluation_engine::CriterionEvaluation;
 use crate::harness::evaluation_observation::evaluate_tool_evidence;
+use crate::harness::failure_classification::{
+    FailureEvidence, FailureReport, RecoveryBudget, RecoveryStrategy, build_failure_report,
+    classify_progress_stall, classify_system_failure, select_recovery_strategy,
+};
 use crate::harness::goal_driven::{
-    Goal, GoalEvaluator, GoalProgressTracker, GoalStatus, ProgressAssessment,
+    Goal, GoalEvaluator, GoalProgressTracker, GoalStatus, ProgressAssessment, ProgressSignal,
     collect_evidence_from_context,
 };
 use crate::harness::observation::AgentObservation;
@@ -19,8 +25,16 @@ pub enum LoopStatus {
     Completed,
     Failed,
     MaxIterations,
-    /// Ventana de no-progreso agotada (convergencia bloqueada).
+    /// Ventana de no-progreso agotada sin causa más específica demostrable.
     NonProgress,
+    /// Servicio externo bloqueó la ejecución (p. ej. rate limit agotado).
+    ExternalServiceBlocked,
+    /// Fallo permanente de configuración/credenciales del servicio modelo.
+    ExternalConfigurationBlocked,
+    /// Decisiones del modelo sin progreso medible (servicio OK).
+    ModelCapabilityFailure,
+    /// Fallo interno del sistema autónomo.
+    SystemFailure,
 }
 
 /// Historial observable de una ejecución del loop.
@@ -38,6 +52,8 @@ pub struct LoopHistory {
     pub steps: Vec<StepOutcome>,
     /// Assessments de progreso goal-driven (vacío si no hay specification / stale tracking).
     pub progress_assessments: Vec<ProgressAssessment>,
+    /// Informes de clasificación/recovery emitidos durante la corrida.
+    pub failure_reports: Vec<FailureReport>,
 }
 
 /// Resultado estructurado del Agent Loop.
@@ -48,6 +64,8 @@ pub struct LoopResult {
     pub history: LoopHistory,
     pub final_context: AgentContext,
     pub termination_reason: String,
+    /// Último informe de fallo clasificado, si aplica.
+    pub failure_report: Option<FailureReport>,
 }
 
 impl LoopResult {
@@ -70,6 +88,7 @@ pub struct AgentLoop {
     max_iterations: u32,
     /// Si `Some`, evalúa progreso de Goal tras cada paso con specification.
     max_stale_iterations: Option<u32>,
+    recovery_budget_template: RecoveryBudget,
 }
 
 impl AgentLoop {
@@ -81,12 +100,21 @@ impl AgentLoop {
         Self {
             max_iterations,
             max_stale_iterations: None,
+            recovery_budget_template: RecoveryBudget::default(),
         }
     }
 
     /// Activa detección de no-progreso (default productivo: 3).
     pub fn with_max_stale_iterations(mut self, max_stale_iterations: u32) -> Self {
         self.max_stale_iterations = Some(max_stale_iterations.max(1));
+        self
+    }
+
+    /// Configura el presupuesto de recovery transitorio (intentos + backoff).
+    ///
+    /// Tests: usar `Duration::ZERO` (default) para evitar sleeps reales.
+    pub fn with_recovery_budget(mut self, budget: RecoveryBudget) -> Self {
+        self.recovery_budget_template = budget;
         self
     }
 
@@ -105,6 +133,10 @@ impl AgentLoop {
         let mut iterations = 0;
         let mut termination_reason = String::new();
         let mut progress = GoalProgressTracker::new();
+        let mut recovery_budget = self.recovery_budget_template;
+        let mut failure_report: Option<FailureReport> = None;
+        let mut meaningful_progress_observed = false;
+        let mut recovered_after_failure = false;
 
         while iterations < self.max_iterations {
             iterations += 1;
@@ -131,6 +163,63 @@ impl AgentLoop {
                 history.tool_results.push(tool_result);
             }
 
+            // Fallo estructurado del Agent (ModelError / response) — antes de stale/Finish genérico.
+            if let Some(mut evidence) = agent.last_failure_evidence() {
+                evidence.failed_action =
+                    outcome.action.tool_name().map(str::to_string).or_else(|| {
+                        match &outcome.action {
+                            AgentAction::Finish { .. } => Some("finish".to_string()),
+                            AgentAction::NoOp => Some("noop".to_string()),
+                            _ => None,
+                        }
+                    });
+                match self.handle_classified_failure(
+                    evidence,
+                    &mut recovery_budget,
+                    &mut history,
+                    meaningful_progress_observed,
+                    &mut recovered_after_failure,
+                ) {
+                    FailureHandle::Recover => continue,
+                    FailureHandle::Stop {
+                        loop_status,
+                        reason,
+                        report,
+                    } => {
+                        status = loop_status;
+                        termination_reason = reason;
+                        failure_report = Some(report);
+                        break;
+                    }
+                }
+            }
+
+            if let AgentObservation::UnknownTool { tool_name } = &outcome.observation {
+                let evidence = classify_system_failure(
+                    format!("herramienta no registrada: {tool_name}"),
+                    Some(tool_name.clone()),
+                );
+                match self.handle_classified_failure(
+                    evidence,
+                    &mut recovery_budget,
+                    &mut history,
+                    meaningful_progress_observed,
+                    &mut recovered_after_failure,
+                ) {
+                    FailureHandle::Recover => continue,
+                    FailureHandle::Stop {
+                        loop_status,
+                        reason,
+                        report,
+                    } => {
+                        status = loop_status;
+                        termination_reason = reason;
+                        failure_report = Some(report);
+                        break;
+                    }
+                }
+            }
+
             if let AgentObservation::Finished { summary } = &outcome.observation {
                 let failed = summary.to_ascii_lowercase().contains("fail")
                     || summary.to_ascii_lowercase().contains("error");
@@ -145,7 +234,6 @@ impl AgentLoop {
             }
 
             // Coordinación VERIFY: Tool Evidence → EvaluationEngine → Observation.
-            // AgentLoop orquesta; EvaluationEngine no conoce el Agent.
             if outcome.tool_executed
                 && let (Some(tool_name), Some(specification)) = (
                     outcome.tool_name.as_deref(),
@@ -185,21 +273,40 @@ impl AgentLoop {
                     artifact_revision,
                 );
                 history.progress_assessments.push(assessment.clone());
+                if assessment.signal == ProgressSignal::Improved {
+                    meaningful_progress_observed = true;
+                    recovered_after_failure = false;
+                }
 
                 let stagnating = progress.stale_iterations() >= max_stale
                     || (assessment.repeated_action && progress.stale_iterations() >= max_stale);
                 if stagnating {
-                    status = LoopStatus::NonProgress;
-                    termination_reason = format!(
-                        "non_progress: {} (stale_iterations={}, signal={:?})",
-                        assessment.reason,
-                        progress.stale_iterations(),
-                        assessment.signal
-                    );
-                    history
-                        .evidence
-                        .push(Evidence::new("non_progress", termination_reason.clone()));
-                    break;
+                    let tool_executed_recently = history
+                        .steps
+                        .iter()
+                        .rev()
+                        .take(max_stale as usize)
+                        .any(|step| step.tool_executed);
+                    let evidence = classify_progress_stall(&assessment, tool_executed_recently);
+                    match self.handle_classified_failure(
+                        evidence,
+                        &mut recovery_budget,
+                        &mut history,
+                        meaningful_progress_observed,
+                        &mut recovered_after_failure,
+                    ) {
+                        FailureHandle::Recover => continue,
+                        FailureHandle::Stop {
+                            loop_status,
+                            reason,
+                            report,
+                        } => {
+                            status = loop_status;
+                            termination_reason = reason;
+                            failure_report = Some(report);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -227,7 +334,92 @@ impl AgentLoop {
             history,
             final_context: ctx,
             termination_reason,
+            failure_report,
         }
+    }
+
+    fn handle_classified_failure(
+        &self,
+        evidence: FailureEvidence,
+        budget: &mut RecoveryBudget,
+        history: &mut LoopHistory,
+        meaningful_progress_observed: bool,
+        recovered_after_failure: &mut bool,
+    ) -> FailureHandle {
+        let strategy = select_recovery_strategy(&evidence, budget);
+        if strategy.is_recover() && budget.consume() {
+            if !budget.backoff.is_zero() {
+                thread::sleep(budget.backoff);
+            }
+            *recovered_after_failure = true;
+            let report = build_failure_report(
+                &evidence,
+                strategy,
+                budget.attempts_used,
+                false,
+                meaningful_progress_observed,
+            );
+            history.failure_reports.push(report);
+            history.evidence.push(Evidence::new(
+                "failure_recovery",
+                format!(
+                    "class={} strategy={} attempt={}/{}",
+                    evidence.class.as_str(),
+                    strategy.as_str(),
+                    budget.attempts_used,
+                    budget.max_attempts
+                ),
+            ));
+            return FailureHandle::Recover;
+        }
+
+        let terminal_strategy = if strategy.is_recover() {
+            RecoveryStrategy::StopExternalBlocked
+        } else {
+            strategy
+        };
+        let report = build_failure_report(
+            &evidence,
+            terminal_strategy,
+            budget.attempts_used,
+            *recovered_after_failure && meaningful_progress_observed,
+            meaningful_progress_observed,
+        );
+        history.failure_reports.push(report.clone());
+        history.evidence.push(Evidence::new(
+            "failure_terminal",
+            report.terminal_explanation(),
+        ));
+        FailureHandle::Stop {
+            loop_status: loop_status_for_strategy(terminal_strategy),
+            reason: format!(
+                "{}: {}",
+                evidence.class.as_str(),
+                report.terminal_explanation()
+            ),
+            report,
+        }
+    }
+}
+
+enum FailureHandle {
+    Recover,
+    Stop {
+        loop_status: LoopStatus,
+        reason: String,
+        report: FailureReport,
+    },
+}
+
+fn loop_status_for_strategy(strategy: RecoveryStrategy) -> LoopStatus {
+    match strategy {
+        RecoveryStrategy::StopExternalBlocked | RecoveryStrategy::RetryWithBackoff => {
+            LoopStatus::ExternalServiceBlocked
+        }
+        RecoveryStrategy::StopConfigurationBlocked => LoopStatus::ExternalConfigurationBlocked,
+        RecoveryStrategy::StopModelCapability => LoopStatus::ModelCapabilityFailure,
+        RecoveryStrategy::StopSystemFailure => LoopStatus::SystemFailure,
+        RecoveryStrategy::StopConvergenceStalled => LoopStatus::NonProgress,
     }
 }
 

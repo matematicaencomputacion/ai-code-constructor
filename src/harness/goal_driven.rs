@@ -641,6 +641,14 @@ pub enum GoalDrivenStatus {
     Escalated,
     /// Sin progreso medible durante la ventana configurada.
     NonProgress,
+    /// Servicio externo bloqueó la ejecución autónoma.
+    ExternalServiceBlocked,
+    /// Configuración/credenciales del servicio modelo inválidas.
+    ExternalConfigurationBlocked,
+    /// El modelo no produjo progreso medible con el servicio disponible.
+    ModelCapabilityFailure,
+    /// Fallo interno del sistema autónomo.
+    SystemFailure,
 }
 
 /// Historial de evaluaciones de Goal durante el loop.
@@ -787,10 +795,21 @@ impl GoalDrivenLoop {
                 .map(|item| item.reason.clone())
                 .unwrap_or_else(|| loop_result.termination_reason.clone()),
             GoalDrivenStatus::MaxIterations => loop_result.termination_reason.clone(),
-            GoalDrivenStatus::Failed => format!(
-                "goal no alcanzada: {} ({})",
-                loop_result.termination_reason, final_evaluation.specification_evaluation.message
-            ),
+            GoalDrivenStatus::Failed
+            | GoalDrivenStatus::ExternalServiceBlocked
+            | GoalDrivenStatus::ExternalConfigurationBlocked
+            | GoalDrivenStatus::ModelCapabilityFailure
+            | GoalDrivenStatus::SystemFailure => {
+                if let Some(report) = &loop_result.failure_report {
+                    report.terminal_explanation()
+                } else {
+                    format!(
+                        "goal no alcanzada: {} ({})",
+                        loop_result.termination_reason,
+                        final_evaluation.specification_evaluation.message
+                    )
+                }
+            }
         };
 
         GoalDrivenResult {
@@ -816,6 +835,7 @@ fn empty_satisfied_loop_result(ctx: AgentContext) -> LoopResult {
         history: Default::default(),
         final_context: ctx,
         termination_reason: "goal pre-satisfecha".to_string(),
+        failure_report: None,
     }
 }
 
@@ -834,7 +854,14 @@ fn check_escalation(
         return None;
     }
 
-    let non_progress = loop_result.status == LoopStatus::NonProgress;
+    let non_progress = matches!(
+        loop_result.status,
+        LoopStatus::NonProgress
+            | LoopStatus::ModelCapabilityFailure
+            | LoopStatus::ExternalServiceBlocked
+            | LoopStatus::ExternalConfigurationBlocked
+            | LoopStatus::SystemFailure
+    );
     let stale = progress.stale_iterations() >= max_stale || non_progress;
     let exhausted = loop_result.status == LoopStatus::MaxIterations;
     let no_hypothesis = evaluation
@@ -875,8 +902,18 @@ fn resolve_goal_status(
     evaluation: &GoalEvaluation,
     escalated: bool,
 ) -> GoalDrivenStatus {
-    if loop_result.status == LoopStatus::NonProgress {
-        return GoalDrivenStatus::NonProgress;
+    match loop_result.status {
+        LoopStatus::ExternalServiceBlocked => return GoalDrivenStatus::ExternalServiceBlocked,
+        LoopStatus::ExternalConfigurationBlocked => {
+            return GoalDrivenStatus::ExternalConfigurationBlocked;
+        }
+        LoopStatus::ModelCapabilityFailure => return GoalDrivenStatus::ModelCapabilityFailure,
+        LoopStatus::SystemFailure => return GoalDrivenStatus::SystemFailure,
+        LoopStatus::NonProgress => return GoalDrivenStatus::NonProgress,
+        LoopStatus::Completed
+        | LoopStatus::Failed
+        | LoopStatus::Running
+        | LoopStatus::MaxIterations => {}
     }
     if escalated {
         return GoalDrivenStatus::Escalated;
@@ -889,6 +926,10 @@ fn resolve_goal_status(
         LoopStatus::Failed | LoopStatus::Running => GoalDrivenStatus::Failed,
         LoopStatus::Completed => GoalDrivenStatus::Failed,
         LoopStatus::NonProgress => GoalDrivenStatus::NonProgress,
+        LoopStatus::ExternalServiceBlocked => GoalDrivenStatus::ExternalServiceBlocked,
+        LoopStatus::ExternalConfigurationBlocked => GoalDrivenStatus::ExternalConfigurationBlocked,
+        LoopStatus::ModelCapabilityFailure => GoalDrivenStatus::ModelCapabilityFailure,
+        LoopStatus::SystemFailure => GoalDrivenStatus::SystemFailure,
     }
 }
 
@@ -1297,6 +1338,11 @@ mod tests {
                 GoalDrivenStatus::Escalated
                     | GoalDrivenStatus::MaxIterations
                     | GoalDrivenStatus::NonProgress
+                    | GoalDrivenStatus::ExternalServiceBlocked
+                    | GoalDrivenStatus::ExternalConfigurationBlocked
+                    | GoalDrivenStatus::ModelCapabilityFailure
+                    | GoalDrivenStatus::SystemFailure
+                    | GoalDrivenStatus::Failed
             ),
             "debe escalar, agotar iteraciones o detectar non-progress: {:?}",
             result.status

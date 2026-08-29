@@ -1040,7 +1040,12 @@ fn implementar_handlers() {
         assert!(
             matches!(
                 result.loop_result.status,
-                LoopStatus::MaxIterations | LoopStatus::NonProgress
+                LoopStatus::MaxIterations
+                    | LoopStatus::NonProgress
+                    | LoopStatus::ExternalServiceBlocked
+                    | LoopStatus::ModelCapabilityFailure
+                    | LoopStatus::ExternalConfigurationBlocked
+                    | LoopStatus::SystemFailure
             ),
             "terminación acotada esperada, got {:?}",
             result.loop_result.status
@@ -1637,6 +1642,11 @@ fn implementar_handlers() {
             result.loop_result.status == LoopStatus::Completed
                 || result.loop_result.status == LoopStatus::MaxIterations
                 || result.loop_result.status == LoopStatus::NonProgress
+                || result.loop_result.status == LoopStatus::ExternalServiceBlocked
+                || result.loop_result.status == LoopStatus::ModelCapabilityFailure
+                || result.loop_result.status == LoopStatus::ExternalConfigurationBlocked
+                || result.loop_result.status == LoopStatus::SystemFailure
+                || result.loop_result.status == LoopStatus::Failed
         );
         assert!(!result.session_trace.records.is_empty());
         assert_eq!(result.session_trace.action_policy, "action_policy");
