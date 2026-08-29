@@ -462,7 +462,9 @@ pub fn run_live_repair_smoke_harness() -> Result<LiveRepairSmokeOutcome, LiveSes
     let mut config = LiveSessionConfig::autonomous_compile_repair_artifact();
     config.debug_log_prompt = true;
     let result = run_live_agent_session(config)?;
-    Ok(LiveRepairSmokeOutcome::LiveSessionCompleted(Box::new(result)))
+    Ok(LiveRepairSmokeOutcome::LiveSessionCompleted(Box::new(
+        result,
+    )))
 }
 
 /// Construye Harness con Tools + [`ActionPolicy::default_session_policy`].
