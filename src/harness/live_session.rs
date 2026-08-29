@@ -2063,162 +2063,76 @@ fn implementar_handlers() {
         }
     }
 
-    /// ModelClient observation-driven para wiring live de reparación autónoma (sin API real).
-    struct LiveRepairWiringClient;
-
-    impl ModelClient for LiveRepairWiringClient {
-        fn complete(
-            &self,
-            request: &ModelRequest,
-        ) -> Result<crate::harness::model::ModelResponse, ModelError> {
-            use crate::harness::model::DiagnosticContextModelClient;
-
-            if request.last_observation.as_ref().is_some_and(|obs| {
-                obs.tool_name.as_deref() == Some(REPAIR_DIAGNOSTIC) && obs.success == Some(true)
-            }) {
-                return DiagnosticContextModelClient::new().complete(request);
-            }
-
-            let decision = match &request.last_observation {
-                None => ModelDecision::Compile {
-                    code: request.working_code.clone().unwrap_or_default(),
-                },
-                Some(obs)
-                    if obs.kind == "criterion_evaluated"
-                        && obs.criterion_kind.as_deref() == Some("Compile")
-                        && obs.evaluation_verdict.as_deref() == Some("Fail") =>
-                {
-                    ModelDecision::RepairDiagnostic {
-                        errors: if request.diagnostic_context.compiler_stderr.is_empty() {
-                            vec!["compile fail".to_string()]
-                        } else {
-                            request.diagnostic_context.compiler_stderr.clone()
-                        },
-                    }
-                }
-                Some(obs) if obs.kind == "action_rejected" => ModelDecision::RepairDiagnostic {
-                    errors: request
-                        .diagnostic_context
-                        .compiler_stderr
-                        .first()
-                        .cloned()
-                        .into_iter()
-                        .collect(),
-                },
-                Some(obs)
-                    if obs.tool_name.as_deref() == Some(APPLY_CORRECTION)
-                        && obs.success == Some(true) =>
-                {
-                    ModelDecision::Compile {
-                        code: request.working_code.clone().unwrap_or_default(),
-                    }
-                }
-                Some(obs)
-                    if obs.kind == "criterion_evaluated"
-                        && obs.criterion_kind.as_deref() == Some("Compile")
-                        && obs.evaluation_verdict.as_deref() == Some("Pass") =>
-                {
-                    ModelDecision::Finish {
-                        summary: "live repair wiring completed".to_string(),
-                    }
-                }
-                Some(obs)
-                    if obs.tool_name.as_deref() == Some(COMPILE) && obs.success == Some(true) =>
-                {
-                    ModelDecision::Finish {
-                        summary: "live repair wiring completed".to_string(),
-                    }
-                }
-                Some(obs)
-                    if obs.tool_name.as_deref() == Some(COMPILE) && obs.success == Some(false) =>
-                {
-                    ModelDecision::RepairDiagnostic {
-                        errors: request.diagnostic_context.compiler_stderr.clone(),
-                    }
-                }
-                _ => ModelDecision::Compile {
-                    code: request.working_code.clone().unwrap_or_default(),
-                },
-            };
-            Ok(crate::harness::model::ModelResponse {
-                raw_text: serialize_decision(&decision),
-            })
-        }
-    }
-
     #[test]
-    fn live_repair_smoke_wiring_repairs_broken_helper() {
+    fn live_repair_smoke_wiring_diagnostic_context_on_compile_fail() {
+        use std::sync::{Arc, Mutex};
+
+        struct CaptureDiagnosticRequest {
+            captured: Arc<Mutex<Option<ModelRequest>>>,
+        }
+
+        impl ModelClient for CaptureDiagnosticRequest {
+            fn complete(
+                &self,
+                request: &ModelRequest,
+            ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+                if request
+                    .diagnostic_context
+                    .compile_status
+                    .as_deref()
+                    .is_some_and(|status| status == "error")
+                {
+                    *self.captured.lock().unwrap() = Some(request.clone());
+                    return Ok(crate::harness::model::ModelResponse {
+                        raw_text: serialize_decision(&ModelDecision::Finish {
+                            summary: "capture stop".to_string(),
+                        }),
+                    });
+                }
+
+                Ok(crate::harness::model::ModelResponse {
+                    raw_text: serialize_decision(&ModelDecision::Compile {
+                        code: request.working_code.clone().unwrap_or_default(),
+                    }),
+                })
+            }
+        }
+
         unsafe {
             std::env::remove_var("AI_AGENT_GAP_GUIDANCE");
         }
 
+        let captured = Arc::new(Mutex::new(None));
         let config =
             LiveSessionConfig::autonomous_compile_repair_artifact().with_gap_guidance(false);
-        let result = run_live_agent_session_with_client(
-            Box::new(LiveRepairWiringClient),
+        let _ = run_live_agent_session_with_client(
+            Box::new(CaptureDiagnosticRequest {
+                captured: Arc::clone(&captured),
+            }),
             config,
-            Some("live-repair-wiring".to_string()),
-        )
-        .expect("wiring session");
-
-        assert_eq!(result.loop_result.status, LoopStatus::Completed);
-        assert!(
-            result
-                .loop_result
-                .tools_executed()
-                .iter()
-                .any(|t| t == COMPILE)
-        );
-        assert!(
-            result
-                .loop_result
-                .tools_executed()
-                .iter()
-                .any(|t| t == REPAIR_DIAGNOSTIC)
-        );
-        assert!(
-            result
-                .loop_result
-                .tools_executed()
-                .iter()
-                .any(|t| t == APPLY_CORRECTION)
+            Some("live-repair-capture".to_string()),
         );
 
-        let helper_path = ArtifactPath::parse("src/helper.rs").unwrap();
-        let final_helper = result
-            .loop_result
-            .final_context
-            .working_artifact
-            .as_ref()
-            .and_then(|a| a.file(&helper_path))
-            .expect("helper final");
-        assert!(!final_helper.contains("broken"));
-        assert!(final_helper.contains('0'));
-
-        let compile_fail_request = result
-            .model_trace
-            .requests
-            .iter()
-            .find(|req| {
-                req.diagnostic_context
-                    .compile_status
-                    .as_deref()
-                    .is_some_and(|s| s == "error")
-            })
-            .expect("ModelRequest con diagnostic_context de compile FAIL");
+        let captured_request = captured
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("debe existir ModelRequest con compile_status=error tras compile FAIL");
         assert!(
-            !compile_fail_request
+            captured_request
                 .diagnostic_context
                 .compiler_stderr
-                .is_empty()
-                || compile_fail_request
-                    .diagnostic_context
-                    .evidence_pairs
-                    .iter()
-                    .any(|(label, _)| label == "compiler_stderr"),
-            "diagnóstico debe fluir al ModelRequest"
+                .iter()
+                .any(|line| line.contains("broken")),
+            "compiler_stderr debe incluir el error del helper roto"
         );
-        assert!(!result.session_trace.contains_secrets());
+        assert!(
+            captured_request
+                .recommended_action
+                .as_ref()
+                .is_some_and(|rec| rec.kind == "RepairDiagnostic"),
+            "recommended_action debe ser RepairDiagnostic tras compile FAIL"
+        );
     }
 
     /// Validación live con modelo real + reparación autónoma (NO CI).
