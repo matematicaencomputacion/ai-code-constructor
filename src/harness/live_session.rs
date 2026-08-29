@@ -2069,8 +2069,8 @@ fn implementar_handlers() {
 
         // gap_guidance=false: Finish prematuro → action_rejected → repair determinista
         // (con gap_guidance=true el mock puede quedar en compile↔finish sin repair en AgentLoop).
-        let config = LiveSessionConfig::autonomous_compile_repair_artifact()
-            .with_gap_guidance(false);
+        let config =
+            LiveSessionConfig::autonomous_compile_repair_artifact().with_gap_guidance(false);
         let result = run_live_agent_session_with_client(
             Box::new(DiagnosticContextModelClient::new()),
             config,
