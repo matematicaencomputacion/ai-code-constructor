@@ -262,27 +262,126 @@ impl ModelInteractionTrace {
     }
 }
 
+/// Clasificación mínima de fallos de transporte (sin hardcodear proveedor).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportFailureKind {
+    Timeout,
+    Connection,
+    Other,
+}
+
+impl TransportFailureKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Timeout => "timeout",
+            Self::Connection => "connection",
+            Self::Other => "other",
+        }
+    }
+}
+
 /// Error de transporte/consulta al modelo.
+///
+/// Variantes transitorias pueden transportar señales HTTP estructuradas
+/// (`retry_after`, status) sin depender de matching de strings de proveedor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModelError {
     Configuration(String),
     Authentication(String),
-    RateLimited(String),
+    RateLimited {
+        category: String,
+        retry_after: Option<std::time::Duration>,
+    },
     Timeout,
-    Transport(String),
-    Http { status: u16, category: String },
+    Transport {
+        message: String,
+        kind: TransportFailureKind,
+    },
+    Http {
+        status: u16,
+        category: String,
+        retry_after: Option<std::time::Duration>,
+    },
     InvalidResponse(String),
 }
 
 impl ModelError {
+    pub fn rate_limited(category: impl Into<String>) -> Self {
+        Self::RateLimited {
+            category: category.into(),
+            retry_after: None,
+        }
+    }
+
+    pub fn rate_limited_with_retry_after(
+        category: impl Into<String>,
+        retry_after: Option<std::time::Duration>,
+    ) -> Self {
+        Self::RateLimited {
+            category: category.into(),
+            retry_after,
+        }
+    }
+
+    pub fn transport(message: impl Into<String>, kind: TransportFailureKind) -> Self {
+        Self::Transport {
+            message: message.into(),
+            kind,
+        }
+    }
+
+    pub fn http(status: u16, category: impl Into<String>) -> Self {
+        Self::Http {
+            status,
+            category: category.into(),
+            retry_after: None,
+        }
+    }
+
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::RateLimited(_) | Self::Timeout => true,
+            Self::RateLimited { .. } | Self::Timeout => true,
             Self::Http { status, .. } => (500..600).contains(status),
             Self::Configuration(_)
             | Self::Authentication(_)
-            | Self::Transport(_)
+            | Self::Transport { .. }
             | Self::InvalidResponse(_) => false,
+        }
+    }
+
+    /// Hint temporal del proveedor (`Retry-After`), si se conservó desde HTTP.
+    pub fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::RateLimited { retry_after, .. } | Self::Http { retry_after, .. } => *retry_after,
+            Self::Configuration(_)
+            | Self::Authentication(_)
+            | Self::Timeout
+            | Self::Transport { .. }
+            | Self::InvalidResponse(_) => None,
+        }
+    }
+
+    pub fn http_status(&self) -> Option<u16> {
+        match self {
+            Self::RateLimited { .. } => Some(429),
+            Self::Http { status, .. } => Some(*status),
+            Self::Configuration(_)
+            | Self::Authentication(_)
+            | Self::Timeout
+            | Self::Transport { .. }
+            | Self::InvalidResponse(_) => None,
+        }
+    }
+
+    pub fn transport_kind(&self) -> Option<TransportFailureKind> {
+        match self {
+            Self::Timeout => Some(TransportFailureKind::Timeout),
+            Self::Transport { kind, .. } => Some(*kind),
+            Self::Configuration(_)
+            | Self::Authentication(_)
+            | Self::RateLimited { .. }
+            | Self::Http { .. }
+            | Self::InvalidResponse(_) => None,
         }
     }
 }
@@ -292,10 +391,14 @@ impl std::fmt::Display for ModelError {
         match self {
             Self::Configuration(message) => write!(f, "configuración: {message}"),
             Self::Authentication(message) => write!(f, "autenticación: {message}"),
-            Self::RateLimited(message) => write!(f, "rate limit: {message}"),
+            Self::RateLimited { category, .. } => write!(f, "rate limit: {category}"),
             Self::Timeout => write!(f, "timeout del modelo"),
-            Self::Transport(message) => write!(f, "transporte: {message}"),
-            Self::Http { status, category } => {
+            Self::Transport { message, kind } => {
+                write!(f, "transporte ({}): {message}", kind.as_str())
+            }
+            Self::Http {
+                status, category, ..
+            } => {
                 write!(f, "http {status}: {category}")
             }
             Self::InvalidResponse(message) => write!(f, "respuesta inválida: {message}"),

@@ -1,4 +1,4 @@
-use std::thread;
+use std::sync::Arc;
 
 use crate::harness::action::AgentAction;
 use crate::harness::agent::Agent;
@@ -7,8 +7,9 @@ use crate::harness::evaluation::{Evaluation, Evidence};
 use crate::harness::evaluation_engine::CriterionEvaluation;
 use crate::harness::evaluation_observation::evaluate_tool_evidence;
 use crate::harness::failure_classification::{
-    FailureEvidence, FailureReport, RecoveryBudget, RecoveryStrategy, build_failure_report,
-    classify_progress_stall, classify_system_failure, select_recovery_strategy,
+    FailureEvidence, FailureReport, RecoveryBudget, RecoveryDelay, RecoveryStrategy,
+    SharedRecoveryDelay, build_failure_report, classify_progress_stall, classify_system_failure,
+    default_recovery_delay, plan_recovery,
 };
 use crate::harness::goal_driven::{
     Goal, GoalEvaluator, GoalProgressTracker, GoalStatus, ProgressAssessment, ProgressSignal,
@@ -89,6 +90,7 @@ pub struct AgentLoop {
     /// Si `Some`, evalúa progreso de Goal tras cada paso con specification.
     max_stale_iterations: Option<u32>,
     recovery_budget_template: RecoveryBudget,
+    recovery_delay: SharedRecoveryDelay,
 }
 
 impl AgentLoop {
@@ -101,6 +103,7 @@ impl AgentLoop {
             max_iterations,
             max_stale_iterations: None,
             recovery_budget_template: RecoveryBudget::default(),
+            recovery_delay: default_recovery_delay(),
         }
     }
 
@@ -115,6 +118,12 @@ impl AgentLoop {
     /// Tests: usar `Duration::ZERO` (default) para evitar sleeps reales.
     pub fn with_recovery_budget(mut self, budget: RecoveryBudget) -> Self {
         self.recovery_budget_template = budget;
+        self
+    }
+
+    /// Inyecta abstracción de espera (p. ej. recording delay en tests).
+    pub fn with_recovery_delay(mut self, delay: Arc<dyn RecoveryDelay>) -> Self {
+        self.recovery_delay = delay;
         self
     }
 
@@ -346,15 +355,15 @@ impl AgentLoop {
         meaningful_progress_observed: bool,
         recovered_after_failure: &mut bool,
     ) -> FailureHandle {
-        let strategy = select_recovery_strategy(&evidence, budget);
-        if strategy.is_recover() && budget.consume() {
-            if !budget.backoff.is_zero() {
-                thread::sleep(budget.backoff);
-            }
+        // Recovery externo no registra progreso de Goal: este path hace continue
+        // antes de GoalProgressTracker::record_iteration (evita contaminar NonProgress).
+        let decision = plan_recovery(&evidence, budget);
+        if decision.strategy.is_recover() && budget.consume() {
+            self.recovery_delay.delay(decision.wait);
             *recovered_after_failure = true;
             let report = build_failure_report(
                 &evidence,
-                strategy,
+                &decision,
                 budget.attempts_used,
                 false,
                 meaningful_progress_observed,
@@ -363,24 +372,32 @@ impl AgentLoop {
             history.evidence.push(Evidence::new(
                 "failure_recovery",
                 format!(
-                    "class={} strategy={} attempt={}/{}",
+                    "class={} strategy={} reason={} wait_ms={} attempt={}/{} signal={}",
                     evidence.class.as_str(),
-                    strategy.as_str(),
+                    decision.strategy.as_str(),
+                    decision.reason.as_str(),
+                    decision.wait.as_millis(),
                     budget.attempts_used,
-                    budget.max_attempts
+                    budget.max_attempts,
+                    decision.signal.summary()
                 ),
             ));
             return FailureHandle::Recover;
         }
 
-        let terminal_strategy = if strategy.is_recover() {
-            RecoveryStrategy::StopExternalBlocked
+        let terminal_decision = if decision.strategy.is_recover() {
+            let mut blocked = decision.clone();
+            blocked.strategy = RecoveryStrategy::StopExternalBlocked;
+            blocked.wait = std::time::Duration::ZERO;
+            blocked.reason =
+                crate::harness::failure_classification::RecoveryPlanReason::BudgetExhausted;
+            blocked
         } else {
-            strategy
+            decision
         };
         let report = build_failure_report(
             &evidence,
-            terminal_strategy,
+            &terminal_decision,
             budget.attempts_used,
             *recovered_after_failure && meaningful_progress_observed,
             meaningful_progress_observed,
@@ -391,7 +408,7 @@ impl AgentLoop {
             report.terminal_explanation(),
         ));
         FailureHandle::Stop {
-            loop_status: loop_status_for_strategy(terminal_strategy),
+            loop_status: loop_status_for_strategy(terminal_decision.strategy),
             reason: format!(
                 "{}: {}",
                 evidence.class.as_str(),
@@ -413,9 +430,9 @@ enum FailureHandle {
 
 fn loop_status_for_strategy(strategy: RecoveryStrategy) -> LoopStatus {
     match strategy {
-        RecoveryStrategy::StopExternalBlocked | RecoveryStrategy::RetryWithBackoff => {
-            LoopStatus::ExternalServiceBlocked
-        }
+        RecoveryStrategy::StopExternalBlocked
+        | RecoveryStrategy::RetryWithBackoff
+        | RecoveryStrategy::WaitThenRetry => LoopStatus::ExternalServiceBlocked,
         RecoveryStrategy::StopConfigurationBlocked => LoopStatus::ExternalConfigurationBlocked,
         RecoveryStrategy::StopModelCapability => LoopStatus::ModelCapabilityFailure,
         RecoveryStrategy::StopSystemFailure => LoopStatus::SystemFailure,

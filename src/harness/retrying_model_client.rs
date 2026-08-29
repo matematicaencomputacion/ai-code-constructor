@@ -8,9 +8,11 @@
 //! AiAgent / AgentLoop no conocen esta observabilidad; el orquestador retiene el handle.
 
 use std::sync::{Arc, Mutex};
-use std::thread;
 use std::time::Duration;
 
+use crate::harness::failure_classification::{
+    RecoveryDelay, SharedRecoveryDelay, default_recovery_delay,
+};
 use crate::harness::model::{ModelClient, ModelError, ModelRequest, ModelResponse};
 
 const DEFAULT_MAX_RETRIES: u32 = 2;
@@ -77,6 +79,7 @@ pub struct RetryingModelClient {
     inner: Box<dyn ModelClient>,
     config: RetryConfig,
     metrics: Arc<Mutex<RetryMetricsState>>,
+    delay: SharedRecoveryDelay,
 }
 
 impl RetryingModelClient {
@@ -89,7 +92,13 @@ impl RetryingModelClient {
             inner,
             config,
             metrics: Arc::new(Mutex::new(RetryMetricsState::default())),
+            delay: default_recovery_delay(),
         }
+    }
+
+    pub fn with_delay(mut self, delay: Arc<dyn RecoveryDelay>) -> Self {
+        self.delay = delay;
+        self
     }
 
     /// Cantidad de retries del **último** `complete()` finalizado.
@@ -124,9 +133,9 @@ impl ModelClient for RetryingModelClient {
                 }
                 Err(error) if attempt < self.config.max_retries && error.is_retryable() => {
                     attempt += 1;
-                    if !self.config.backoff.is_zero() {
-                        thread::sleep(self.config.backoff);
-                    }
+                    // ProviderHint (Retry-After) prioriza sobre backoff genérico del wrapper.
+                    let wait = error.retry_after().unwrap_or(self.config.backoff);
+                    self.delay.delay(wait);
                 }
                 Err(error) => {
                     self.record_finished_complete(attempt);
@@ -260,7 +269,7 @@ mod tests {
     fn retries_rate_limited_then_succeeds() {
         let inner = FlakyModelClient::new(
             2,
-            ModelError::RateLimited("slow".to_string()),
+            ModelError::rate_limited("slow"),
             r#"{"action":"finish","summary":"ok"}"#,
         );
         let client = RetryingModelClient::with_config(Box::new(inner), zero_backoff(2));
@@ -287,6 +296,7 @@ mod tests {
             ModelError::Http {
                 status: 500,
                 category: "server".to_string(),
+                retry_after: None,
             },
             r#"{"action":"finish","summary":"ok"}"#,
         );
@@ -315,6 +325,7 @@ mod tests {
             ModelError::Http {
                 status: 403,
                 category: "forbidden".to_string(),
+                retry_after: None,
             },
             r#"{"action":"finish","summary":"ok"}"#,
         );
