@@ -29,6 +29,7 @@ mod feature_flags;
 mod goal_driven;
 mod live_session;
 mod model;
+mod model_routing;
 mod observation;
 mod openai_compatible_client;
 mod retrying_model_client;
@@ -71,6 +72,8 @@ mod model_decision_multi_file_correction_tests;
 #[cfg(test)]
 mod model_multi_file_contract_tests;
 #[cfg(test)]
+mod model_routing_integration_tests;
+#[cfg(test)]
 mod multi_file_correction_tests;
 
 // API pública del harness; aún no consumida por el ciclo Constructor.
@@ -93,6 +96,8 @@ pub use agent_loop::{AgentLoop, LoopHistory, LoopResult, LoopStatus};
 pub use agent_prompt::{SYSTEM_PROMPT_VERSION, system_prompt_v1};
 #[allow(unused_imports)]
 pub use ai_agent::AiAgent;
+#[allow(unused_imports)]
+pub use ai_agent::ModelRoutingState;
 #[allow(unused_imports)]
 pub use artifact::{
     ARTIFACT_CONTRACT_VERSION, ArtifactContractVersion, ArtifactFile, ArtifactId, ArtifactLanguage,
@@ -180,6 +185,11 @@ pub use model::{
     decision_is_compatible_with_recommendation, model_decision_from_recommended_action,
     model_request_from_context, parse_model_response, redact_secrets, serialize_decision,
     structured_to_file_operation, validate_model_decision_against_recommendation,
+};
+#[allow(unused_imports)]
+pub use model_routing::{
+    EscalationBudget, ModelCandidate, ModelIdentity, RelativeTier, RoutingAction, RoutingDecision,
+    RoutingPlanInput, RoutingReason, apply_routing_decision, plan_routing,
 };
 #[allow(unused_imports)]
 pub use observation::AgentObservation;

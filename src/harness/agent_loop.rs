@@ -55,6 +55,8 @@ pub struct LoopHistory {
     pub progress_assessments: Vec<ProgressAssessment>,
     /// Informes de clasificación/recovery emitidos durante la corrida.
     pub failure_reports: Vec<FailureReport>,
+    /// Decisiones de routing multi-modelo (Stay/Wait/Switch/Escalate/Stop).
+    pub routing_decisions: Vec<crate::harness::model_routing::RoutingDecision>,
 }
 
 /// Resultado estructurado del Agent Loop.
@@ -183,6 +185,7 @@ impl AgentLoop {
                         }
                     });
                 match self.handle_classified_failure(
+                    agent,
                     evidence,
                     &mut recovery_budget,
                     &mut history,
@@ -209,6 +212,7 @@ impl AgentLoop {
                     Some(tool_name.clone()),
                 );
                 match self.handle_classified_failure(
+                    agent,
                     evidence,
                     &mut recovery_budget,
                     &mut history,
@@ -298,6 +302,7 @@ impl AgentLoop {
                         .any(|step| step.tool_executed);
                     let evidence = classify_progress_stall(&assessment, tool_executed_recently);
                     match self.handle_classified_failure(
+                        agent,
                         evidence,
                         &mut recovery_budget,
                         &mut history,
@@ -349,6 +354,7 @@ impl AgentLoop {
 
     fn handle_classified_failure(
         &self,
+        agent: &mut dyn Agent,
         evidence: FailureEvidence,
         budget: &mut RecoveryBudget,
         history: &mut LoopHistory,
@@ -369,6 +375,15 @@ impl AgentLoop {
                 meaningful_progress_observed,
             );
             history.failure_reports.push(report);
+            // Observabilidad de routing: ExternalTransient → WaitSameModel (mismo modelo).
+            if let Some(route) =
+                agent.try_route_after_failure(&evidence, meaningful_progress_observed)
+            {
+                history
+                    .evidence
+                    .push(Evidence::new("model_routing", route.summary()));
+                history.routing_decisions.push(route);
+            }
             history.evidence.push(Evidence::new(
                 "failure_recovery",
                 format!(
@@ -383,6 +398,28 @@ impl AgentLoop {
                 ),
             ));
             return FailureHandle::Recover;
+        }
+
+        // Antes de terminal: intentar Switch/Escalate si el agente tiene catálogo.
+        if let Some(route) = agent.try_route_after_failure(&evidence, meaningful_progress_observed)
+        {
+            history
+                .evidence
+                .push(Evidence::new("model_routing", route.summary()));
+            let changed = route.action.changes_model();
+            history.routing_decisions.push(route);
+            if changed {
+                *recovered_after_failure = true;
+                history.evidence.push(Evidence::new(
+                    "failure_recovery",
+                    format!(
+                        "class={} strategy=model_route reason=routing_applied signal={}",
+                        evidence.class.as_str(),
+                        evidence.signal.summary()
+                    ),
+                ));
+                return FailureHandle::Recover;
+            }
         }
 
         let terminal_decision = if decision.strategy.is_recover() {
