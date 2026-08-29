@@ -39,6 +39,7 @@ mod specification_planner;
 mod tool;
 mod tool_permission;
 pub mod tools;
+mod unit_completion;
 
 #[cfg(test)]
 pub mod test_support;
@@ -221,6 +222,10 @@ pub use tools::{
     CorrectionTool, FileOperationsTool, FmtTool, REPAIR_DIAGNOSTIC, RUN_CLIPPY, RUN_TESTS,
     RepairDiagnosticTool, TestTool, VALIDATE, ValidationTool, encode_correction_input,
     encode_file_operations_input, encode_repair_diagnostic_input, encode_validate_input,
+};
+#[allow(unused_imports)]
+pub use unit_completion::{
+    UnitCompletionPhase, UnitCompletionRecord, UnitCompletionTransitionError, UnitTerminalStatus,
 };
 
 #[cfg(test)]
