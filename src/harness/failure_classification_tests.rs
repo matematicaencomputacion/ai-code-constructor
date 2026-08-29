@@ -15,14 +15,14 @@ mod tests {
     use crate::harness::criterion::CriterionKind;
     use crate::harness::evaluation::EvaluationVerdict;
     use crate::harness::failure_classification::{
-        FailureClass, RecoveryBudget, RecoveryStrategy, classify_model_error,
-        select_recovery_strategy,
+        FailureClass, RecordingRecoveryDelay, RecoveryBudget, RecoveryPlanReason, RecoveryStrategy,
+        StructuredRecoverySignal, classify_model_error, plan_recovery, select_recovery_strategy,
     };
     use crate::harness::goal_driven::{Goal, GoalProgressTracker, ProgressSignal};
     use crate::harness::live_session::build_validate_compile_harness_with_policy;
     use crate::harness::model::{
         AiSessionConfig, ModelClient, ModelDecision, ModelError, ModelRequest, ModelResponse,
-        redact_secrets, serialize_decision,
+        TransportFailureKind, redact_secrets, serialize_decision,
     };
     use crate::harness::observation::AgentObservation;
     use crate::harness::runtime::Harness;
@@ -80,7 +80,7 @@ mod tests {
     /// TEST A — transient failure classification
     #[test]
     fn test_a_transient_failure_classification() {
-        let evidence = classify_model_error(&ModelError::RateLimited("rate_limited".into()));
+        let evidence = classify_model_error(&ModelError::rate_limited("rate_limited"));
         assert_eq!(evidence.class, FailureClass::ExternalTransient);
         assert!(evidence.retryable);
         assert_eq!(evidence.http_status, Some(429));
@@ -92,7 +92,7 @@ mod tests {
     #[test]
     fn test_b_recovery_success() {
         let client = ScriptedModelClient::new(
-            vec![Some(ModelError::RateLimited("rate_limited".into()))],
+            vec![Some(ModelError::rate_limited("rate_limited"))],
             ModelDecision::Finish {
                 summary: "recovered ok".to_string(),
             },
@@ -123,10 +123,10 @@ mod tests {
     fn test_c_recovery_exhausted() {
         let client = ScriptedModelClient::new(
             vec![
-                Some(ModelError::RateLimited("rate_limited".into())),
-                Some(ModelError::RateLimited("rate_limited".into())),
-                Some(ModelError::RateLimited("rate_limited".into())),
-                Some(ModelError::RateLimited("rate_limited".into())),
+                Some(ModelError::rate_limited("rate_limited")),
+                Some(ModelError::rate_limited("rate_limited")),
+                Some(ModelError::rate_limited("rate_limited")),
+                Some(ModelError::rate_limited("rate_limited")),
             ],
             ModelDecision::Finish {
                 summary: "should not reach".to_string(),
@@ -322,8 +322,9 @@ mod tests {
     #[test]
     fn test_j_no_secret_leakage() {
         let client = ScriptedModelClient::new(
-            vec![Some(ModelError::Transport(
-                "authorization: Bearer super-secret-key-xyz".into(),
+            vec![Some(ModelError::transport(
+                "authorization: Bearer super-secret-key-xyz",
+                TransportFailureKind::Other,
             ))],
             ModelDecision::Finish {
                 summary: "unreachable".to_string(),
@@ -363,10 +364,10 @@ mod tests {
     fn test_k_rate_limit_rejected_finish_not_model_capability() {
         let client = ScriptedModelClient::new(
             vec![
-                Some(ModelError::RateLimited("rate_limited".into())),
-                Some(ModelError::RateLimited("rate_limited".into())),
-                Some(ModelError::RateLimited("rate_limited".into())),
-                Some(ModelError::RateLimited("rate_limited".into())),
+                Some(ModelError::rate_limited("rate_limited")),
+                Some(ModelError::rate_limited("rate_limited")),
+                Some(ModelError::rate_limited("rate_limited")),
+                Some(ModelError::rate_limited("rate_limited")),
             ],
             ModelDecision::Compile {
                 code: "fn main() {}".to_string(),
@@ -401,5 +402,163 @@ mod tests {
         assert_ne!(report.classification, FailureClass::ModelCapability);
         assert_ne!(result.status, LoopStatus::NonProgress);
         assert_ne!(result.status, LoopStatus::ModelCapabilityFailure);
+    }
+
+    /// SIGNAL CASE A — structured signal from ModelError is observable.
+    #[test]
+    fn signal_case_a_structured_signal_observable() {
+        let error =
+            ModelError::rate_limited_with_retry_after("rate_limited", Some(Duration::from_secs(9)));
+        let evidence = classify_model_error(&error);
+        assert_eq!(
+            evidence.signal,
+            StructuredRecoverySignal {
+                http_status: Some(429),
+                retry_after: Some(Duration::from_secs(9)),
+                transport_kind: None,
+            }
+        );
+        assert!(evidence.signal.summary().contains("http_status=429"));
+        assert!(evidence.signal.summary().contains("retry_after=9s"));
+    }
+
+    /// SIGNAL CASE B — Retry-After → WaitThenRetry (not generic backoff).
+    #[test]
+    fn signal_case_b_retry_after_wait_then_retry() {
+        let recorder = std::sync::Arc::new(RecordingRecoveryDelay::new());
+        let client = ScriptedModelClient::new(
+            vec![Some(ModelError::rate_limited_with_retry_after(
+                "rate_limited",
+                Some(Duration::from_secs(11)),
+            ))],
+            ModelDecision::Finish {
+                summary: "recovered".to_string(),
+            },
+        );
+        let session = AiSessionConfig::new("meta", "Generic");
+        let mut agent = AiAgent::new(Box::new(client), session);
+        let ctx = AgentContext::new("retry-after");
+        let harness = Harness::new(5);
+        let result = AgentLoop::new(5)
+            .with_recovery_budget(RecoveryBudget::new(3, Duration::from_secs(99)))
+            .with_recovery_delay(recorder.clone())
+            .run(&harness, &mut agent, ctx);
+
+        assert_eq!(result.status, LoopStatus::Completed);
+        assert_eq!(recorder.waits(), vec![Duration::from_secs(11)]);
+        let recovery = result
+            .history
+            .failure_reports
+            .first()
+            .expect("recovery report");
+        assert_eq!(recovery.strategy, RecoveryStrategy::WaitThenRetry);
+        assert_eq!(recovery.plan_reason, RecoveryPlanReason::ProviderRetryAfter);
+        assert_eq!(recovery.wait, Duration::from_secs(11));
+        assert_ne!(recovery.strategy, RecoveryStrategy::RetryWithBackoff);
+    }
+
+    /// SIGNAL CASE C — ExternalTransient without hint → configured backoff fallback.
+    #[test]
+    fn signal_case_c_fallback_configured_backoff() {
+        let evidence = classify_model_error(&ModelError::rate_limited("rate_limited"));
+        let decision = plan_recovery(
+            &evidence,
+            &RecoveryBudget::new(2, Duration::from_millis(40)),
+        );
+        assert_eq!(decision.strategy, RecoveryStrategy::RetryWithBackoff);
+        assert_eq!(decision.reason, RecoveryPlanReason::ConfiguredBackoff);
+        assert_eq!(decision.wait, Duration::from_millis(40));
+        assert!(decision.signal.retry_after.is_none());
+    }
+
+    /// SIGNAL CASE D — ExternalPermanent → no retry.
+    #[test]
+    fn signal_case_d_permanent_no_retry() {
+        let evidence = classify_model_error(&ModelError::Authentication("forbidden".into()));
+        let decision = plan_recovery(&evidence, &RecoveryBudget::new(5, Duration::from_secs(1)));
+        assert_eq!(
+            decision.strategy,
+            RecoveryStrategy::StopConfigurationBlocked
+        );
+        assert_eq!(decision.reason, RecoveryPlanReason::PermanentExternal);
+        assert_eq!(decision.wait, Duration::ZERO);
+        assert!(!decision.strategy.is_recover());
+    }
+
+    /// SIGNAL CASE E — budget exhausted → ExternalServiceBlocked.
+    #[test]
+    fn signal_case_e_budget_exhausted() {
+        let client = ScriptedModelClient::new(
+            vec![
+                Some(ModelError::rate_limited_with_retry_after(
+                    "rate_limited",
+                    Some(Duration::from_secs(3)),
+                )),
+                Some(ModelError::rate_limited("rate_limited")),
+                Some(ModelError::rate_limited("rate_limited")),
+            ],
+            ModelDecision::Finish {
+                summary: "should not reach".to_string(),
+            },
+        );
+        let recorder = std::sync::Arc::new(RecordingRecoveryDelay::new());
+        let session = AiSessionConfig::new("meta", "Generic");
+        let mut agent = AiAgent::new(Box::new(client), session);
+        let ctx = AgentContext::new("exhausted-signal");
+        let harness = Harness::new(10);
+        let result = AgentLoop::new(10)
+            .with_recovery_budget(RecoveryBudget::new(2, Duration::ZERO))
+            .with_recovery_delay(recorder.clone())
+            .run(&harness, &mut agent, ctx);
+
+        assert_eq!(result.status, LoopStatus::ExternalServiceBlocked);
+        let report = result.failure_report.expect("terminal");
+        assert_eq!(report.classification, FailureClass::ExternalTransient);
+        assert_eq!(report.strategy, RecoveryStrategy::StopExternalBlocked);
+        assert_eq!(report.plan_reason, RecoveryPlanReason::BudgetExhausted);
+        assert_eq!(report.recovery_attempts, 2);
+        assert_eq!(
+            recorder.waits(),
+            vec![Duration::from_secs(3), Duration::ZERO]
+        );
+    }
+
+    /// SIGNAL CASE F — terminal explanation preserves classification/signal/strategy/reason/attempts.
+    #[test]
+    fn signal_case_f_explanation_preserves_fields() {
+        let client = ScriptedModelClient::new(
+            vec![
+                Some(ModelError::rate_limited_with_retry_after(
+                    "rate_limited",
+                    Some(Duration::from_secs(5)),
+                )),
+                Some(ModelError::rate_limited_with_retry_after(
+                    "rate_limited",
+                    Some(Duration::from_secs(5)),
+                )),
+            ],
+            ModelDecision::Finish {
+                summary: "unreachable".to_string(),
+            },
+        );
+        let session = AiSessionConfig::new("meta", "Generic");
+        let mut agent = AiAgent::new(Box::new(client), session);
+        let harness = Harness::new(5);
+        let result = AgentLoop::new(5)
+            .with_recovery_budget(RecoveryBudget::new(1, Duration::ZERO))
+            .with_recovery_delay(std::sync::Arc::new(RecordingRecoveryDelay::new()))
+            .run(&harness, &mut agent, AgentContext::new("explain"));
+
+        let report = result.failure_report.expect("terminal report");
+        let explanation = report.terminal_explanation();
+        assert!(explanation.contains("classification=external_transient"));
+        assert!(explanation.contains("strategy=stop_external_blocked"));
+        assert!(explanation.contains("reason=budget_exhausted"));
+        assert!(explanation.contains("http_status=429"));
+        assert!(explanation.contains("retry_after=5s"));
+        assert!(explanation.contains("recovery_attempts=1"));
+        assert_eq!(report.signal.http_status, Some(429));
+        assert_eq!(report.signal.retry_after, Some(Duration::from_secs(5)));
+        assert_eq!(result.status, LoopStatus::ExternalServiceBlocked);
     }
 }

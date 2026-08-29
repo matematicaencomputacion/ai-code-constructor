@@ -6,9 +6,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::harness::model::{
-    ModelClient, ModelError, ModelRequest, ModelResponse, append_artifact_files_to_message_parts,
-    append_diagnostic_context_to_message_parts, append_goal_context_to_message_parts,
-    append_recent_evidence_to_message_parts, redact_secrets,
+    ModelClient, ModelError, ModelRequest, ModelResponse, TransportFailureKind,
+    append_artifact_files_to_message_parts, append_diagnostic_context_to_message_parts,
+    append_goal_context_to_message_parts, append_recent_evidence_to_message_parts, redact_secrets,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -148,10 +148,14 @@ impl ModelClient for OpenAICompatibleModelClient {
 
         let status = response.status();
         let request_id = response.header("x-request-id").map(str::to_string);
+        let retry_after = read_retry_after(&response);
 
-        let response_text = response
-            .into_string()
-            .map_err(|error| ModelError::Transport(redact_secrets(&error.to_string())))?;
+        let response_text = response.into_string().map_err(|error| {
+            ModelError::transport(
+                redact_secrets(&error.to_string()),
+                TransportFailureKind::Other,
+            )
+        })?;
 
         let latency_ms = started.elapsed().as_millis() as u64;
         self.record_call(ModelCallMetadata {
@@ -173,7 +177,7 @@ impl ModelClient for OpenAICompatibleModelClient {
                 http_status: Some(status),
                 error_category: Some(category.clone()),
             });
-            return Err(map_http_status(status, &response_text));
+            return Err(map_http_status(status, &response_text, retry_after));
         }
 
         let raw_text = extract_message_content(&response_text)
@@ -320,33 +324,57 @@ fn map_ureq_error(error: ureq::Error, elapsed: Duration, timeout: Duration) -> M
     }
     match error {
         ureq::Error::Status(code, response) => {
+            let retry_after = read_retry_after(&response);
             let body = response.into_string().unwrap_or_default();
-            map_http_status(code, &body)
+            map_http_status(code, &body, retry_after)
         }
         ureq::Error::Transport(transport) => {
-            let message = transport.to_string().to_ascii_lowercase();
+            let rendered = transport.to_string();
+            let message = rendered.to_ascii_lowercase();
             if message.contains("timeout") || message.contains("timed out") {
                 ModelError::Timeout
             } else {
-                ModelError::Transport(redact_secrets(&transport.to_string()))
+                let kind = if message.contains("connection") || message.contains("connect") {
+                    TransportFailureKind::Connection
+                } else {
+                    TransportFailureKind::Other
+                };
+                ModelError::transport(redact_secrets(&rendered), kind)
             }
         }
     }
 }
 
-fn map_http_status(status: u16, body: &str) -> ModelError {
+fn read_retry_after(response: &ureq::Response) -> Option<Duration> {
+    response
+        .header("retry-after")
+        .or_else(|| response.header("Retry-After"))
+        .and_then(parse_retry_after_value)
+}
+
+/// Solo delta-seconds (RFC 7231). HTTP-date se ignora a propósito (mínimo verificable).
+fn parse_retry_after_value(raw: &str) -> Option<Duration> {
+    raw.trim().parse::<u64>().ok().map(Duration::from_secs)
+}
+
+fn map_http_status(status: u16, body: &str, retry_after: Option<Duration>) -> ModelError {
     let safe_body = redact_secrets(body);
     let category = http_error_category(status);
     match status {
         401 | 403 => ModelError::Authentication(category),
-        429 => ModelError::RateLimited(category),
+        429 => ModelError::RateLimited {
+            category,
+            retry_after,
+        },
         500..=599 => ModelError::Http {
             status,
             category: safe_body,
+            retry_after,
         },
         _ => ModelError::Http {
             status,
             category: safe_body,
+            retry_after,
         },
     }
 }
@@ -378,6 +406,14 @@ mod tests {
 
     impl MockHttpServer {
         fn spawn(status_line: &str, response_body: &str) -> Self {
+            Self::spawn_with_headers(status_line, response_body, &[])
+        }
+
+        fn spawn_with_headers(
+            status_line: &str,
+            response_body: &str,
+            extra_headers: &[&str],
+        ) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock");
             listener.set_nonblocking(true).expect("nonblocking");
             let addr = listener.local_addr().expect("addr");
@@ -387,11 +423,19 @@ mod tests {
             let auth = Arc::clone(&captured_auth);
             let status = status_line.to_string();
             let body = response_body.to_string();
+            let headers: Vec<String> = extra_headers.iter().map(|h| (*h).to_string()).collect();
 
             thread::spawn(move || {
                 for _ in 0..500 {
                     if let Ok((mut stream, _)) = listener.accept() {
-                        handle_mock_connection(&mut stream, &status, &body, &bodies, &auth);
+                        handle_mock_connection(
+                            &mut stream,
+                            &status,
+                            &body,
+                            &headers,
+                            &bodies,
+                            &auth,
+                        );
                         return;
                     }
                     thread::sleep(Duration::from_millis(5));
@@ -418,6 +462,7 @@ mod tests {
         stream: &mut TcpStream,
         status_line: &str,
         response_body: &str,
+        extra_headers: &[String],
         bodies: &Arc<Mutex<Vec<String>>>,
         auth: &Arc<Mutex<Vec<String>>>,
     ) {
@@ -437,8 +482,13 @@ mod tests {
                 .expect("lock")
                 .push(request[header_end + 4..].to_string());
         }
+        let mut extra = String::new();
+        for header in extra_headers {
+            extra.push_str(header);
+            extra.push_str("\r\n");
+        }
         let response = format!(
-            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{response_body}",
             response_body.len()
         );
         let _ = stream.write_all(response.as_bytes());
@@ -626,7 +676,32 @@ mod tests {
         let server = MockHttpServer::spawn("429 Too Many Requests", r#"{"error":"slow down"}"#);
         let client = OpenAICompatibleModelClient::new(test_config(&server.base_url));
         let err = client.complete(&sample_request()).unwrap_err();
-        assert!(matches!(err, ModelError::RateLimited(_)));
+        assert!(matches!(
+            err,
+            ModelError::RateLimited {
+                retry_after: None,
+                ..
+            }
+        ));
+        assert_eq!(err.http_status(), Some(429));
+    }
+
+    #[test]
+    fn http_429_preserves_retry_after_header() {
+        let server = MockHttpServer::spawn_with_headers(
+            "429 Too Many Requests",
+            r#"{"error":"slow down"}"#,
+            &["Retry-After: 7"],
+        );
+        let client = OpenAICompatibleModelClient::new(test_config(&server.base_url));
+        let err = client.complete(&sample_request()).unwrap_err();
+        assert!(matches!(
+            err,
+            ModelError::RateLimited {
+                retry_after: Some(duration),
+                ..
+            } if duration == Duration::from_secs(7)
+        ));
     }
 
     #[test]
@@ -634,7 +709,7 @@ mod tests {
         let server = MockHttpServer::spawn("500 Internal Server Error", r#"{"error":"boom"}"#);
         let client = OpenAICompatibleModelClient::new(test_config(&server.base_url));
         let err = client.complete(&sample_request()).unwrap_err();
-        assert!(matches!(err, ModelError::Http { .. }));
+        assert!(matches!(err, ModelError::Http { status: 500, .. }));
     }
 
     #[test]
@@ -696,7 +771,7 @@ mod tests {
         let err = client.complete(&sample_request()).unwrap_err();
         assert!(matches!(
             err,
-            ModelError::Timeout | ModelError::Transport(_)
+            ModelError::Timeout | ModelError::Transport { .. }
         ));
     }
 

@@ -141,9 +141,11 @@ pub use evaluation_observation::{
 };
 #[allow(unused_imports)]
 pub use failure_classification::{
-    FailureClass, FailureEvidence, FailureReport, FailureSource, RecoveryBudget, RecoveryStrategy,
-    build_failure_report, classify_model_error, classify_progress_stall, classify_response_error,
-    classify_system_failure, select_recovery_strategy,
+    FailureClass, FailureEvidence, FailureReport, FailureSource, RecordingRecoveryDelay,
+    RecoveryBudget, RecoveryDecision, RecoveryDelay, RecoveryPlanReason, RecoveryStrategy,
+    SharedRecoveryDelay, StructuredRecoverySignal, ThreadRecoveryDelay, build_failure_report,
+    classify_model_error, classify_progress_stall, classify_response_error,
+    classify_system_failure, default_recovery_delay, plan_recovery, select_recovery_strategy,
 };
 #[allow(unused_imports)]
 pub use goal_driven::{
@@ -172,12 +174,12 @@ pub use model::{
     ModelError, ModelInteractionTrace, ModelRequest, ModelResponse, ModelResponseError,
     SerializedCriterionGap, SerializedDiagnosticContext, SerializedGoalEvaluation,
     SerializedGoalGap, SerializedRecommendedAction, StructuredCorrection, StructuredFileOperation,
-    append_diagnostic_context_to_message_parts, append_goal_context_to_message_parts,
-    append_recent_evidence_to_message_parts, append_recommended_action_to_message_parts,
-    apply_gap_guidance, decision_from_goal_gap, decision_is_compatible_with_recommendation,
-    model_decision_from_recommended_action, model_request_from_context, parse_model_response,
-    redact_secrets, serialize_decision, structured_to_file_operation,
-    validate_model_decision_against_recommendation,
+    TransportFailureKind, append_diagnostic_context_to_message_parts,
+    append_goal_context_to_message_parts, append_recent_evidence_to_message_parts,
+    append_recommended_action_to_message_parts, apply_gap_guidance, decision_from_goal_gap,
+    decision_is_compatible_with_recommendation, model_decision_from_recommended_action,
+    model_request_from_context, parse_model_response, redact_secrets, serialize_decision,
+    structured_to_file_operation, validate_model_decision_against_recommendation,
 };
 #[allow(unused_imports)]
 pub use observation::AgentObservation;
