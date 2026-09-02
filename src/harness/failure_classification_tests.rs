@@ -8,6 +8,7 @@ mod tests {
     use crate::harness::Evidence;
     use crate::harness::action::AgentAction;
     use crate::harness::action_policy::ActionPolicy;
+    use crate::harness::adaptive_recovery::{AdaptiveRecoveryBudget, AdaptiveRecoveryReason};
     use crate::harness::agent::Agent;
     use crate::harness::agent_loop::{AgentLoop, LoopStatus};
     use crate::harness::ai_agent::AiAgent;
@@ -560,5 +561,48 @@ mod tests {
         assert_eq!(report.signal.http_status, Some(429));
         assert_eq!(report.signal.retry_after, Some(Duration::from_secs(5)));
         assert_eq!(result.status, LoopStatus::ExternalServiceBlocked);
+    }
+
+    /// SIGNAL CASE G — Retry-After no puede superar la espera acumulada de sesión.
+    #[test]
+    fn signal_case_g_retry_after_respects_cumulative_wait_budget() {
+        let client = ScriptedModelClient::new(
+            vec![Some(ModelError::rate_limited_with_retry_after(
+                "rate_limited",
+                Some(Duration::from_secs(11)),
+            ))],
+            ModelDecision::Finish {
+                summary: "must not retry".to_string(),
+            },
+        );
+        let recorder = std::sync::Arc::new(RecordingRecoveryDelay::new());
+        let mut agent = AiAgent::new(
+            Box::new(client),
+            AiSessionConfig::new("bounded-wait", "Generic"),
+        );
+        let budget = AdaptiveRecoveryBudget::new(
+            RecoveryBudget::new(3, Duration::ZERO),
+            2,
+            Duration::from_secs(5),
+        );
+        let result = AgentLoop::new(5)
+            .with_adaptive_recovery_budget(budget)
+            .with_recovery_delay(recorder.clone())
+            .run(
+                &Harness::new(5),
+                &mut agent,
+                AgentContext::new("bounded-wait"),
+            );
+
+        assert_eq!(result.status, LoopStatus::ExternalServiceBlocked);
+        assert!(recorder.waits().is_empty());
+        assert_eq!(
+            result.history.adaptive_recovery_decisions[0].reason,
+            AdaptiveRecoveryReason::CumulativeWaitExhausted
+        );
+        assert_eq!(
+            result.failure_report.expect("terminal").plan_reason,
+            RecoveryPlanReason::BudgetExhausted
+        );
     }
 }

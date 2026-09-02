@@ -1,6 +1,10 @@
 use std::sync::Arc;
 
 use crate::harness::action::AgentAction;
+use crate::harness::adaptive_recovery::{
+    AdaptiveRecoveryAction, AdaptiveRecoveryBudget, AdaptiveRecoveryDecision,
+    plan_adaptive_recovery,
+};
 use crate::harness::agent::Agent;
 use crate::harness::context::AgentContext;
 use crate::harness::evaluation::{Evaluation, Evidence};
@@ -55,6 +59,8 @@ pub struct LoopHistory {
     pub progress_assessments: Vec<ProgressAssessment>,
     /// Informes de clasificación/recovery emitidos durante la corrida.
     pub failure_reports: Vec<FailureReport>,
+    /// Decisiones compuestas de recovery/routing y presupuesto.
+    pub adaptive_recovery_decisions: Vec<AdaptiveRecoveryDecision>,
     /// Decisiones de routing multi-modelo (Stay/Wait/Switch/Escalate/Stop).
     pub routing_decisions: Vec<crate::harness::model_routing::RoutingDecision>,
 }
@@ -91,7 +97,7 @@ pub struct AgentLoop {
     max_iterations: u32,
     /// Si `Some`, evalúa progreso de Goal tras cada paso con specification.
     max_stale_iterations: Option<u32>,
-    recovery_budget_template: RecoveryBudget,
+    adaptive_recovery_budget_template: AdaptiveRecoveryBudget,
     recovery_delay: SharedRecoveryDelay,
 }
 
@@ -104,7 +110,7 @@ impl AgentLoop {
         Self {
             max_iterations,
             max_stale_iterations: None,
-            recovery_budget_template: RecoveryBudget::default(),
+            adaptive_recovery_budget_template: AdaptiveRecoveryBudget::default(),
             recovery_delay: default_recovery_delay(),
         }
     }
@@ -119,7 +125,13 @@ impl AgentLoop {
     ///
     /// Tests: usar `Duration::ZERO` (default) para evitar sleeps reales.
     pub fn with_recovery_budget(mut self, budget: RecoveryBudget) -> Self {
-        self.recovery_budget_template = budget;
+        self.adaptive_recovery_budget_template.recovery = budget;
+        self
+    }
+
+    /// Configura el presupuesto común de retries, esperas y cambios de modelo.
+    pub fn with_adaptive_recovery_budget(mut self, budget: AdaptiveRecoveryBudget) -> Self {
+        self.adaptive_recovery_budget_template = budget;
         self
     }
 
@@ -144,10 +156,9 @@ impl AgentLoop {
         let mut iterations = 0;
         let mut termination_reason = String::new();
         let mut progress = GoalProgressTracker::new();
-        let mut recovery_budget = self.recovery_budget_template;
+        let mut adaptive_recovery_budget = self.adaptive_recovery_budget_template;
         let mut failure_report: Option<FailureReport> = None;
-        let mut meaningful_progress_observed = false;
-        let mut recovered_after_failure = false;
+        let mut recovery_progress = RecoveryProgressState::default();
 
         while iterations < self.max_iterations {
             iterations += 1;
@@ -187,10 +198,9 @@ impl AgentLoop {
                 match self.handle_classified_failure(
                     agent,
                     evidence,
-                    &mut recovery_budget,
+                    &mut adaptive_recovery_budget,
                     &mut history,
-                    meaningful_progress_observed,
-                    &mut recovered_after_failure,
+                    &mut recovery_progress,
                 ) {
                     FailureHandle::Recover => continue,
                     FailureHandle::Stop {
@@ -214,10 +224,9 @@ impl AgentLoop {
                 match self.handle_classified_failure(
                     agent,
                     evidence,
-                    &mut recovery_budget,
+                    &mut adaptive_recovery_budget,
                     &mut history,
-                    meaningful_progress_observed,
-                    &mut recovered_after_failure,
+                    &mut recovery_progress,
                 ) {
                     FailureHandle::Recover => continue,
                     FailureHandle::Stop {
@@ -267,6 +276,7 @@ impl AgentLoop {
                 let evaluation =
                     GoalEvaluator::new().evaluate(&goal, &collect_evidence_from_context(&ctx));
                 if evaluation.status == GoalStatus::Satisfied {
+                    recovery_progress.record_meaningful_progress();
                     continue;
                 }
                 let action_label = outcome.action.tool_name().map(str::to_string).or_else(|| {
@@ -286,10 +296,7 @@ impl AgentLoop {
                     artifact_revision,
                 );
                 history.progress_assessments.push(assessment.clone());
-                if assessment.signal == ProgressSignal::Improved {
-                    meaningful_progress_observed = true;
-                    recovered_after_failure = false;
-                }
+                recovery_progress.record_assessment(assessment.signal);
 
                 let stagnating = progress.stale_iterations() >= max_stale
                     || (assessment.repeated_action && progress.stale_iterations() >= max_stale);
@@ -304,10 +311,9 @@ impl AgentLoop {
                     match self.handle_classified_failure(
                         agent,
                         evidence,
-                        &mut recovery_budget,
+                        &mut adaptive_recovery_budget,
                         &mut history,
-                        meaningful_progress_observed,
-                        &mut recovered_after_failure,
+                        &mut recovery_progress,
                     ) {
                         FailureHandle::Recover => continue,
                         FailureHandle::Stop {
@@ -356,29 +362,39 @@ impl AgentLoop {
         &self,
         agent: &mut dyn Agent,
         evidence: FailureEvidence,
-        budget: &mut RecoveryBudget,
+        budget: &mut AdaptiveRecoveryBudget,
         history: &mut LoopHistory,
-        meaningful_progress_observed: bool,
-        recovered_after_failure: &mut bool,
+        progress: &mut RecoveryProgressState,
     ) -> FailureHandle {
         // Recovery externo no registra progreso de Goal: este path hace continue
         // antes de GoalProgressTracker::record_iteration (evita contaminar NonProgress).
-        let decision = plan_recovery(&evidence, budget);
-        if decision.strategy.is_recover() && budget.consume() {
-            self.recovery_delay.delay(decision.wait);
-            *recovered_after_failure = true;
+        let recovery = plan_recovery(&evidence, &budget.recovery);
+        let routing = agent.plan_route_after_failure(&evidence, progress.recent_progress_observed);
+        let adaptive = plan_adaptive_recovery(recovery, routing, budget);
+        history
+            .evidence
+            .push(Evidence::new("adaptive_recovery", adaptive.summary()));
+        history.adaptive_recovery_decisions.push(adaptive.clone());
+
+        if adaptive.action == AdaptiveRecoveryAction::RetrySameModel
+            && budget.consume_recovery(adaptive.recovery.wait)
+        {
+            self.recovery_delay.delay(adaptive.recovery.wait);
+            progress.mark_recovery_pending();
             let report = build_failure_report(
                 &evidence,
-                &decision,
-                budget.attempts_used,
+                &adaptive.recovery,
+                budget.recovery.attempts_used,
                 false,
-                meaningful_progress_observed,
+                progress.meaningful_progress_observed,
             );
             history.failure_reports.push(report);
-            // Observabilidad de routing: ExternalTransient → WaitSameModel (mismo modelo).
-            if let Some(route) =
-                agent.try_route_after_failure(&evidence, meaningful_progress_observed)
+            // RetrySameModel owns this iteration. A model-changing route must
+            // pass through RouteModel, where the shared switch budget is consumed.
+            if let Some(planned) = adaptive.routing.clone()
+                && !planned.action.changes_model()
             {
+                let route = agent.apply_route_after_failure(planned);
                 history
                     .evidence
                     .push(Evidence::new("model_routing", route.summary()));
@@ -387,34 +403,42 @@ impl AgentLoop {
             history.evidence.push(Evidence::new(
                 "failure_recovery",
                 format!(
-                    "class={} strategy={} reason={} wait_ms={} attempt={}/{} signal={}",
+                    "class={} strategy={} reason={} adaptive_reason={} wait_ms={} attempt={}/{} cumulative_wait_ms={}/{} signal={}",
                     evidence.class.as_str(),
-                    decision.strategy.as_str(),
-                    decision.reason.as_str(),
-                    decision.wait.as_millis(),
-                    budget.attempts_used,
-                    budget.max_attempts,
-                    decision.signal.summary()
+                    adaptive.recovery.strategy.as_str(),
+                    adaptive.recovery.reason.as_str(),
+                    adaptive.reason.as_str(),
+                    adaptive.recovery.wait.as_millis(),
+                    budget.recovery.attempts_used,
+                    budget.recovery.max_attempts,
+                    budget.cumulative_wait.as_millis(),
+                    budget.max_cumulative_wait.as_millis(),
+                    adaptive.recovery.signal.summary()
                 ),
             ));
             return FailureHandle::Recover;
         }
 
-        // Antes de terminal: intentar Switch/Escalate si el agente tiene catálogo.
-        if let Some(route) = agent.try_route_after_failure(&evidence, meaningful_progress_observed)
+        if adaptive.action == AdaptiveRecoveryAction::RouteModel
+            && let Some(planned) = adaptive.routing.clone()
+            && budget.consume_model_switch()
         {
+            let route = agent.apply_route_after_failure(planned);
+            let changed = route.action.changes_model();
             history
                 .evidence
                 .push(Evidence::new("model_routing", route.summary()));
-            let changed = route.action.changes_model();
             history.routing_decisions.push(route);
             if changed {
-                *recovered_after_failure = true;
+                progress.mark_recovery_pending();
                 history.evidence.push(Evidence::new(
                     "failure_recovery",
                     format!(
-                        "class={} strategy=model_route reason=routing_applied signal={}",
+                        "class={} strategy=model_route reason={} switch={}/{} signal={}",
                         evidence.class.as_str(),
+                        adaptive.reason.as_str(),
+                        budget.model_switches_used,
+                        budget.max_model_switches,
                         evidence.signal.summary()
                     ),
                 ));
@@ -422,22 +446,33 @@ impl AgentLoop {
             }
         }
 
-        let terminal_decision = if decision.strategy.is_recover() {
-            let mut blocked = decision.clone();
+        if adaptive.action == AdaptiveRecoveryAction::Stop
+            && let Some(planned) = adaptive.routing.clone()
+            && !planned.action.changes_model()
+        {
+            let route = agent.apply_route_after_failure(planned);
+            history
+                .evidence
+                .push(Evidence::new("model_routing", route.summary()));
+            history.routing_decisions.push(route);
+        }
+
+        let terminal_decision = if adaptive.recovery.strategy.is_recover() {
+            let mut blocked = adaptive.recovery.clone();
             blocked.strategy = RecoveryStrategy::StopExternalBlocked;
             blocked.wait = std::time::Duration::ZERO;
             blocked.reason =
                 crate::harness::failure_classification::RecoveryPlanReason::BudgetExhausted;
             blocked
         } else {
-            decision
+            adaptive.recovery
         };
         let report = build_failure_report(
             &evidence,
             &terminal_decision,
-            budget.attempts_used,
-            *recovered_after_failure && meaningful_progress_observed,
-            meaningful_progress_observed,
+            budget.recovery.attempts_used,
+            progress.recovery_restored_progress,
+            progress.meaningful_progress_observed,
         );
         history.failure_reports.push(report.clone());
         history.evidence.push(Evidence::new(
@@ -453,6 +488,37 @@ impl AgentLoop {
             ),
             report,
         }
+    }
+}
+
+#[derive(Debug, Default)]
+struct RecoveryProgressState {
+    meaningful_progress_observed: bool,
+    recent_progress_observed: bool,
+    recovery_pending_progress: bool,
+    recovery_restored_progress: bool,
+}
+
+impl RecoveryProgressState {
+    fn record_assessment(&mut self, signal: ProgressSignal) {
+        self.recent_progress_observed = signal == ProgressSignal::Improved;
+        if self.recent_progress_observed {
+            self.record_meaningful_progress();
+        }
+    }
+
+    fn record_meaningful_progress(&mut self) {
+        self.meaningful_progress_observed = true;
+        self.recent_progress_observed = true;
+        if self.recovery_pending_progress {
+            self.recovery_restored_progress = true;
+            self.recovery_pending_progress = false;
+        }
+    }
+
+    fn mark_recovery_pending(&mut self) {
+        self.recovery_pending_progress = true;
+        self.recent_progress_observed = false;
     }
 }
 
@@ -486,6 +552,10 @@ mod tests {
         RejectedThenFinishAgent, ValidateThenRepairAgent,
     };
     use crate::harness::bridge::introduce_validation_defect;
+    use crate::harness::model::ModelError;
+    use crate::harness::model_routing::{
+        ModelIdentity, RoutingAction, RoutingDecision, RoutingReason,
+    };
     use crate::harness::tool::Tool;
     use crate::harness::tool_permission::ToolPermissionConstraint;
     use crate::harness::tools::{
@@ -548,6 +618,115 @@ fn implementar_handlers() {
 }
 "#
         .to_string()
+    }
+
+    #[test]
+    fn recovery_is_restored_only_after_measurable_progress() {
+        let mut state = RecoveryProgressState::default();
+        state.mark_recovery_pending();
+
+        assert!(state.recovery_pending_progress);
+        assert!(!state.recovery_restored_progress);
+
+        state.record_assessment(ProgressSignal::Unchanged);
+        assert!(state.recovery_pending_progress);
+        assert!(!state.recovery_restored_progress);
+
+        state.record_assessment(ProgressSignal::Improved);
+        assert!(!state.recovery_pending_progress);
+        assert!(state.recovery_restored_progress);
+        assert!(state.meaningful_progress_observed);
+    }
+
+    #[test]
+    fn recent_progress_expires_after_non_progress_assessment() {
+        let mut state = RecoveryProgressState::default();
+        state.record_assessment(ProgressSignal::Improved);
+        assert!(state.recent_progress_observed);
+
+        state.record_assessment(ProgressSignal::Unchanged);
+        assert!(state.meaningful_progress_observed);
+        assert!(!state.recent_progress_observed);
+    }
+
+    #[test]
+    fn retry_same_model_never_applies_model_change_outside_switch_budget() {
+        struct ConflictingRetryRoutingAgent {
+            proposals: u32,
+            applied_switches: u32,
+        }
+
+        impl Agent for ConflictingRetryRoutingAgent {
+            fn propose(&mut self, _ctx: &AgentContext) -> AgentAction {
+                self.proposals = self.proposals.saturating_add(1);
+                if self.proposals == 1 {
+                    AgentAction::NoOp
+                } else {
+                    AgentAction::Finish {
+                        summary: "completed after retry".to_string(),
+                    }
+                }
+            }
+
+            fn last_failure_evidence(&self) -> Option<FailureEvidence> {
+                (self.proposals == 1)
+                    .then(|| crate::harness::classify_model_error(&ModelError::Timeout))
+            }
+
+            fn plan_route_after_failure(
+                &self,
+                evidence: &FailureEvidence,
+                _recent_progress_observed: bool,
+            ) -> Option<RoutingDecision> {
+                Some(RoutingDecision {
+                    action: RoutingAction::SwitchAlternative,
+                    reason: RoutingReason::ExternalPermanentSwitch,
+                    from: ModelIdentity::new("provider", "low"),
+                    to: Some(ModelIdentity::new("provider", "alternative")),
+                    failure_class: evidence.class,
+                    escalation_used: 0,
+                    escalation_remaining: 0,
+                })
+            }
+
+            fn apply_route_after_failure(&mut self, decision: RoutingDecision) -> RoutingDecision {
+                if decision.action.changes_model() {
+                    self.applied_switches = self.applied_switches.saturating_add(1);
+                }
+                decision
+            }
+        }
+
+        let mut agent = ConflictingRetryRoutingAgent {
+            proposals: 0,
+            applied_switches: 0,
+        };
+        let budget = AdaptiveRecoveryBudget::new(
+            RecoveryBudget::new(1, std::time::Duration::ZERO),
+            0,
+            std::time::Duration::ZERO,
+        );
+
+        let result = AgentLoop::new(3).with_adaptive_recovery_budget(budget).run(
+            &Harness::new(3),
+            &mut agent,
+            AgentContext::new("retry-authority"),
+        );
+
+        assert_eq!(result.status, LoopStatus::Completed);
+        assert_eq!(agent.applied_switches, 0);
+        assert_eq!(result.history.adaptive_recovery_decisions.len(), 1);
+        assert_eq!(
+            result.history.adaptive_recovery_decisions[0].action,
+            AdaptiveRecoveryAction::RetrySameModel
+        );
+        assert_eq!(
+            result.history.adaptive_recovery_decisions[0]
+                .budget
+                .model_switches_max,
+            0
+        );
+        assert!(result.history.routing_decisions.is_empty());
     }
 
     #[test]

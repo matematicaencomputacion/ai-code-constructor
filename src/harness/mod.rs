@@ -5,6 +5,7 @@
 
 mod action;
 mod action_policy;
+mod adaptive_recovery;
 mod agent;
 mod agent_loop;
 mod agent_prompt;
@@ -29,6 +30,8 @@ mod feature_flags;
 mod goal_driven;
 mod live_session;
 mod model;
+mod model_compatibility_probe;
+mod model_compatibility_scheduler;
 mod model_routing;
 mod observation;
 mod openai_compatible_client;
@@ -69,6 +72,8 @@ mod goal_driven_integration_tests;
 #[cfg(test)]
 mod live_session_builder_initial_artifact_tests;
 #[cfg(test)]
+mod model_compatibility_scheduler_tests;
+#[cfg(test)]
 mod model_decision_multi_file_correction_tests;
 #[cfg(test)]
 mod model_multi_file_contract_tests;
@@ -84,6 +89,11 @@ pub use action::AgentAction;
 pub use action_policy::{
     ActionConstraint, ActionPolicy, ApplyCorrectionConstraint, ApplyFileOperationsConstraint,
     ArtifactStateConstraint, FinishConstraint, PolicyVerdict, RepairDiagnosticConstraint,
+};
+#[allow(unused_imports)]
+pub use adaptive_recovery::{
+    AdaptiveRecoveryAction, AdaptiveRecoveryBudget, AdaptiveRecoveryBudgetSnapshot,
+    AdaptiveRecoveryDecision, AdaptiveRecoveryReason, plan_adaptive_recovery,
 };
 #[allow(unused_imports)]
 pub use agent::{
@@ -188,6 +198,13 @@ pub use model::{
     structured_to_file_operation, validate_model_decision_against_recommendation,
 };
 #[allow(unused_imports)]
+pub use model_compatibility_probe::{probe_cli_usage, run_model_compatibility_probe_cli};
+#[allow(unused_imports)]
+pub use model_compatibility_scheduler::{
+    ProbeScheduleOutcome, ProbeScheduleState, ProbeScheduler, ProbeSchedulerConfig,
+    ProbeSchedulerError,
+};
+#[allow(unused_imports)]
 pub use model_routing::{
     EscalationBudget, ModelCandidate, ModelIdentity, RelativeTier, RoutingAction, RoutingDecision,
     RoutingPlanInput, RoutingReason, apply_routing_decision, plan_routing,
@@ -196,7 +213,7 @@ pub use model_routing::{
 pub use observation::AgentObservation;
 #[allow(unused_imports)]
 pub use openai_compatible_client::{
-    ModelCallMetadata, ModelClientConfig, OpenAICompatibleModelClient,
+    ModelCallMetadata, ModelClientConfig, OpenAICompatibleModelClient, ResponseFormatMode,
 };
 #[allow(unused_imports)]
 pub use retrying_model_client::{ModelRetryObservability, RetryConfig, RetryingModelClient};

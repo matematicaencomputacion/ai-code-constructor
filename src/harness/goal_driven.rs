@@ -496,8 +496,9 @@ impl GoalProgressTracker {
                 } else if pass_count < *prev {
                     ProgressSignal::Regressed
                 } else {
-                    // Fingerprint nuevo con pass_count estable: evidencia/gap distinta.
-                    ProgressSignal::Improved
+                    // Cambiar qué criterio está abierto sin aumentar los Pass no es
+                    // mejora neta: evita confundir movimiento lateral con progreso.
+                    ProgressSignal::Unchanged
                 }
             }
         };
@@ -509,15 +510,24 @@ impl GoalProgressTracker {
                 ProgressSignal::Unchanged | ProgressSignal::RepeatedState
             );
 
+        let fingerprint_changed = self
+            .fingerprints
+            .last()
+            .is_some_and(|previous| previous != &fingerprint);
+        let state_action_seen =
+            self.fingerprints
+                .iter()
+                .zip(&self.actions)
+                .any(|(seen_state, seen_action)| {
+                    seen_state == &fingerprint && seen_action.as_deref() == action
+                });
+
         let artifact_changed_without_progress = artifact_revision.is_some()
             && self.artifact_revisions.last().copied().flatten() != artifact_revision
             && matches!(
                 signal,
                 ProgressSignal::Unchanged | ProgressSignal::RepeatedState
             );
-
-        let action_advanced =
-            action.is_some() && self.actions.last().and_then(|item| item.as_deref()) != action;
 
         let reason = match signal {
             ProgressSignal::Improved => {
@@ -541,6 +551,13 @@ impl GoalProgressTracker {
                     )
                 } else if artifact_changed_without_progress {
                     "artifact mutó sin mejora de criterios/gap".to_string()
+                } else if state_action_seen {
+                    format!(
+                        "acción ya intentada para el mismo estado: {}",
+                        action.unwrap_or("sin acción")
+                    )
+                } else if fingerprint_changed {
+                    "estado de criterios cambió sin mejora neta".to_string()
                 } else {
                     "sin cambio en fingerprint de criterios".to_string()
                 }
@@ -553,17 +570,20 @@ impl GoalProgressTracker {
             }
         };
 
-        // Estancamiento: repetición de acción/estado, no pasos intermedios de un pipeline
-        // (p. ej. RepairDiagnostic → ApplyCorrection → re-verify aún Unchanged).
+        // La primera observación establece la línea base. Un paso nuevo del pipeline
+        // sobre el mismo estado recibe margen; repetir el par estado+acción, volver a
+        // un estado visto, cambiar lateralmente o regresar sí consume la ventana.
+        // Así una secuencia RepairDiagnostic → ApplyCorrection → Compile puede
+        // verificar antes de ser declarada stale, pero A ↔ B sin cambio converge.
         if signal == ProgressSignal::Improved {
             self.stale_iterations = 0;
-        } else if signal == ProgressSignal::RepeatedState
-            || repeated_action
-            || (matches!(
-                signal,
-                ProgressSignal::Unchanged | ProgressSignal::Regressed
-            ) && !action_advanced
-                && !self.pass_counts.is_empty())
+        } else if !self.pass_counts.is_empty()
+            && (state_action_seen
+                || fingerprint_changed
+                || matches!(
+                    signal,
+                    ProgressSignal::RepeatedState | ProgressSignal::Regressed
+                ))
         {
             self.stale_iterations += 1;
         }

@@ -21,17 +21,32 @@ pub trait Agent: Send + Sync {
         None
     }
 
-    /// Planifica (y aplica si corresponde) routing multi-modelo tras un fallo clasificado.
+    /// Planifica routing multi-modelo sin mutar el estado del Agent.
+    fn plan_route_after_failure(
+        &self,
+        evidence: &FailureEvidence,
+        recent_progress_observed: bool,
+    ) -> Option<RoutingDecision> {
+        let _ = (evidence, recent_progress_observed);
+        None
+    }
+
+    /// Aplica y registra una decisión previamente planificada.
+    fn apply_route_after_failure(&mut self, decision: RoutingDecision) -> RoutingDecision {
+        decision
+    }
+
+    /// Compatibilidad: planifica y aplica routing en una sola llamada.
     ///
     /// Default: `None` (agentes sin catálogo de candidatos). Un `Some` con
     /// `action.changes_model()` indica que el loop puede continuar con el nuevo modelo.
     fn try_route_after_failure(
         &mut self,
         evidence: &FailureEvidence,
-        meaningful_progress_observed: bool,
+        recent_progress_observed: bool,
     ) -> Option<RoutingDecision> {
-        let _ = (evidence, meaningful_progress_observed);
-        None
+        let planned = self.plan_route_after_failure(evidence, recent_progress_observed)?;
+        Some(self.apply_route_after_failure(planned))
     }
 }
 

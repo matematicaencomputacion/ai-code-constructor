@@ -172,7 +172,43 @@ Properties implemented today:
 - **Full history**: `LoopHistory` records proposed actions, rejections, tool
   results, evidence, evaluations, and observations.
 
-Live sessions use `LIVE_AGENT_MAX_ITERATIONS = 8` as a stricter cap.
+Live sessions use `LIVE_AGENT_MAX_ITERATIONS = 12` as a strict cap.
+
+### Goal convergence and adaptive recovery
+
+When an evaluation specification is present, the loop also records measurable
+Goal progress. `GoalProgressTracker` compares criterion verdicts, gap size,
+state fingerprints, artifact revision, and the state/action pair:
+
+- a larger pass count or smaller gap is progress;
+- swapping one passing criterion for another is lateral movement, not progress;
+- alternating actions over an unchanged Goal still consumes the stale window;
+- historical progress is retained for reporting, but only recent progress can
+  suppress a model escalation.
+
+Failure handling is a composed, observable decision:
+
+```
+FailureEvidence + recent Goal progress
+        ├── plan_recovery (retry / wait / terminal)
+        └── plan_routing  (stay / switch / escalate / stop)
+                         ↓
+             plan_adaptive_recovery
+                         ↓
+        AdaptiveRecoveryBudget (single session ledger)
+                         ↓
+              retry | route | stop
+```
+
+The common ledger bounds recovery attempts, model switches, and cumulative
+wait. Its current defaults are 3 recovery attempts, 2 model switches, and 300
+seconds of cumulative wait. A provider `Retry-After` hint has priority over
+generic backoff, but it cannot exceed that cumulative wait budget.
+
+Routing planning is side-effect free. The selected route is applied only after
+the common budget authorizes it. The product live entrypoint likewise uses
+`AgentLoop` as the single retry authority; `RetryingModelClient` remains an
+explicit compatibility/standalone wrapper rather than being stacked by default.
 
 ---
 
@@ -337,8 +373,11 @@ AiAgent
 ModelClient (trait)
    ├── MockModelClient      (deterministic, CI-safe)
    └── OpenAICompatibleModelClient
-           ↑ wrapped by RetryingModelClient (429, timeout, 5xx)
 ```
+
+`RetryingModelClient` remains available for standalone or legacy callers.
+The default live session passes the raw compatible client to `AgentLoop`,
+which owns retry, `Retry-After`, and the shared budget.
 
 - **`ModelRequest`** carries goal, step, working code, serialized observations,
   evidence, and a versioned system prompt (`SYSTEM_PROMPT_V1`).
@@ -390,10 +429,11 @@ inside the harness** without corrupting the original `CodeState`.
 
 ```
 OpenAICompatibleModelClient
-  → RetryingModelClient
   → AiAgent
   → Harness (validate / repair / correct / compile tools)
-  → AgentLoop (capped)
+  → AgentLoop
+      └── progress + failure classification
+          + adaptive recovery/routing budget
 ```
 
 First use case implemented: validate and compile an existing Rust artifact with
@@ -437,7 +477,7 @@ Do not overstate protections. Today the sandbox is **minimal and explicit**:
 | `ToolPermissionConstraint` | Allowlist of tool names |
 | `CorrectionTarget::SessionCode` | Corrections only on harness working code |
 | Typed `AgentAction` | No arbitrary shell or path fields |
-| Iteration limits | Constructor (3) and live session (8) |
+| Iteration limits | Constructor (3) and live session (12) |
 | Secret redaction | `redact_secrets` in public model errors |
 | System prompt rules | Instructs model; enforcement is architectural |
 
@@ -445,9 +485,11 @@ Do not overstate protections. Today the sandbox is **minimal and explicit**:
 arbitrary-path write prevention beyond the correction target design, or a shell
 tool.
 
-Some allowed tools **do** invoke `cargo` or `rustc` when the harness permits
-them (compile, clippy, fmt, tests). That is intentional but bounded by the
-allowlist and action typing.
+Some product/session harnesses **do** register tools that invoke `cargo` or
+`rustc` (compile, clippy, fmt, tests). `ToolPermissionConstraint` limits which
+registered capability may be selected; it is not a process sandbox and does
+not isolate the filesystem, network, syscalls, or inherited environment.
+Generated-code execution is therefore not a certified security boundary.
 
 ---
 
@@ -455,7 +497,7 @@ allowlist and action typing.
 
 Tests are not a footnote. They **demonstrate contracts and causality**.
 
-The suite (130+ deterministic tests; 2 ignored live-provider tests) covers:
+The suite currently runs 612 tests (608 passing; 4 manual/live tests ignored) and covers:
 
 - harness step execution and rejection,
 - tool evidence shape,
@@ -467,15 +509,18 @@ The suite (130+ deterministic tests; 2 ignored live-provider tests) covers:
 - E2E mock flows: validate → repair → correct → validate → compile → finish,
 - HTTP client behavior with local mock server,
 - retry policy for transient model errors,
+- state/action convergence, lateral-state detection, and bounded NonProgress,
+- structured failure classification and signal-aware `Retry-After`,
+- common-budget recovery plus multi-model capability escalation,
 - retry observability (`last` ≠ `total` ≠ AgentLoop `iteration_count`; `None` ≠ zero).
 
 CI (`.github/workflows/ci.yml`): `cargo fmt --check`, `cargo clippy -D warnings`,
 `cargo check`, `cargo test` — no network, no live LLM.
 
-**Retry observability (causal):** `last_retry_count` = retries del último `complete()`.
-`ModelRetryObservability::total()` = suma de retries de todos los `complete()` finalizados.
-`per_call()` = retries por complete en orden. Iteraciones del AgentLoop no se derivan de retries
-ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente causal), no `Some(0)`.
+**Retry observability (causal):** `last_retry_count` and
+`ModelRetryObservability::per_call()` describe an explicitly injected client
+wrapper. `LiveSessionTrace::total_retries` includes coordinator retries and,
+when present, wrapper retries. AgentLoop iterations remain a separate measure.
 
 ---
 
@@ -486,19 +531,25 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - Constructor pipeline: Planner, Builder, Compiler, Validator, Repairer, `CodeState`
 - CLI entry via `run_constructor` / `cargo run -- "<request>"`
 - Harness core: AgentLoop, Harness, Agent trait, Context, Observation, Evidence, Evaluation
+- Goal → Gap → RecommendedAction → Model → Tools → Evidence guidance
+- `GoalProgressTracker` with repeated state/action and lateral-change detection
+- Structured failure classification and terminal `FailureReport`
+- `AdaptiveRecoveryBudget` for attempts, model switches, and cumulative wait
+- Pure recovery/routing composition with observable `AdaptiveRecoveryDecision`
+- Optional multi-model routing with bounded capability escalation and no revisits
 - Typed `AgentAction` and Constraint framework
 - Tools: compile, validate, repair_diagnostic, apply_correction, run_tests, clippy, fmt
 - Structured `Correction` + `CorrectionTool`
 - `CorrectionPolicy` + deterministic implementation
 - `ModelClient`, `MockModelClient`, `AiAgent`, JSON decision parsing
-- `OpenAICompatibleModelClient` + `RetryingModelClient`
+- `OpenAICompatibleModelClient` + opt-in `RetryingModelClient`
 - `ModelRetryObservability` (handle causal): `last` / `total` / `per_call` — ortogonal a `AgentLoop` iterations
-- LiveSession proyecta `total_retries` (y `StepRecord.retry_count` solo si hay alineación 1:1 propose↔complete↔step)
+- LiveSession reports coordinator retries plus optional client-wrapper retries
 - `ConstructionObservability.model_retry_count`: `Some(total)` con handle inyectado; `None` sin fuente causal (no inventa 0)
 - `ConstructorBridge` + artifact snapshot from `CodeState`
 - Live session scaffolding + versioned system prompt
-- `RustArtifact` with revision tracking (unit tested, not integrated)
-- `Specification` contract: goal, requirements, acceptance criteria, structural validation (not wired to Planner/Agent)
+- `RustArtifact` with revision tracking and canonical AgentContext integration
+- `Specification` contract: goal, requirements, acceptance criteria, structural validation
 - Deterministic `plan_specification`: `Specification` → `BuildPlan` via `SpecificationBuildPlan` (traceable WHAT → HOW)
 - Evidence-based `EvaluationEngine`: AcceptanceCriterion + Evidence → PASS / FAIL / InsufficientEvidence (deterministic, no LLM)
 - Explicit `CriterionKind` on `AcceptanceCriterion` (semantics live in the contract, not in the ID)
@@ -534,6 +585,9 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 
 ### Next (reasonable architectural units)
 
+- Wire configured model catalogs into the product LiveSession entrypoint
+- Attach `UnitCompletionRecord` to terminal session/construction outcomes
+- Extend the common ledger to explicit model-call, tool-call, and wall-clock caps
 - Extend multi-file initial artifacts to additional PlanKinds when justified
 
 ### Long-term vision (not implemented)
@@ -543,7 +597,7 @@ ni al revés. Sin handle inyectado, `model_retry_count` es `None` (sin fuente ca
 - Filesystem / shell / Git tools under harness control
 - AI-based CorrectionPolicy
 - Persistent memory, multi-agent coordination, MCP, RAG
-- Provider fallbacks and streaming
+- Provider catalog discovery and streaming
 
 ---
 
@@ -588,7 +642,64 @@ cargo clippy -- -D warnings
 cargo check
 ```
 
-**Dependencies:** Rust stable; `ureq` for HTTP model client only.
+**Dependencies:** Rust stable; `ureq` para HTTP, `serde`/`serde_json` para checkpoints y `httpdate` para `Retry-After` RFC 9110.
+
+## Model compatibility probe
+
+`ModelCompatibilityProbe` certifica de forma acotada transporte, gramática de
+decisiones y comportamiento causal del Harness sin guardar prompts, respuestas
+crudas o credenciales. No certifica todavía la ejecución real de código generado.
+
+**Preflight sin red ni secretos:**
+
+```bash
+cargo run -- model-compatibility-probe --dry-run --profile smoke --max-calls 32 --json
+```
+
+**Ejecución live explícita:**
+
+```bash
+export NVIDIA_API_KEY='configure-locally'
+cargo run -- model-compatibility-probe \
+  --profile smoke \
+  --max-calls 32 \
+  --checkpoint-dir .model-probe-state \
+  --pacing-ms 2000 \
+  --max-recoveries 3 \
+  --max-retry-after-ms 120000 \
+  --max-cumulative-wait-ms 300000 \
+  --ack-live \
+  --json
+```
+
+Por defecto recorre `moonshotai/kimi-k3`, `deepseek-ai/deepseek-v4-pro-0813`, `nvidia/nemotron-3.5-lightning-30b-a3b` y `nvidia/nemotron-3-ultra-550b-a55b`. `--model ID` puede repetirse para seleccionar un subconjunto.
+
+La base URL live debe usar HTTPS; HTTP se rechaza antes de adjuntar o enviar `NVIDIA_API_KEY`.
+
+La suite evalúa transporte prompt-only, JSON estricto, todas las acciones
+válidas, reparación autónoma, edición multiarchivo, convergencia acotada y
+el contrato de `429/Retry-After`. Los gates individuales de acciones solo validan
+el JSON producido por el modelo; no entregan esas acciones al Harness ni ejecutan herramientas.
+
+El `repair_bundle` live usa un Harness exclusivo del probe. `Validate`,
+`RepairDiagnostic`, `ApplyCorrection` y `ApplyFileOperations` operan sobre el
+artefacto en memoria, mientras que `Compile` se resuelve con
+`ProbeCompileTool`, un verificador sintético que no materializa archivos ni
+inicia procesos. `RunTests`, `RunClippy` y `CheckFormat` no están
+registrados en ese Harness y cualquier intento de usarlos dentro del bundle es
+rechazado. Un `pass` demuestra la secuencia causal sobre la fixture sintética;
+la ejecución real mediante `cargo` o `rustc` permanece fuera de alcance hasta
+incorporar un `SandboxRunner`.
+
+El scheduler persiste un checkpoint atómico por target y perfil. Un `429`,
+timeout, `5xx` o fallo de transporte elegible deja el estado en `waiting` solo
+si quedan presupuestos suficientes para reintentarlo; si se agotó el límite de
+llamadas, recoveries, tiempo activo o espera, queda `blocked`. En ambos casos
+conserva el primer gate pendiente y no repite gates ya confirmados.
+
+`Retry-After` admite delta-seconds y HTTP-date según RFC 9110. Una espera superior a `--max-retry-after-ms`, o que exceda `--max-cumulative-wait-ms`, deja el checkpoint en `blocked` en vez de truncar o insistir. El gate sintético nunca fuerza un rate limit real.
+
+El adaptador actual consume acciones JSON en `choices[0].message.content`; por eso tool-calling nativo se informa como `not_tested` y no afecta el veredicto general.
 
 ---
 
@@ -620,7 +731,7 @@ src/
     tools/
 ```
 
-No `docs/architecture/` or ADR directory exists yet.
+Las decisiones de arquitectura y contratos activos se documentan en `docs/` y `docs/adr/`.
 
 ---
 
