@@ -184,22 +184,28 @@ impl Agent for AiAgent {
             .map(classify_response_error)
     }
 
-    fn try_route_after_failure(
-        &mut self,
+    fn plan_route_after_failure(
+        &self,
         evidence: &FailureEvidence,
-        meaningful_progress_observed: bool,
+        recent_progress_observed: bool,
     ) -> Option<RoutingDecision> {
-        let state = self.routing.as_mut()?;
+        let state = self.routing.as_ref()?;
         let active = state.candidates.get(state.active_index)?.clone();
-        let planned = plan_routing(
+        Some(plan_routing(
             evidence,
             RoutingPlanInput {
                 active: &active,
                 candidates: &state.candidates,
                 budget: &state.budget,
-                meaningful_progress_observed,
+                meaningful_progress_observed: recent_progress_observed,
             },
-        );
+        ))
+    }
+
+    fn apply_route_after_failure(&mut self, planned: RoutingDecision) -> RoutingDecision {
+        let Some(state) = self.routing.as_mut() else {
+            return planned;
+        };
         if planned.action.changes_model() {
             let applied = apply_routing_decision(
                 &planned,
@@ -218,7 +224,7 @@ impl Agent for AiAgent {
                     escalation_remaining: state.budget.remaining_count(),
                 };
                 state.decisions.push(stopped.clone());
-                return Some(stopped);
+                return stopped;
             }
         }
         // Refrescar contadores post-apply para observabilidad exacta.
@@ -226,7 +232,7 @@ impl Agent for AiAgent {
         recorded.escalation_used = state.budget.switches_used;
         recorded.escalation_remaining = state.budget.remaining_count();
         state.decisions.push(recorded.clone());
-        Some(recorded)
+        recorded
     }
 
     fn propose(&mut self, ctx: &AgentContext) -> AgentAction {

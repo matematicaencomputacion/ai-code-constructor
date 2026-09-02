@@ -17,7 +17,9 @@ use crate::harness::model::{
 };
 use crate::harness::observation::AgentObservation;
 use crate::harness::openai_compatible_client::{ModelClientConfig, OpenAICompatibleModelClient};
-use crate::harness::retrying_model_client::{ModelRetryObservability, RetryingModelClient};
+use crate::harness::retrying_model_client::ModelRetryObservability;
+#[cfg(test)]
+use crate::harness::retrying_model_client::RetryingModelClient;
 use crate::harness::runtime::Harness;
 use crate::harness::specification::Specification;
 use crate::harness::specification_planner::{SpecificationPlannerError, plan_specification};
@@ -356,8 +358,9 @@ pub struct LiveSessionTrace {
     pub action_policy: String,
     pub records: Vec<LiveSessionStepRecord>,
     pub finish_reason: String,
-    /// Total de retries de transporte/modelo de la sesión (fuente causal, no iterations).
-    /// Sin handle de observabilidad: 0.
+    /// Total de retries de la sesión: coordinador + cliente inyectado, si lo hubiera.
+    /// El entrypoint productivo usa al coordinador como única autoridad.
+    /// Sin handle de cliente, conserva los retries observados por el coordinador.
     pub total_retries: u32,
 }
 
@@ -510,16 +513,14 @@ pub fn run_live_agent_session(
     config: LiveSessionConfig,
 ) -> Result<LiveSessionResult, LiveSessionError> {
     let model_config = ModelClientConfig::from_env()?;
-    let inner = OpenAICompatibleModelClient::new(model_config.clone());
-    let retrying = RetryingModelClient::new(Box::new(inner));
-    let retry_obs = retrying.observability();
-    let client: Box<dyn ModelClient> = Box::new(retrying);
+    let model_name = model_config.model.clone();
+    let client: Box<dyn ModelClient> = Box::new(OpenAICompatibleModelClient::new(model_config));
     run_live_agent_session_with_client_policy_and_retry_observability(
         client,
         config,
-        Some(model_config.model),
+        Some(model_name),
         ActionPolicy::default_session_policy(),
-        Some(retry_obs),
+        None,
     )
 }
 
@@ -626,7 +627,16 @@ fn build_session_trace(
     let per_call = retry_observability
         .map(|obs| obs.per_call())
         .unwrap_or_default();
-    let total_retries = retry_observability.map(|obs| obs.total()).unwrap_or(0);
+    let client_retries = retry_observability.map(|obs| obs.total()).unwrap_or(0);
+    let coordinator_retries = loop_result
+        .history
+        .adaptive_recovery_decisions
+        .iter()
+        .filter(|decision| {
+            decision.action == crate::harness::AdaptiveRecoveryAction::RetrySameModel
+        })
+        .count() as u32;
+    let total_retries = client_retries.saturating_add(coordinator_retries);
 
     // Causalidad AiAgent: cada step del AgentLoop = un `propose()` = un `complete()`.
     // Si longitudes coinciden, proyectamos per_call[i] → record[i].retry_count.
@@ -779,11 +789,10 @@ fn implementar_handlers() {
             outcome.rejected_constraint.as_deref(),
             Some("artifact_state")
         );
-        assert_eq!(
+        assert!(
             build_validate_compile_harness_with_policy(ActionPolicy::default_session_policy())
                 .execute_step(AgentAction::NoOp, &mut AgentContext::new("a2"))
-                .permitted,
-            true
+                .permitted
         );
     }
 
@@ -1308,6 +1317,58 @@ fn implementar_handlers() {
             result.session_trace.records[0].retry_count,
             Some(2),
             "AiAgent: propose↔complete↔step es 1:1"
+        );
+        assert_eq!(result.loop_result.status, LoopStatus::Completed);
+    }
+
+    #[test]
+    fn coordinator_retry_is_counted_without_client_wrapper() {
+        struct FailOnceThenFinish {
+            calls: AtomicUsize,
+        }
+
+        impl ModelClient for FailOnceThenFinish {
+            fn complete(
+                &self,
+                _request: &ModelRequest,
+            ) -> Result<crate::harness::model::ModelResponse, ModelError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(ModelError::Timeout);
+                }
+                Ok(crate::harness::model::ModelResponse {
+                    raw_text: serialize_decision(&ModelDecision::Finish {
+                        summary: "ok after coordinator retry".to_string(),
+                    }),
+                })
+            }
+        }
+
+        let config = LiveSessionConfig::validate_and_compile_artifact(
+            "Crear una API REST",
+            "Api",
+            "fn main() {}",
+        );
+        let result = run_live_agent_session_with_client(
+            Box::new(FailOnceThenFinish {
+                calls: AtomicUsize::new(0),
+            }),
+            config,
+            None,
+        )
+        .expect("session");
+
+        assert_eq!(result.loop_result.iterations, 2);
+        assert_eq!(result.session_trace.total_retries, 1);
+        assert!(
+            result
+                .session_trace
+                .records
+                .iter()
+                .all(|record| { record.retry_count.is_none() })
+        );
+        assert_eq!(
+            result.loop_result.history.adaptive_recovery_decisions[0].action,
+            crate::harness::AdaptiveRecoveryAction::RetrySameModel
         );
         assert_eq!(result.loop_result.status, LoopStatus::Completed);
     }

@@ -60,7 +60,7 @@ impl Tool for DiagnosticCompileTool {
         };
 
         for (path, source) in artifact.files() {
-            for token in bare_identifier_lines(source) {
+            if let Some(token) = bare_identifier_lines(source).into_iter().next() {
                 let stderr = format!(
                     "error[E0425]: cannot find value `{token}` in this scope\n --> {}:1:1",
                     path.as_str()

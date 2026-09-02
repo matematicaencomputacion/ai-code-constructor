@@ -2,6 +2,7 @@
 //!
 //! Encapsula transporte, autenticación y extracción de texto. No ejecuta Tools.
 
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -12,10 +13,24 @@ use crate::harness::model::{
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Límite duro del envelope HTTP antes de parsear JSON.
+const MAX_HTTP_RESPONSE_BODY_BYTES: usize = 1024 * 1024;
 const ENV_BASE_URL: &str = "MODEL_BASE_URL";
 const ENV_API_KEY: &str = "MODEL_API_KEY";
 const ENV_MODEL_NAME: &str = "MODEL_NAME";
 const ENV_TIMEOUT_MS: &str = "MODEL_TIMEOUT_MS";
+
+/// Controla si el endpoint recibe una restricción nativa de salida JSON.
+///
+/// `JsonObject` conserva el comportamiento histórico del cliente. `PromptOnly`
+/// permite interoperar con endpoints que respetan el contrato JSON del prompt,
+/// pero no aceptan el campo OpenAI `response_format`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResponseFormatMode {
+    PromptOnly,
+    #[default]
+    JsonObject,
+}
 
 /// Configuración explícita del cliente HTTP (sin secretos en logs).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +102,7 @@ pub struct OpenAICompatibleModelClient {
     config: ModelClientConfig,
     provider: String,
     last_call: Arc<Mutex<Option<ModelCallMetadata>>>,
+    response_format_mode: ResponseFormatMode,
 }
 
 impl OpenAICompatibleModelClient {
@@ -95,7 +111,13 @@ impl OpenAICompatibleModelClient {
             provider: "openai-compatible".to_string(),
             config,
             last_call: Arc::new(Mutex::new(None)),
+            response_format_mode: ResponseFormatMode::default(),
         }
+    }
+
+    pub fn with_response_format_mode(mut self, mode: ResponseFormatMode) -> Self {
+        self.response_format_mode = mode;
+        self
     }
 
     pub fn from_env() -> Result<Self, ModelError> {
@@ -113,8 +135,12 @@ impl OpenAICompatibleModelClient {
 
     fn build_http_body(&self, request: &ModelRequest) -> String {
         let user = build_user_message(request);
+        let response_format = match self.response_format_mode {
+            ResponseFormatMode::PromptOnly => "",
+            ResponseFormatMode::JsonObject => ",\"response_format\":{\"type\":\"json_object\"}",
+        };
         format!(
-            "{{\"model\":{},\"messages\":[{{\"role\":\"system\",\"content\":{}}},{{\"role\":\"user\",\"content\":{}}}],\"response_format\":{{\"type\":\"json_object\"}}}}",
+            "{{\"model\":{},\"messages\":[{{\"role\":\"system\",\"content\":{}}},{{\"role\":\"user\",\"content\":{}}}]{response_format}}}",
             json_string(&self.config.model),
             json_string(&request.system_prompt),
             json_string(&user),
@@ -150,12 +176,7 @@ impl ModelClient for OpenAICompatibleModelClient {
         let request_id = response.header("x-request-id").map(str::to_string);
         let retry_after = read_retry_after(&response);
 
-        let response_text = response.into_string().map_err(|error| {
-            ModelError::transport(
-                redact_secrets(&error.to_string()),
-                TransportFailureKind::Other,
-            )
-        })?;
+        let response_text = read_response_body_limited(response)?;
 
         let latency_ms = started.elapsed().as_millis() as u64;
         self.record_call(ModelCallMetadata {
@@ -261,45 +282,24 @@ fn build_user_message(request: &ModelRequest) -> String {
 }
 
 fn extract_message_content(raw: &str) -> Result<String, String> {
-    if let Some(content) = extract_json_string_field(raw, "content") {
-        return Ok(content);
-    }
-    Err("no se encontró choices[0].message.content".to_string())
-}
+    let envelope: serde_json::Value =
+        serde_json::from_str(raw).map_err(|error| format!("envelope JSON inválido: {error}"))?;
+    let message = envelope
+        .get("choices")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|choices| choices.first())
+        .and_then(|choice| choice.get("message"))
+        .ok_or_else(|| "no se encontró choices[0].message".to_string())?;
 
-fn extract_json_string_field(raw: &str, field: &str) -> Option<String> {
-    let pattern = format!("\"{field}\":");
-    let start = raw.find(&pattern)? + pattern.len();
-    let slice = raw[start..].trim_start();
-    parse_json_string(slice)
-}
+    if let Some(content) = message.get("content").and_then(serde_json::Value::as_str) {
+        return Ok(content.to_string());
+    }
 
-fn parse_json_string(raw: &str) -> Option<String> {
-    if !raw.starts_with('"') {
-        return None;
+    if message.get("tool_calls").is_some() {
+        Err("choices[0].message contiene tool_calls sin content string".to_string())
+    } else {
+        Err("choices[0].message.content ausente o no-string".to_string())
     }
-    let mut value = String::new();
-    let mut escaped = false;
-    for ch in raw.chars().skip(1) {
-        if escaped {
-            value.push(match ch {
-                'n' => '\n',
-                'r' => '\r',
-                't' => '\t',
-                '"' => '"',
-                '\\' => '\\',
-                other => other,
-            });
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' => escaped = true,
-            '"' => return Some(value),
-            other => value.push(other),
-        }
-    }
-    None
 }
 
 fn json_string(value: &str) -> String {
@@ -318,6 +318,29 @@ fn json_string(value: &str) -> String {
     out
 }
 
+fn read_response_body_limited(response: ureq::Response) -> Result<String, ModelError> {
+    read_utf8_limited(response.into_reader(), MAX_HTTP_RESPONSE_BODY_BYTES)
+}
+
+fn read_utf8_limited(reader: impl Read, max_bytes: usize) -> Result<String, ModelError> {
+    let mut limited = reader.take((max_bytes as u64).saturating_add(1));
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024).saturating_add(1));
+    limited.read_to_end(&mut bytes).map_err(|error| {
+        ModelError::transport(
+            redact_secrets(&error.to_string()),
+            TransportFailureKind::Other,
+        )
+    })?;
+    if bytes.len() > max_bytes {
+        return Err(ModelError::InvalidResponse(format!(
+            "HTTP response body exceeds hard limit of {max_bytes} bytes",
+        )));
+    }
+    String::from_utf8(bytes).map_err(|_| {
+        ModelError::InvalidResponse("HTTP response body is not valid UTF-8".to_string())
+    })
+}
+
 fn map_ureq_error(error: ureq::Error, elapsed: Duration, timeout: Duration) -> ModelError {
     if elapsed >= timeout.saturating_sub(Duration::from_millis(10)) {
         return ModelError::Timeout;
@@ -325,7 +348,7 @@ fn map_ureq_error(error: ureq::Error, elapsed: Duration, timeout: Duration) -> M
     match error {
         ureq::Error::Status(code, response) => {
             let retry_after = read_retry_after(&response);
-            let body = response.into_string().unwrap_or_default();
+            let body = read_response_body_limited(response).unwrap_or_default();
             map_http_status(code, &body, retry_after)
         }
         ureq::Error::Transport(transport) => {
@@ -352,9 +375,17 @@ fn read_retry_after(response: &ureq::Response) -> Option<Duration> {
         .and_then(parse_retry_after_value)
 }
 
-/// Solo delta-seconds (RFC 7231). HTTP-date se ignora a propósito (mínimo verificable).
+/// Acepta delta-seconds y HTTP-date conforme a RFC 9110.
 fn parse_retry_after_value(raw: &str) -> Option<Duration> {
-    raw.trim().parse::<u64>().ok().map(Duration::from_secs)
+    parse_retry_after_value_at(raw, std::time::SystemTime::now())
+}
+
+fn parse_retry_after_value_at(raw: &str, now: std::time::SystemTime) -> Option<Duration> {
+    if let Ok(seconds) = raw.trim().parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let deadline = httpdate::parse_http_date(raw.trim()).ok()?;
+    Some(deadline.duration_since(now).unwrap_or(Duration::ZERO))
 }
 
 fn map_http_status(status: u16, body: &str, retry_after: Option<Duration>) -> ModelError {
@@ -551,6 +582,28 @@ mod tests {
     }
 
     #[test]
+    fn json_object_response_format_is_enabled_by_default() {
+        let client = OpenAICompatibleModelClient::new(test_config("http://localhost:8080/v1"));
+
+        let body = client.build_http_body(&sample_request());
+
+        assert!(body.contains("\"response_format\":{\"type\":\"json_object\"}"));
+    }
+
+    #[test]
+    fn prompt_only_response_format_omits_native_json_constraint() {
+        let client = OpenAICompatibleModelClient::new(test_config("http://localhost:8080/v1"))
+            .with_response_format_mode(ResponseFormatMode::PromptOnly);
+
+        let body = client.build_http_body(&sample_request());
+
+        assert!(!body.contains("\"response_format\""));
+        assert!(body.contains("\"model\":\"test-model\""));
+        assert!(body.contains("\"role\":\"system\""));
+        assert!(body.contains("\"role\":\"user\""));
+    }
+
+    #[test]
     fn missing_api_key_returns_configuration_error() {
         let client = OpenAICompatibleModelClient::new(ModelClientConfig::new(
             "http://localhost:8080/v1",
@@ -655,6 +708,51 @@ mod tests {
     }
 
     #[test]
+    fn response_extraction_ignores_decoy_content_outside_first_choice_message() {
+        let body = r#"{
+            "content":"decoy",
+            "choices":[{"message":{"content":"{\"action\":\"finish\",\"summary\":\"real\"}"}}]
+        }"#;
+        let server = MockHttpServer::spawn("200 OK", body);
+        let client = OpenAICompatibleModelClient::new(test_config(&server.base_url));
+
+        let response = client.complete(&sample_request()).expect("response");
+
+        assert!(response.raw_text.contains("real"));
+        assert!(!response.raw_text.contains("decoy"));
+    }
+
+    #[test]
+    fn tool_calls_only_response_is_an_adapter_envelope_error() {
+        let body = r#"{
+            "choices":[{"message":{"content":null,"tool_calls":[{"id":"call_1","type":"function","function":{"name":"finish","arguments":"{}"}}]}}]
+        }"#;
+        let server = MockHttpServer::spawn("200 OK", body);
+        let client = OpenAICompatibleModelClient::new(test_config(&server.base_url));
+
+        let error = client
+            .complete(&sample_request())
+            .expect_err("adapter error");
+
+        assert!(matches!(error, ModelError::InvalidResponse(_)));
+        assert!(error.to_string().contains("tool_calls"));
+    }
+
+    #[test]
+    fn response_reader_rejects_bytes_beyond_hard_limit() {
+        let error = read_utf8_limited(std::io::Cursor::new(vec![b'x'; 9]), 8)
+            .expect_err("oversized response");
+
+        assert!(matches!(error, ModelError::InvalidResponse(_)));
+        assert!(error.to_string().contains("hard limit"));
+        assert_eq!(
+            read_utf8_limited(std::io::Cursor::new(b"valid".to_vec()), 5)
+                .expect("bounded valid body"),
+            "valid"
+        );
+    }
+
+    #[test]
     fn invalid_http_response_body_returns_invalid_response() {
         let server = MockHttpServer::spawn("200 OK", r#"{"choices":[]}"#);
         let client = OpenAICompatibleModelClient::new(test_config(&server.base_url));
@@ -669,6 +767,24 @@ mod tests {
         let err = client.complete(&sample_request()).unwrap_err();
         assert!(matches!(err, ModelError::Authentication(_)));
         assert!(!err.to_string().contains("test-api-key"));
+    }
+
+    #[test]
+    fn retry_after_parser_accepts_delta_seconds_and_http_date() {
+        let now =
+            httpdate::parse_http_date("Sun, 06 Nov 1994 08:49:37 GMT").expect("valid HTTP date");
+        assert_eq!(
+            parse_retry_after_value_at("7", now),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            parse_retry_after_value_at("Sun, 06 Nov 1994 08:50:37 GMT", now),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            parse_retry_after_value_at("Sun, 06 Nov 1994 08:48:37 GMT", now),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]

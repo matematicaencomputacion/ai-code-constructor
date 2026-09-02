@@ -18,8 +18,7 @@ mod tests {
     use crate::harness::criterion::CriterionKind;
     use crate::harness::evaluation::EvaluationVerdict;
     use crate::harness::model::{
-        ModelClient, ModelDecision, ModelError, ModelRequest, ModelResponse,
-        StructuredFileOperation, parse_model_response, serialize_decision,
+        ModelDecision, StructuredFileOperation, parse_model_response, serialize_decision,
         structured_to_file_operation,
     };
     use crate::harness::observation::AgentObservation;
@@ -28,7 +27,6 @@ mod tests {
     use crate::harness::specification::{AcceptanceCriterion, Requirement, Specification};
     use crate::harness::tools::{
         APPLY_FILE_OPERATIONS, CompileTool, CorrectionTool, FileOperationsTool,
-        encode_file_operations_input,
     };
     use crate::harness::{COMPILE, Tool};
     use std::process::Command;

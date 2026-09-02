@@ -183,7 +183,7 @@ pub struct RecoveryBudget {
 impl RecoveryBudget {
     pub fn new(max_attempts: u32, backoff: Duration) -> Self {
         Self {
-            max_attempts: max_attempts.max(1),
+            max_attempts,
             backoff,
             attempts_used: 0,
         }
@@ -598,6 +598,15 @@ mod tests {
             select_recovery_strategy(&evidence, &budget),
             RecoveryStrategy::StopExternalBlocked
         );
+    }
+
+    #[test]
+    fn zero_attempt_budget_disables_recovery() {
+        let mut budget = RecoveryBudget::new(0, Duration::ZERO);
+
+        assert!(!budget.remaining());
+        assert!(!budget.consume());
+        assert_eq!(budget.attempts_used, 0);
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Integración AgentLoop + routing multi-modelo (tests M/N deterministas).
 
 #[cfg(test)]
-mod model_routing_integration_tests {
+mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::Duration;
 
     use crate::harness::action_policy::{ActionPolicy, FinishConstraint};
+    use crate::harness::adaptive_recovery::{AdaptiveRecoveryBudget, AdaptiveRecoveryReason};
     use crate::harness::agent::Agent;
     use crate::harness::agent_loop::{AgentLoop, LoopStatus};
     use crate::harness::ai_agent::AiAgent;
@@ -246,5 +247,47 @@ mod model_routing_integration_tests {
         assert_eq!(decision.action, RoutingAction::Stop);
         assert_eq!(decision.reason, RoutingReason::SystemFailureNoEscalation);
         assert_eq!(agent.active_model_candidate().unwrap().model_id, "cheap");
+    }
+
+    /// El presupuesto común puede vetar una escalación aún disponible localmente.
+    #[test]
+    fn common_budget_vetoes_model_switch() {
+        let cheap = ModelCandidate::new("mock", "cheap", RelativeTier::Low, RelativeTier::Low);
+        let strong = ModelCandidate::new("mock", "strong", RelativeTier::High, RelativeTier::High);
+        let catalog = vec![
+            (
+                cheap,
+                Box::new(SequenceModelClient::always_invalid("cheap")) as Box<dyn ModelClient>,
+            ),
+            (
+                strong,
+                Box::new(SequenceModelClient::finish_ok("strong")) as Box<dyn ModelClient>,
+            ),
+        ];
+        let mut agent = AiAgent::with_model_routing(
+            catalog,
+            AiSessionConfig::new("common-budget", "Generic"),
+            EscalationBudget::new(2),
+        );
+        let common_budget =
+            AdaptiveRecoveryBudget::new(RecoveryBudget::new(1, Duration::ZERO), 0, Duration::ZERO);
+
+        let result = AgentLoop::new(4)
+            .with_adaptive_recovery_budget(common_budget)
+            .run(&harness(), &mut agent, AgentContext::new("common-budget"));
+
+        assert_eq!(result.status, LoopStatus::ModelCapabilityFailure);
+        assert_eq!(agent.active_model_candidate().unwrap().model_id, "cheap");
+        assert!(
+            result
+                .history
+                .routing_decisions
+                .iter()
+                .all(|decision| !decision.action.changes_model())
+        );
+        assert_eq!(
+            result.history.adaptive_recovery_decisions[0].reason,
+            AdaptiveRecoveryReason::ModelSwitchBudgetExhausted
+        );
     }
 }

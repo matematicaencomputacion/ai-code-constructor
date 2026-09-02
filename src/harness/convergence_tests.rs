@@ -2,16 +2,19 @@
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use crate::harness::Evidence;
     use crate::harness::action::AgentAction;
     use crate::harness::action_policy::ActionPolicy;
+    use crate::harness::adaptive_recovery::AdaptiveRecoveryAction;
     use crate::harness::agent::Agent;
     use crate::harness::agent_loop::{AgentLoop, LoopStatus};
     use crate::harness::ai_agent::AiAgent;
     use crate::harness::context::AgentContext;
     use crate::harness::criterion::CriterionKind;
     use crate::harness::evaluation::EvaluationVerdict;
-    use crate::harness::failure_classification::FailureClass;
+    use crate::harness::failure_classification::{FailureClass, FailureEvidence};
     use crate::harness::goal_driven::{
         Goal, GoalDrivenLoop, GoalDrivenStatus, GoalEvaluator, GoalProgressTracker, GoalStatus,
         ProgressSignal, RecommendedAction, collect_evidence_from_context,
@@ -21,6 +24,9 @@ mod tests {
     use crate::harness::model::{
         AiSessionConfig, MockModelClient, ModelClient, ModelDecision, ModelError, ModelRequest,
         ModelResponse, apply_gap_guidance, model_request_from_context, serialize_decision,
+    };
+    use crate::harness::model_routing::{
+        ModelIdentity, RoutingAction, RoutingDecision, RoutingReason,
     };
     use crate::harness::observation::AgentObservation;
     use crate::harness::runtime::Harness;
@@ -333,6 +339,240 @@ mod tests {
             ),
             "status inesperado: {:?}",
             result.status
+        );
+    }
+
+    /// TEST J — cambiar de acción no oculta un Goal estancado.
+    #[test]
+    fn test_j_alternating_actions_accumulate_non_progress() {
+        let goal = compile_only_goal();
+        let unchanged = GoalEvaluator::new().evaluate(
+            &goal,
+            &[
+                Evidence::new("tool", COMPILE),
+                Evidence::new("compile_status", "error"),
+            ],
+        );
+        let mut tracker = GoalProgressTracker::new();
+
+        tracker.record_iteration(&unchanged, Some(COMPILE), Some(0));
+        tracker.record_iteration(&unchanged, Some(VALIDATE), Some(0));
+        tracker.record_iteration(&unchanged, Some(COMPILE), Some(0));
+        tracker.record_iteration(&unchanged, Some(VALIDATE), Some(0));
+        tracker.record_iteration(&unchanged, Some(COMPILE), Some(0));
+
+        assert_eq!(
+            tracker.stale_iterations(),
+            3,
+            "tres observaciones sin cambio deben agotar la ventana aunque alternen acciones"
+        );
+    }
+
+    /// TEST K — intercambiar criterios Pass/Fail no es mejora neta.
+    #[test]
+    fn test_k_lateral_criterion_change_is_not_progress() {
+        let goal = compile_and_validate_goal();
+        let validate_pass = GoalEvaluator::new().evaluate(
+            &goal,
+            &[
+                Evidence::new("tool", VALIDATE),
+                Evidence::new("validate_status", "ok"),
+                Evidence::new("tool", COMPILE),
+                Evidence::new("compile_status", "error"),
+            ],
+        );
+        let compile_pass = GoalEvaluator::new().evaluate(
+            &goal,
+            &[
+                Evidence::new("tool", VALIDATE),
+                Evidence::new("validate_status", "error"),
+                Evidence::new("tool", COMPILE),
+                Evidence::new("compile_status", "ok"),
+            ],
+        );
+        let validate_pass_count = validate_pass
+            .specification_evaluation
+            .criteria
+            .iter()
+            .filter(|item| item.verdict == EvaluationVerdict::Pass)
+            .count();
+        let compile_pass_count = compile_pass
+            .specification_evaluation
+            .criteria
+            .iter()
+            .filter(|item| item.verdict == EvaluationVerdict::Pass)
+            .count();
+        assert_eq!(validate_pass_count, 1);
+        assert_eq!(compile_pass_count, 1);
+
+        let mut tracker = GoalProgressTracker::new();
+        tracker.record_iteration(&validate_pass, Some(VALIDATE), Some(0));
+        let lateral = tracker.record_iteration(&compile_pass, Some(COMPILE), Some(0));
+
+        assert_eq!(lateral.signal, ProgressSignal::Unchanged);
+        assert!(!lateral.is_meaningful_progress());
+        assert_eq!(tracker.stale_iterations(), 1);
+    }
+
+    /// TEST L — el loop termina por no-progreso antes del límite total.
+    #[test]
+    fn test_l_alternating_actions_terminate_before_max_iterations() {
+        struct AlternatingNoProgressAgent {
+            compile_next: bool,
+        }
+
+        impl Agent for AlternatingNoProgressAgent {
+            fn propose(&mut self, _ctx: &AgentContext) -> AgentAction {
+                let action = if self.compile_next {
+                    AgentAction::Compile {
+                        code: "fn main() { broken".to_string(),
+                    }
+                } else {
+                    AgentAction::RepairDiagnostic {
+                        errors: vec!["error: broken".to_string()],
+                    }
+                };
+                self.compile_next = !self.compile_next;
+                action
+            }
+        }
+
+        let goal = compile_only_goal();
+        let harness = diagnostic_harness();
+        let mut agent = AlternatingNoProgressAgent { compile_next: true };
+        let ctx = AgentContext::new("alternating-no-progress")
+            .with_working_code("fn main() { broken")
+            .with_evaluation_specification(goal.specification.clone());
+
+        let result = AgentLoop::new(10)
+            .with_max_stale_iterations(3)
+            .run(&harness, &mut agent, ctx);
+
+        assert_eq!(result.status, LoopStatus::ModelCapabilityFailure);
+        assert!(result.iterations < 10, "iterations={}", result.iterations);
+        assert_eq!(result.history.progress_assessments.len(), 5);
+        assert_eq!(
+            result.history.progress_assessments[4]
+                .snapshot
+                .last_action
+                .as_deref(),
+            Some(COMPILE)
+        );
+    }
+
+    /// TEST M — una mejora histórica no bloquea escalación tras estancamiento reciente.
+    #[test]
+    fn test_m_historical_progress_does_not_block_later_escalation() {
+        struct ProgressThenStallAgent {
+            phase: u32,
+            routed: bool,
+            validated: bool,
+            recent_progress_at_route: AtomicBool,
+        }
+
+        impl ProgressThenStallAgent {
+            fn valid_code() -> String {
+                r#"fn main() {
+    crear_servidor();
+    definir_endpoints();
+    implementar_handlers();
+}
+
+fn crear_servidor() {}
+fn definir_endpoints() {}
+fn implementar_handlers() {}
+"#
+                .to_string()
+            }
+        }
+
+        impl Agent for ProgressThenStallAgent {
+            fn propose(&mut self, _ctx: &AgentContext) -> AgentAction {
+                if self.routed {
+                    if !self.validated {
+                        self.validated = true;
+                        return AgentAction::Validate {
+                            request: "crear una API HTTP con endpoints y handlers".to_string(),
+                            code: Some(Self::valid_code()),
+                            plan_kind: "Generic".to_string(),
+                        };
+                    }
+                    return AgentAction::Finish {
+                        summary: "goal complete".to_string(),
+                    };
+                }
+
+                let action = match self.phase {
+                    0 => AgentAction::NoOp,
+                    1 => AgentAction::Compile {
+                        code: Self::valid_code(),
+                    },
+                    _ => AgentAction::RepairDiagnostic {
+                        errors: vec!["same stale diagnostic".to_string()],
+                    },
+                };
+                self.phase = self.phase.saturating_add(1);
+                action
+            }
+
+            fn plan_route_after_failure(
+                &self,
+                evidence: &FailureEvidence,
+                recent_progress_observed: bool,
+            ) -> Option<RoutingDecision> {
+                self.recent_progress_at_route
+                    .store(recent_progress_observed, Ordering::SeqCst);
+                Some(RoutingDecision {
+                    action: RoutingAction::EscalateCapability,
+                    reason: RoutingReason::ModelCapabilityEscalate,
+                    from: ModelIdentity::new("mock", "low"),
+                    to: Some(ModelIdentity::new("mock", "high")),
+                    failure_class: evidence.class,
+                    escalation_used: 0,
+                    escalation_remaining: 1,
+                })
+            }
+
+            fn apply_route_after_failure(&mut self, decision: RoutingDecision) -> RoutingDecision {
+                if decision.action.changes_model() {
+                    self.routed = true;
+                }
+                decision
+            }
+        }
+
+        let goal = compile_and_validate_goal();
+        let harness = diagnostic_harness();
+        let mut agent = ProgressThenStallAgent {
+            phase: 0,
+            routed: false,
+            validated: false,
+            recent_progress_at_route: AtomicBool::new(true),
+        };
+        let ctx = AgentContext::new("recent-progress-routing")
+            .with_working_code("fn main() { broken")
+            .with_evaluation_specification(goal.specification.clone());
+
+        let result = AgentLoop::new(12)
+            .with_max_stale_iterations(3)
+            .run(&harness, &mut agent, ctx);
+
+        assert_eq!(result.status, LoopStatus::Completed);
+        assert!(agent.routed);
+        assert!(!agent.recent_progress_at_route.load(Ordering::SeqCst));
+        assert!(
+            result
+                .history
+                .adaptive_recovery_decisions
+                .iter()
+                .any(|decision| decision.action == AdaptiveRecoveryAction::RouteModel)
+        );
+        assert!(
+            result
+                .history
+                .routing_decisions
+                .iter()
+                .any(|decision| decision.action == RoutingAction::EscalateCapability)
         );
     }
 

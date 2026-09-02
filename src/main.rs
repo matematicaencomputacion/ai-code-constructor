@@ -16,6 +16,18 @@ const MAX_ITERATIONS: u32 = 3;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("model-compatibility-probe") {
+        match harness::run_model_compatibility_probe_cli(args.iter().skip(1).cloned()) {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!("model-compatibility-probe: {error}");
+                eprintln!("{}", harness::probe_cli_usage());
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     if args.first().map(String::as_str) == Some("live-repair-smoke") {
         match harness::run_live_repair_smoke_harness() {
             Ok(harness::LiveRepairSmokeOutcome::BlockedWithInstructions) => {}
