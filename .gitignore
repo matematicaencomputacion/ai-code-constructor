@@ -24,3 +24,6 @@ credentials*.json
 client_secret*.json
 id_rsa*
 id_ed25519*
+
+# IDE
+.idea/
