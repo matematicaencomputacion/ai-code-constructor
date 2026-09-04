@@ -49,6 +49,9 @@ pub struct LiveSessionConfig {
     pub debug_log_prompt: bool,
     /// Activa redirección de Finish prematuro vía gap guidance (opt-in; default false).
     pub gap_guidance: bool,
+    /// Presupuesto opcional de tokens de modelo. Si se supera, el loop termina
+    /// con [`crate::harness::agent_loop::LoopStatus::MaxIterations`].
+    pub token_budget: Option<u64>,
 }
 
 impl LiveSessionConfig {
@@ -68,6 +71,7 @@ impl LiveSessionConfig {
             max_iterations: LIVE_AGENT_MAX_ITERATIONS,
             debug_log_prompt: false,
             gap_guidance: false,
+            token_budget: None,
         }
     }
 
@@ -84,6 +88,11 @@ impl LiveSessionConfig {
 
     pub fn with_specification(mut self, specification: Specification) -> Self {
         self.evaluation_specification = Some(specification);
+        self
+    }
+
+    pub fn with_token_budget(mut self, budget: u64) -> Self {
+        self.token_budget = Some(budget);
         self
     }
 
@@ -105,6 +114,7 @@ impl LiveSessionConfig {
             max_iterations: LIVE_AGENT_MAX_ITERATIONS,
             debug_log_prompt: false,
             gap_guidance: true,
+            token_budget: None,
         }
     }
 
@@ -128,6 +138,7 @@ impl LiveSessionConfig {
             max_iterations: LIVE_AGENT_MAX_ITERATIONS,
             debug_log_prompt: false,
             gap_guidance: false,
+            token_budget: None,
         }
     }
 
@@ -176,6 +187,7 @@ impl LiveSessionConfig {
             max_iterations: options.max_iterations.unwrap_or(LIVE_AGENT_MAX_ITERATIONS),
             debug_log_prompt: options.debug_log_prompt,
             gap_guidance: false,
+            token_budget: None,
         })
     }
 }
@@ -1047,6 +1059,7 @@ fn implementar_handlers() {
             max_iterations: 100,
             debug_log_prompt: false,
             gap_guidance: false,
+            token_budget: None,
         };
         assert_eq!(config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS), 12);
 
@@ -1744,6 +1757,7 @@ fn implementar_handlers() {
                     || result.loop_result.status == LoopStatus::MaxIterations
                     || result.loop_result.status == LoopStatus::NonProgress
                     || result.loop_result.status == LoopStatus::ExternalServiceBlocked
+                    || result.loop_result.status == LoopStatus::ExternalConfigurationBlocked
             );
         }
     }
@@ -2266,6 +2280,7 @@ fn implementar_handlers() {
                 || result.loop_result.status == LoopStatus::Failed
                 || result.loop_result.status == LoopStatus::MaxIterations
                 || result.loop_result.status == LoopStatus::NonProgress
+                || result.loop_result.status == LoopStatus::ExternalServiceBlocked
         );
     }
 }
