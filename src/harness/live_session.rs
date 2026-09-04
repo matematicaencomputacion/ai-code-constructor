@@ -607,7 +607,11 @@ pub fn run_live_agent_session_with_client_policy_and_retry_observability(
         ));
     }
 
-    let max_iterations = config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS);
+    let max_iterations = if let Some(budget) = config.token_budget {
+        (budget as u32).min(config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS))
+    } else {
+        config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS)
+    };
     let session = AiSessionConfig::new(config.user_request.clone(), config.plan_kind.clone())
         .with_gap_guidance(config.gap_guidance);
     let mut ctx = match config.working_artifact.clone() {
@@ -2282,5 +2286,19 @@ fn implementar_handlers() {
                 || result.loop_result.status == LoopStatus::NonProgress
                 || result.loop_result.status == LoopStatus::ExternalServiceBlocked
         );
+    }
+    #[test]
+    fn test_token_budget_caps_iterations() {
+        let invalid = introduce_validation_defect(&api_valid_code());
+        let config = LiveSessionConfig::validate_and_compile_artifact("Crear una API REST", "Api", invalid)
+            .with_token_budget(2);
+
+        assert_eq!(config.token_budget, Some(2));
+        let effective_max = if let Some(budget) = config.token_budget {
+            (budget as u32).min(config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS))
+        } else {
+            config.max_iterations.min(LIVE_AGENT_MAX_ITERATIONS)
+        };
+        assert_eq!(effective_max, 2);
     }
 }
