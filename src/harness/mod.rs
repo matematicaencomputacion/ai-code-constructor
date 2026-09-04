@@ -25,6 +25,8 @@ mod criterion;
 mod evaluation;
 mod evaluation_engine;
 mod evaluation_observation;
+mod export;
+mod export_cli;
 mod failure_classification;
 mod feature_flags;
 mod goal_driven;
@@ -154,6 +156,13 @@ pub use evaluation_engine::{
 pub use evaluation_observation::{
     EvaluationAwareAgent, ToolEvaluationStep, criterion_kind_for_tool, evaluate_tool_evidence,
     observation_from_criterion_evaluation, observation_from_specification_evaluation,
+};
+#[allow(unused_imports)]
+pub use export::{ExportError, ExportReport, export_artifact};
+#[allow(unused_imports)]
+pub use export_cli::{
+    ExportCliError, ExportCliOptions, catalog_artifact, export_cli_usage, known_artifact_ids,
+    parse_export_cli_args, run_export_cli,
 };
 #[allow(unused_imports)]
 pub use failure_classification::{

@@ -530,6 +530,7 @@ when present, wrapper retries. AgentLoop iterations remain a separate measure.
 
 - Constructor pipeline: Planner, Builder, Compiler, Validator, Repairer, `CodeState`
 - CLI entry via `run_constructor` / `cargo run -- "<request>"`
+- CLI `export`: `export_artifact` writes a minimal Cargo package (`Cargo.toml` + `src/`) from the in-memory catalog (`demo` / `api` / `calculator` / `authentication`); accepts `--out <dir>` and `--force`
 - Harness core: AgentLoop, Harness, Agent trait, Context, Observation, Evidence, Evaluation
 - Goal → Gap → RecommendedAction → Model → Tools → Evidence guidance
 - `GoalProgressTracker` with repeated state/action and lateral-change detection
@@ -632,6 +633,22 @@ cargo run -- "Crear una API REST"
 cargo run -- "Crear una calculadora"
 cargo run -- "Crear un sistema de autenticación"
 ```
+
+**Export artifact (Oleada 1):**
+
+`export_artifact` materializes a `RustArtifact` as a minimal Cargo package
+(`Cargo.toml` + `src/`). The catalog is in-memory (`demo`, `api`,
+`calculator`, `authentication`); there is no persistent artifact store yet.
+The resulting directory is compilable with `cargo build` in its own directory.
+
+```bash
+cargo run -- export demo --out /tmp/exported-demo
+cargo run -- export demo /tmp/exported-demo
+cargo run -- export --force --artifact-id authentication --out /tmp/exported-auth
+```
+
+`--force` allows writing into a non-empty directory. Paths inside the artifact
+are still resolved with `ArtifactPath::resolve_under` (no traversal).
 
 **Quality checks:**
 

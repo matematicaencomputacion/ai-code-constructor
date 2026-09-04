@@ -6,6 +6,8 @@
 //! Permanece separado de [`crate::state::CodeState`].
 
 use std::collections::BTreeMap;
+use std::fs;
+use std::path::Path;
 
 use crate::harness::artifact_path::ArtifactPath;
 use crate::harness::specification::SpecificationId;
@@ -229,6 +231,27 @@ impl RustArtifact {
         }
     }
 
+    /// Materializa todos los archivos del artefacto bajo `target_dir`.
+    ///
+    /// Crea los subdirectorios necesarios (`src/…`, `tests/…`) y escribe cada
+    /// fuente en disco. Los paths se resuelven con [`ArtifactPath::resolve_under`]
+    /// para no escapar del directorio destino.
+    pub fn export_to_dir(&self, target_dir: &Path) -> std::io::Result<()> {
+        fs::create_dir_all(target_dir)?;
+
+        for (path, source) in self.files() {
+            let dest = path
+                .resolve_under(target_dir)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(&dest, source)?;
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn insert_file_internal(&mut self, path: ArtifactPath, source: String) {
         self.files.insert(path, source);
     }
@@ -416,5 +439,70 @@ mod tests {
                 .unwrap_err()
                 .contains("primary")
         );
+    }
+
+    #[test]
+    fn test_artifact_export_to_dir() {
+        let artifact = RustArtifact::new("main.rs", "fn main() {}");
+        let target = std::env::temp_dir().join(format!(
+            "ai_code_constructor_export_single_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&target);
+        artifact.export_to_dir(&target).expect("export failed");
+
+        let main_path = target.join("src/main.rs");
+        assert!(main_path.is_file(), "src/main.rs debe existir");
+        assert_eq!(fs::read_to_string(&main_path).unwrap(), "fn main() {}");
+        let _ = fs::remove_dir_all(&target);
+
+        let main = ArtifactPath::parse("src/main.rs").unwrap();
+        let multi = RustArtifact::try_from_files(
+            ArtifactId::new("art-export-multi"),
+            "main.rs",
+            main,
+            [
+                (
+                    ArtifactPath::parse("src/main.rs").unwrap(),
+                    "fn main() {}".to_string(),
+                ),
+                (
+                    ArtifactPath::parse("src/lib.rs").unwrap(),
+                    "pub fn run() {}".to_string(),
+                ),
+                (
+                    ArtifactPath::parse("src/domain/math.rs").unwrap(),
+                    "pub fn add(a: i32, b: i32) -> i32 { a + b }".to_string(),
+                ),
+            ],
+        )
+        .unwrap();
+
+        let target2 = std::env::temp_dir().join(format!(
+            "ai_code_constructor_export_multi_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&target2);
+        multi.export_to_dir(&target2).expect("multi export failed");
+
+        assert!(target2.join("src/main.rs").is_file());
+        assert_eq!(
+            fs::read_to_string(target2.join("src/main.rs")).unwrap(),
+            "fn main() {}"
+        );
+        assert!(target2.join("src/lib.rs").is_file());
+        assert_eq!(
+            fs::read_to_string(target2.join("src/lib.rs")).unwrap(),
+            "pub fn run() {}"
+        );
+        assert!(
+            target2.join("src/domain/math.rs").is_file(),
+            "debe crear subdirectorios anidados"
+        );
+        assert_eq!(
+            fs::read_to_string(target2.join("src/domain/math.rs")).unwrap(),
+            "pub fn add(a: i32, b: i32) -> i32 { a + b }"
+        );
+        let _ = fs::remove_dir_all(&target2);
     }
 }
