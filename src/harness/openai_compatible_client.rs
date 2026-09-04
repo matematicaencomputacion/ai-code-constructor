@@ -78,6 +78,38 @@ impl ModelClientConfig {
         })
     }
 
+    /// Comprueba si las variables de entorno mínimas para el cliente están definidas y no vacías.
+    pub fn has_env_config() -> bool {
+        std::env::var(ENV_BASE_URL)
+            .map(|val| !val.trim().is_empty())
+            .unwrap_or(false)
+            && std::env::var(ENV_MODEL_NAME)
+                .map(|val| !val.trim().is_empty())
+                .unwrap_or(false)
+            && std::env::var(ENV_API_KEY)
+                .map(|key| !key.trim().is_empty())
+                .unwrap_or(false)
+    }
+
+    /// Resuelve configuración inyectada si se provee, o desde el entorno si las variables MODEL_* están definidas.
+    ///
+    /// Retorna `Ok(Some(config))` si hay configuración explícita o de entorno completa.
+    /// Retorna `Ok(None)` si no hay configuración inyectada y faltan variables `MODEL_*`.
+    /// Retorna `Err` si ocurre un error inesperado al leer la configuración.
+    pub fn resolve(injected: Option<ModelClientConfig>) -> Result<Option<Self>, ModelError> {
+        if let Some(config) = injected {
+            return Ok(Some(config));
+        }
+        if !Self::has_env_config() {
+            return Ok(None);
+        }
+        match Self::from_env() {
+            Ok(config) => Ok(Some(config)),
+            Err(ModelError::Configuration(_)) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn require_api_key(&self) -> Result<&str, ModelError> {
         self.api_key
             .as_deref()
@@ -206,6 +238,57 @@ impl ModelClient for OpenAICompatibleModelClient {
 
         Ok(ModelResponse { raw_text })
     }
+}
+
+/// Construye un `ModelRequest` de prueba para llamadas manuales live.
+pub fn sample_live_model_request() -> ModelRequest {
+    ModelRequest {
+        goal: "ai-test".to_string(),
+        step: 1,
+        user_request: "Crear una API REST".to_string(),
+        plan_kind: Some("Api".to_string()),
+        working_code: Some("fn main() {}".to_string()),
+        artifact_id: Some("artifact:main.rs".to_string()),
+        artifact_language: Some("Rust".to_string()),
+        artifact_revision: Some(0),
+        artifact_primary_path: Some("main.rs".to_string()),
+        artifact_files: vec![crate::harness::model::ArtifactFileSnapshot {
+            path: "main.rs".to_string(),
+            source: "fn main() {}".to_string(),
+        }],
+        last_observation: None,
+        recent_observations: Vec::new(),
+        recent_evidence: Vec::new(),
+        goal_evaluation: None,
+        goal_gap: None,
+        recommended_action: None,
+        diagnostic_context: Default::default(),
+        system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
+    }
+}
+
+/// Ejecuta la prueba manual live contra un endpoint OpenAI compatible.
+///
+/// Si `injected_config` es `None`, intenta resolver desde variables de entorno `MODEL_*`.
+/// Si faltan variables `MODEL_*`, no hace panic y retorna `Ok(None)`.
+pub fn run_manual_live_openai_compatible_client(
+    injected_config: Option<ModelClientConfig>,
+) -> Result<Option<ModelResponse>, ModelError> {
+    let config = match ModelClientConfig::resolve(injected_config)? {
+        Some(cfg) => cfg,
+        None => {
+            println!(
+                "SKIP: manual_live_openai_compatible_client saltado porque faltan variables MODEL_*"
+            );
+            return Ok(None);
+        }
+    };
+
+    let client = OpenAICompatibleModelClient::new(config);
+    let request = sample_live_model_request();
+    let response = client.complete(&request)?;
+    assert!(!response.raw_text.is_empty());
+    Ok(Some(response))
 }
 
 fn build_user_message(request: &ModelRequest) -> String {
@@ -527,29 +610,7 @@ mod tests {
     }
 
     fn sample_request() -> ModelRequest {
-        ModelRequest {
-            goal: "ai-test".to_string(),
-            step: 1,
-            user_request: "Crear una API REST".to_string(),
-            plan_kind: Some("Api".to_string()),
-            working_code: Some("fn main() {}".to_string()),
-            artifact_id: Some("artifact:main.rs".to_string()),
-            artifact_language: Some("Rust".to_string()),
-            artifact_revision: Some(0),
-            artifact_primary_path: Some("main.rs".to_string()),
-            artifact_files: vec![crate::harness::model::ArtifactFileSnapshot {
-                path: "main.rs".to_string(),
-                source: "fn main() {}".to_string(),
-            }],
-            last_observation: None,
-            recent_observations: Vec::new(),
-            recent_evidence: Vec::new(),
-            goal_evaluation: None,
-            goal_gap: None,
-            recommended_action: None,
-            diagnostic_context: Default::default(),
-            system_prompt: crate::harness::agent_prompt::system_prompt_v1().to_string(),
-        }
+        sample_live_model_request()
     }
 
     fn test_config(base_url: &str) -> ModelClientConfig {
@@ -917,12 +978,51 @@ mod tests {
     }
 
     /// Prueba manual opcional (NO CI): requiere MODEL_BASE_URL, MODEL_API_KEY, MODEL_NAME.
+    /// Si faltan variables de entorno MODEL_*, no hace panic.
     #[test]
     #[ignore = "requiere endpoint real y API key configurada por el operador"]
     fn manual_live_openai_compatible_client() {
-        let client = OpenAICompatibleModelClient::from_env().expect("config");
-        let request = sample_request();
-        let response = client.complete(&request).expect("live response");
-        assert!(!response.raw_text.is_empty());
+        run_manual_live_openai_compatible_client(None).expect("manual live client");
+    }
+
+    #[test]
+    fn manual_live_openai_compatible_client_with_injected_config() {
+        let server = MockHttpServer::spawn(
+            "200 OK",
+            &success_response(r#"{"action":"finish","summary":"ok"}"#),
+        );
+        let config = test_config(&server.base_url);
+        let outcome = run_manual_live_openai_compatible_client(Some(config))
+            .expect("injected manual live client");
+        assert!(outcome.is_some());
+        assert!(outcome.unwrap().raw_text.contains("finish"));
+    }
+
+    #[test]
+    fn manual_live_openai_compatible_client_skips_without_env() {
+        let saved_base = std::env::var("MODEL_BASE_URL").ok();
+        let saved_key = std::env::var("MODEL_API_KEY").ok();
+        let saved_name = std::env::var("MODEL_NAME").ok();
+        unsafe {
+            std::env::remove_var("MODEL_BASE_URL");
+            std::env::remove_var("MODEL_API_KEY");
+            std::env::remove_var("MODEL_NAME");
+        }
+
+        let outcome = run_manual_live_openai_compatible_client(None)
+            .expect("should not panic without MODEL_*");
+        assert!(outcome.is_none());
+
+        unsafe {
+            if let Some(v) = saved_base {
+                std::env::set_var("MODEL_BASE_URL", v);
+            }
+            if let Some(v) = saved_key {
+                std::env::set_var("MODEL_API_KEY", v);
+            }
+            if let Some(v) = saved_name {
+                std::env::set_var("MODEL_NAME", v);
+            }
+        }
     }
 }
