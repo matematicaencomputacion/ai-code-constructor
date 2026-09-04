@@ -40,6 +40,18 @@ fn main() {
         return;
     }
 
+    if args.first().map(String::as_str) == Some("export") {
+        match harness::run_export_cli(args.iter().skip(1).cloned()) {
+            Ok(output) => println!("{output}"),
+            Err(error) => {
+                eprintln!("export: {error}");
+                eprintln!("{}", harness::export_cli_usage());
+                std::process::exit(1);
+            }
+        }
+        return;
+    }
+
     let request = args.join(" ");
     let _state = run_constructor(&request);
 }
