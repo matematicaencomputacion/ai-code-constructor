@@ -1,5 +1,26 @@
 /target
+/.model-probe-state/
+
+# Environment files
 .env
 .env.*
+*.env
+*.env.*
 !.env.example
-/.model-probe-state/
+!.env.template
+
+# Credentials and secrets
+*.pem
+*.key
+*.crt
+*.pfx
+*.p12
+*.token
+*.secret
+*.secrets
+secrets/
+*secrets*.json
+credentials*.json
+client_secret*.json
+id_rsa*
+id_ed25519*
