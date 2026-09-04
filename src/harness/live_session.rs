@@ -2290,8 +2290,9 @@ fn implementar_handlers() {
     #[test]
     fn test_token_budget_caps_iterations() {
         let invalid = introduce_validation_defect(&api_valid_code());
-        let config = LiveSessionConfig::validate_and_compile_artifact("Crear una API REST", "Api", invalid)
-            .with_token_budget(2);
+        let config =
+            LiveSessionConfig::validate_and_compile_artifact("Crear una API REST", "Api", invalid)
+                .with_token_budget(2);
 
         assert_eq!(config.token_budget, Some(2));
         let effective_max = if let Some(budget) = config.token_budget {
