@@ -1712,38 +1712,41 @@ fn implementar_handlers() {
     }
 
     /// Prueba manual (NO CI). Requiere MODEL_BASE_URL, MODEL_API_KEY, MODEL_NAME.
-/// Helper ejecutable para pruebas de sesión con config inyectada o variables MODEL_*
-pub fn run_manual_live_agent_session(
-    injected_config: Option<ModelClientConfig>,
-) -> Result<Option<LiveSessionResult>, LiveSessionError> {
-    // Si no hay configuración inyectada ni variables MODEL_*, omite limpiamente con Ok(None)
-    let model_config = match injected_config.or_else(|| ModelClientConfig::from_env().ok()) {
-        Some(cfg) => cfg,
-        None => {
-            eprintln!("⚠️ [SKIP] 'manual_live_agent_session': Variables MODEL_* ausentes y sin config inyectada.");
-            return Ok(None);
-        }
-    };
+    /// Helper ejecutable para pruebas de sesión con config inyectada o variables MODEL_*
+    pub fn run_manual_live_agent_session(
+        injected_config: Option<ModelClientConfig>,
+    ) -> Result<Option<LiveSessionResult>, LiveSessionError> {
+        // Si no hay configuración inyectada ni variables MODEL_*, omite limpiamente con Ok(None)
+        let model_config = match injected_config.or_else(|| ModelClientConfig::from_env().ok()) {
+            Some(cfg) => cfg,
+            None => {
+                eprintln!(
+                    "⚠️ [SKIP] 'manual_live_agent_session': Variables MODEL_* ausentes y sin config inyectada."
+                );
+                return Ok(None);
+            }
+        };
 
-    let invalid = introduce_validation_defect(&api_valid_code());
-    let config = LiveSessionConfig::validate_and_compile_artifact("Crear una API REST", "Api", invalid);
-    let result = run_live_agent_session_with_model_config(config, Some(model_config))?;
-    Ok(Some(result))
-}
-
-#[test]
-#[ignore = "requiere endpoint real y variables MODEL_* configuradas por el operador"]
-fn manual_live_agent_session() {
-    let outcome = run_manual_live_agent_session(None).expect("live session");
-    if let Some(result) = outcome {
-        assert!(
-            result.loop_result.status == LoopStatus::Completed
-            || result.loop_result.status == LoopStatus::MaxIterations
-            || result.loop_result.status == LoopStatus::NonProgress
-            || result.loop_result.status == LoopStatus::ExternalServiceBlocked
-        );
+        let invalid = introduce_validation_defect(&api_valid_code());
+        let config =
+            LiveSessionConfig::validate_and_compile_artifact("Crear una API REST", "Api", invalid);
+        let result = run_live_agent_session_with_model_config(config, Some(model_config))?;
+        Ok(Some(result))
     }
-}
+
+    #[test]
+    #[ignore = "requiere endpoint real y variables MODEL_* configuradas por el operador"]
+    fn manual_live_agent_session() {
+        let outcome = run_manual_live_agent_session(None).expect("live session");
+        if let Some(result) = outcome {
+            assert!(
+                result.loop_result.status == LoopStatus::Completed
+                    || result.loop_result.status == LoopStatus::MaxIterations
+                    || result.loop_result.status == LoopStatus::NonProgress
+                    || result.loop_result.status == LoopStatus::ExternalServiceBlocked
+            );
+        }
+    }
 
     fn quality_artifact() -> RustArtifact {
         RustArtifact::with_id(
@@ -2079,40 +2082,44 @@ fn manual_live_agent_session() {
     ///
     /// Requiere MODEL_BASE_URL, MODEL_API_KEY, MODEL_NAME.
     /// No afirma Completed: observa el ciclo Observation → decisión.
-/// Helper ejecutable para prueba de calidad con config inyectada o variables MODEL_*
-pub fn run_manual_live_quality_agent_session(
-    injected_config: Option<ModelClientConfig>,
-) -> Result<Option<LiveSessionResult>, LiveSessionError> {
-    let model_config = match injected_config.or_else(|| ModelClientConfig::from_env().ok()) {
-        Some(cfg) => cfg,
-        None => {
-            eprintln!("⚠️ [SKIP] 'manual_live_quality_agent_session': Variables MODEL_* ausentes y sin config inyectada.");
-            return Ok(None);
-        }
-    };
+    /// Helper ejecutable para prueba de calidad con config inyectada o variables MODEL_*
+    pub fn run_manual_live_quality_agent_session(
+        injected_config: Option<ModelClientConfig>,
+    ) -> Result<Option<LiveSessionResult>, LiveSessionError> {
+        let model_config = match injected_config.or_else(|| ModelClientConfig::from_env().ok()) {
+            Some(cfg) => cfg,
+            None => {
+                eprintln!(
+                    "⚠️ [SKIP] 'manual_live_quality_agent_session': Variables MODEL_* ausentes y sin config inyectada."
+                );
+                return Ok(None);
+            }
+        };
 
-    let mut config = LiveSessionConfig::quality_verification_artifact(
-        "Crear una API REST",
-        "Api",
-        quality_artifact(),
-    );
-    config.debug_log_prompt = true;
+        let mut config = LiveSessionConfig::quality_verification_artifact(
+            "Crear una API REST",
+            "Api",
+            quality_artifact(),
+        );
+        config.debug_log_prompt = true;
 
-    let result = run_live_agent_session_with_model_config(config, Some(model_config))?;
-    Ok(Some(result))
-}
-
-#[test]
-#[ignore = "requiere endpoint real y variables MODEL_* configuradas por el operador"]
-fn manual_live_quality_agent_session() {
-    let outcome = run_manual_live_quality_agent_session(None).expect("live quality session");
-    if let Some(result) = outcome {
-        eprintln!("Sesión completada con estado: {:?}", result.loop_result.status);
+        let result = run_live_agent_session_with_model_config(config, Some(model_config))?;
+        Ok(Some(result))
     }
-}// Línea 2112 (cierre de manual_live_quality_agent_session)
-     
 
-    #[test]// Línea siguiente (el test que ya existía abajo)
+    #[test]
+    #[ignore = "requiere endpoint real y variables MODEL_* configuradas por el operador"]
+    fn manual_live_quality_agent_session() {
+        let outcome = run_manual_live_quality_agent_session(None).expect("live quality session");
+        if let Some(result) = outcome {
+            eprintln!(
+                "Sesión completada con estado: {:?}",
+                result.loop_result.status
+            );
+        }
+    } // Línea 2112 (cierre de manual_live_quality_agent_session)
+
+    #[test] // Línea siguiente (el test que ya existía abajo)
     fn live_repair_smoke_config_builds_broken_helper_artifact() {
         let config = LiveSessionConfig::autonomous_compile_repair_artifact();
         assert!(config.gap_guidance);
@@ -2233,7 +2240,9 @@ fn manual_live_quality_agent_session() {
     fn manual_live_autonomous_repair_session() {
         let outcome = run_live_repair_smoke_harness().expect("harness");
         let LiveRepairSmokeOutcome::LiveSessionCompleted(result) = outcome else {
-            eprintln!("⚠️ [SKIP] 'manual_live_autonomous_repair_session': Variables MODEL_* no configuradas.");
+            eprintln!(
+                "⚠️ [SKIP] 'manual_live_autonomous_repair_session': Variables MODEL_* no configuradas."
+            );
             return;
         };
         let result = result.as_ref();
